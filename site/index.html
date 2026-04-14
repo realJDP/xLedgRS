@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xLedgRS - XRP Ledger Node Implementation in Rust</title>
+<meta name="description" content="xLedgRS is a from-scratch Rust implementation of the XRP Ledger node. Memory-safe, high-performance, and fully network-compatible. 56,000+ lines of Rust, 22 transaction types, full consensus support.">
+<meta property="og:title" content="xLedgRS - XRP Ledger in Rust">
+<meta property="og:description" content="A from-scratch Rust implementation of the XRP Ledger node. Memory-safe, performant, network-compatible.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://xledgrs.com">
+<link rel="canonical" href="https://xledgrs.com">
+<style>
+:root {
+  --bg: #0a0e17;
+  --bg2: #0f1520;
+  --bg-card: #111827;
+  --bg-card-hover: #1a2332;
+  --border: #1e293b;
+  --border-light: #2d3a4d;
+  --text: #e2e8f0;
+  --text-dim: #94a3b8;
+  --text-muted: #64748b;
+  --accent: #00d2ff;
+  --accent-dim: rgba(0,210,255,0.15);
+  --green: #00ff88;
+  --green-dim: rgba(0,255,136,0.15);
+  --purple: #a78bfa;
+  --purple-dim: rgba(167,139,250,0.15);
+  --yellow: #fbbf24;
+  --yellow-dim: rgba(251,191,36,0.15);
+  --red: #ff6b6b;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+code, pre, .mono {
+  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', monospace;
+}
+
+a { color: var(--accent); text-decoration: none; transition: color 0.2s; }
+a:hover { color: #33dbff; }
+
+.container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+.container-narrow { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+/* ── Nav ── */
+nav {
+  position: fixed; top: 0; width: 100%;
+  background: rgba(10, 14, 23, 0.88);
+  backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+  z-index: 100; padding: 14px 0;
+}
+nav .container { display: flex; justify-content: space-between; align-items: center; }
+nav .logo { font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+nav .logo span { color: var(--accent); }
+nav .links { display: flex; gap: 28px; align-items: center; }
+nav .links a { color: var(--text-dim); font-size: 14px; font-weight: 500; }
+nav .links a:hover { color: var(--text); }
+nav .gh-btn {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 14px; font-size: 13px; color: var(--text); font-weight: 500;
+}
+nav .gh-btn:hover { border-color: var(--accent); }
+
+/* ── Hero ── */
+.hero {
+  padding: 160px 0 80px;
+  text-align: center;
+  position: relative;
+}
+.hero::before {
+  content: ''; position: absolute; top: 60px; left: 50%; transform: translateX(-50%);
+  width: 900px; height: 500px;
+  background: radial-gradient(ellipse, rgba(0,210,255,0.05) 0%, rgba(0,255,136,0.02) 40%, transparent 70%);
+  pointer-events: none;
+}
+.hero .badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: var(--accent-dim); border: 1px solid rgba(0,210,255,0.25);
+  border-radius: 20px; padding: 6px 16px;
+  font-size: 13px; color: var(--accent); font-weight: 500; margin-bottom: 28px;
+}
+.hero .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+.hero h1 {
+  font-size: 60px; font-weight: 800; letter-spacing: -2.5px; line-height: 1.08; margin-bottom: 24px;
+}
+.hero h1 .g { color: var(--green); }
+.hero h1 .c { color: var(--accent); }
+.hero .sub {
+  font-size: 19px; color: var(--text-dim); max-width: 680px; margin: 0 auto 40px; line-height: 1.6;
+}
+.hero .actions { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 13px 26px; border-radius: 8px; font-size: 14px; font-weight: 600;
+  transition: all 0.2s; border: none; cursor: pointer;
+}
+.btn-primary { background: var(--accent); color: #000; }
+.btn-primary:hover { background: #33dbff; transform: translateY(-1px); }
+.btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
+.btn-outline:hover { border-color: var(--accent); background: rgba(0,210,255,0.05); }
+
+/* ── Stats ── */
+.stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+  background: var(--border); border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; margin: 64px auto 0; max-width: 800px;
+}
+.stat-item {
+  background: var(--bg); padding: 28px; text-align: center;
+}
+.stat-item .val {
+  font-size: 32px; font-weight: 800; font-family: 'SF Mono', monospace;
+}
+.stat-item .val.c1 { color: var(--accent); }
+.stat-item .val.c2 { color: var(--green); }
+.stat-item .val.c3 { color: var(--purple); }
+.stat-item .val.c4 { color: var(--yellow); }
+.stat-item .lbl {
+  font-size: 12px; color: var(--text-muted); text-transform: uppercase;
+  letter-spacing: 1.2px; margin-top: 4px;
+}
+
+/* ── Section ── */
+section { padding: 100px 0; }
+section.alt { background: var(--bg2); }
+.section-header { margin-bottom: 56px; }
+.section-header .tag {
+  display: inline-block; font-size: 12px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 1.5px; color: var(--accent); margin-bottom: 12px;
+}
+.section-header h2 { font-size: 38px; font-weight: 700; letter-spacing: -1.5px; margin-bottom: 14px; }
+.section-header p { font-size: 17px; color: var(--text-dim); max-width: 620px; line-height: 1.6; }
+
+/* ── Cards ── */
+.card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+.card-grid-3 { grid-template-columns: repeat(3, 1fr); }
+
+.card {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; transition: border-color 0.25s, transform 0.2s;
+}
+.card:hover { border-color: rgba(0,210,255,0.3); transform: translateY(-2px); }
+.card .card-icon {
+  width: 40px; height: 40px; border-radius: 10px; display: flex;
+  align-items: center; justify-content: center; font-size: 20px; margin-bottom: 16px;
+}
+.card .card-icon.blue { background: var(--accent-dim); }
+.card .card-icon.green { background: var(--green-dim); }
+.card .card-icon.purple { background: var(--purple-dim); }
+.card .card-icon.yellow { background: var(--yellow-dim); }
+.card h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; }
+.card p { font-size: 14px; color: var(--text-dim); line-height: 1.6; }
+
+/* ── Architecture ── */
+.arch-flow {
+  display: flex; align-items: center; justify-content: center;
+  gap: 4px; flex-wrap: wrap; margin: 32px 0;
+}
+.arch-node {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 20px; font-family: 'SF Mono', monospace; font-size: 13px;
+  color: var(--accent); font-weight: 600;
+}
+.arch-arrow { color: var(--text-muted); font-size: 18px; }
+
+.module-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px;
+}
+.module {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 20px; display: flex; gap: 16px; align-items: flex-start;
+}
+.module .mod-name {
+  font-family: 'SF Mono', monospace; font-size: 13px; font-weight: 600;
+  color: var(--accent); white-space: nowrap; min-width: 100px;
+}
+.module .mod-desc { font-size: 13px; color: var(--text-dim); }
+
+/* ── Code ── */
+.code-block {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; margin-top: 24px;
+}
+.code-bar {
+  padding: 10px 16px; background: rgba(0,0,0,0.3); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 6px;
+}
+.code-bar .d { width: 10px; height: 10px; border-radius: 50%; }
+.code-bar .d1 { background: #ff5f56; } .code-bar .d2 { background: #ffbd2e; } .code-bar .d3 { background: #27c93f; }
+.code-bar .fname { font-size: 11px; color: var(--text-muted); margin-left: 8px; }
+pre { padding: 20px; overflow-x: auto; font-size: 13px; line-height: 1.8; color: #c9d1d9; }
+.cm { color: #6e7681; } .kw { color: #ff7b72; } .st { color: #a5d6ff; }
+.fn { color: #d2a8ff; } .nm { color: #79c0ff; }
+
+/* ── Table ── */
+.data-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.data-table th {
+  text-align: left; padding: 12px 16px; border-bottom: 2px solid var(--border);
+  color: var(--text-muted); text-transform: uppercase; font-size: 11px; letter-spacing: 1px;
+}
+.data-table td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.data-table tr:hover td { background: rgba(0,210,255,0.02); }
+.data-table .y { color: var(--green); } .data-table .p { color: var(--yellow); }
+.data-table code { font-size: 12px; background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 3px; }
+
+/* ── TX grid ── */
+.tx-list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px;
+}
+.tx-pill {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 12px; font-size: 12px; display: flex; justify-content: space-between;
+  font-family: 'SF Mono', monospace;
+}
+.tx-pill .ok { color: var(--green); }
+
+/* ── Protocol detail ── */
+.proto-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.proto-box {
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 24px;
+}
+.proto-box h4 { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--accent); }
+.proto-box ul { list-style: none; }
+.proto-box li {
+  font-size: 13px; color: var(--text-dim); padding: 4px 0;
+  padding-left: 16px; position: relative;
+}
+.proto-box li::before {
+  content: ''; position: absolute; left: 0; top: 11px;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--border-light);
+}
+
+/* ── Deps ── */
+.dep-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px;
+}
+.dep {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 6px; font-size: 13px;
+}
+.dep .name { font-family: 'SF Mono', monospace; color: var(--accent); font-weight: 500; }
+.dep .what { color: var(--text-muted); font-size: 12px; }
+
+/* ── Footer ── */
+footer {
+  border-top: 1px solid var(--border); padding: 48px 0; text-align: center;
+  color: var(--text-muted); font-size: 14px;
+}
+footer .f-links { display: flex; justify-content: center; gap: 28px; margin-bottom: 16px; }
+footer .f-links a { color: var(--text-dim); }
+
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .card-grid-3 { grid-template-columns: 1fr; }
+  .proto-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .hero h1 { font-size: 36px; }
+  .hero .sub { font-size: 16px; }
+  .stats { grid-template-columns: 1fr 1fr; }
+  .stat-item .val { font-size: 24px; }
+  section { padding: 64px 0; }
+  nav .links a:not(.gh-btn) { display: none; }
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <div class="logo">x<span>LedgRS</span></div>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#protocol">Protocol</a>
+      <a href="#transactions">Transactions</a>
+      <a href="#quickstart">Install</a>
+      <a href="#comparison">Compare</a>
+      <a href="https://github.com/realJDP/xLedgRS" class="gh-btn">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ════════════════════════ HERO ════════════════════════ -->
+<section class="hero">
+  <div class="container">
+    <div class="badge"><span class="dot"></span> v1.0 Beta &mdash; Mainnet Compatible</div>
+    <h1>The <span class="g">XRP Ledger</span>,<br>reimplemented in <span class="c">Rust</span></h1>
+    <p class="sub">
+      56,000 lines of memory-safe Rust. Full peer protocol. Full consensus.
+      22 transaction types. Connects to the live XRPL network today.
+    </p>
+    <div class="actions">
+      <a href="https://github.com/realJDP/xLedgRS/releases" class="btn btn-primary">Download v1.0 Beta</a>
+      <a href="https://github.com/realJDP/xLedgRS" class="btn btn-outline">Source Code</a>
+      <a href="#quickstart" class="btn btn-outline">Quick Start</a>
+    </div>
+    <div class="stats">
+      <div class="stat-item"><div class="val c1">56,275</div><div class="lbl">Lines of Rust</div></div>
+      <div class="stat-item"><div class="val c2">138</div><div class="lbl">Source Files</div></div>
+      <div class="stat-item"><div class="val c3">22</div><div class="lbl">TX Types</div></div>
+      <div class="stat-item"><div class="val c4">250+</div><div class="lbl">Tests</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ WHY ════════════════════════ -->
+<section id="features">
+  <div class="container">
+    <div class="section-header">
+      <div class="tag">Why xLedgRS</div>
+      <h2>Built for the next decade of XRPL infrastructure</h2>
+      <p>A ground-up rewrite that brings modern systems engineering to the XRP Ledger without compromising on protocol compatibility.</p>
+    </div>
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-icon blue">&#x1F6E1;</div>
+        <h3>Compile-Time Memory Safety</h3>
+        <p>Written entirely in Rust. Buffer overflows, use-after-free, data races, and null pointer dereferences are eliminated by the compiler &mdash; not by hope. No garbage collector overhead. No manual memory management mistakes.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon green">&#x26A1;</div>
+        <h3>Async-Native Architecture</h3>
+        <p>Built on Tokio from the ground up. Every peer connection, RPC request, WebSocket subscription, and consensus timer runs on an async executor. No thread-per-connection. No blocking I/O on the critical path.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon purple">&#x1F517;</div>
+        <h3>Full Network Compatibility</h3>
+        <p>Speaks the exact same RTXP protocol as rippled. Connects to existing peers, syncs the full account state tree via SHAMap download, and validates transactions against the live network. Drop-in network participant.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon yellow">&#x1F4BE;</div>
+        <h3>Dual-Layer Persistence</h3>
+        <p>NuDB for content-addressed Merkle tree nodes (SHAMap) with 256MB cache. SQLite in WAL mode for relational data (ledger headers, transaction index, metadata). Crash-safe, delta-based writes between ledger closes.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon blue">&#x1F310;</div>
+        <h3>Full Consensus Implementation</h3>
+        <p>Implements the XRP Ledger Consensus Protocol: proposal rounds with convergence thresholds (50% &rarr; 65% &rarr; 70% &rarr; 80%), UNL quorum validation, manifest-based ephemeral key delegation, and amendment tracking.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon green">&#x1F4CA;</div>
+        <h3>rippled-Compatible APIs</h3>
+        <p>JSON-RPC with 15+ methods (server_info, account_info, tx, ledger, book_offers, submit, sign, and more). WebSocket API with subscribe/unsubscribe for live ledger events. Same response format &mdash; existing tools just work.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ ARCHITECTURE ════════════════════════ -->
+<section id="architecture" class="alt">
+  <div class="container">
+    <div class="section-header">
+      <div class="tag">Architecture</div>
+      <h2>Modular design, proven patterns</h2>
+      <p>Mirrors rippled's battle-tested architecture &mdash; the view stack, SHAMap, consensus rounds &mdash; while leveraging Rust's type system for correctness.</p>
+    </div>
+
+    <h3 style="font-size: 15px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px;">View Stack (Transaction Application)</h3>
+    <div class="arch-flow">
+      <div class="arch-node">ClosedLedger<br><span style="font-size:11px;color:var(--text-muted)">ReadView</span></div>
+      <div class="arch-arrow">&rarr;</div>
+      <div class="arch-node">OpenView<br><span style="font-size:11px;color:var(--text-muted)">TxsRawView</span></div>
+      <div class="arch-arrow">&rarr;</div>
+      <div class="arch-node">ApplyViewImpl<br><span style="font-size:11px;color:var(--text-muted)">ApplyView</span></div>
+      <div class="arch-arrow">&rarr;</div>
+      <div class="arch-node">New Ledger<br><span style="font-size:11px;color:var(--text-muted)">Validated</span></div>
+    </div>
+
+    <h3 style="font-size: 15px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin: 40px 0 16px;">Consensus Phases</h3>
+    <div class="arch-flow">
+      <div class="arch-node" style="border-color: rgba(0,255,136,0.3);">Open<br><span style="font-size:11px;color:var(--text-muted)">Collect TXs</span></div>
+      <div class="arch-arrow">&rarr;</div>
+      <div class="arch-node" style="border-color: rgba(251,191,36,0.3);">Establish<br><span style="font-size:11px;color:var(--text-muted)">Exchange proposals</span></div>
+      <div class="arch-arrow">&rarr;</div>
+      <div class="arch-node" style="border-color: rgba(167,139,250,0.3);">Accept<br><span style="font-size:11px;color:var(--text-muted)">Apply TX set</span></div>
+      <div class="arch-arrow">&rarr;</div>
+      <div class="arch-node" style="border-color: rgba(0,210,255,0.3);">Validate<br><span style="font-size:11px;color:var(--text-muted)">80% UNL quorum</span></div>
+    </div>
+
+    <h3 style="font-size: 15px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px; margin: 48px 0 16px;">Source Modules</h3>
+    <div class="module-grid">
+      <div class="module"><div class="mod-name">crypto/</div><div class="mod-desc">secp256k1 &amp; Ed25519 keys, base58check encoding, SHA-512-Half, RIPEMD160, account ID derivation, family seed encode/decode</div></div>
+      <div class="module"><div class="mod-name">transaction/</div><div class="mod-desc">STObject canonical binary serialization, field catalog with type/field codes, binary parser for all field types, fluent transaction builder with multi-algorithm signing</div></div>
+      <div class="module"><div class="mod-name">ledger/</div><div class="mod-desc">Radix-16 Merkle tree (SHAMap), view stack, state table, 22 transaction handlers, order book with BTreeMap price-time priority, directory management, metadata generation</div></div>
+      <div class="module"><div class="mod-name">consensus/</div><div class="mod-desc">Proposal &amp; validation rounds, manifest delegation (master &rarr; ephemeral key), convergence thresholds with UNL quorum, amendment tracking</div></div>
+      <div class="module"><div class="mod-name">network/</div><div class="mod-desc">RTXP framing (6-byte uncompressed / 10-byte LZ4 compressed), HTTP upgrade handshake with session-hash signing, peer state machine (connecting &rarr; connected &rarr; active)</div></div>
+      <div class="module"><div class="mod-name">rpc/</div><div class="mod-desc">JSON-RPC dispatcher with 15+ rippled-compatible methods, WebSocket server with subscribe/unsubscribe, live ledger/transaction/validation event streams</div></div>
+      <div class="module"><div class="mod-name">sync/</div><div class="mod-desc">Peer-based SHAMap state download with multi-peer fan-out, progressive tree sync with missing-node detection, NuDB content-addressed persistence, 7-9K objects/sec sustained</div></div>
+      <div class="module"><div class="mod-name">node/</div><div class="mod-desc">Central event loop orchestrating all subsystems: peer accept/dial, RTXP message dispatch, RPC serving, consensus timer, sync coordination, follower replay engine</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ PROTOCOL ════════════════════════ -->
+<section id="protocol">
+  <div class="container">
+    <div class="section-header">
+      <div class="tag">Protocol</div>
+      <h2>Wire-compatible with every rippled node</h2>
+      <p>xLedgRS implements the complete XRPL peer protocol. Every message, every handshake field, every compression mode.</p>
+    </div>
+
+    <div class="proto-grid">
+      <div class="proto-box">
+        <h4>Peer Handshake</h4>
+        <ul>
+          <li>TLS 1.2 with self-signed certificates (OpenSSL)</li>
+          <li>HTTP upgrade with session-signature verification</li>
+          <li>Headers: Network-ID, Network-Time, Public-Key, Session-Signature, Instance-Cookie, Closed-Ledger, Previous-Ledger, X-Protocol-Ctl</li>
+          <li>Bidirectional RTXP message stream post-upgrade</li>
+        </ul>
+      </div>
+      <div class="proto-box">
+        <h4>Message Framing (RTXP)</h4>
+        <ul>
+          <li>6-byte header for uncompressed messages</li>
+          <li>10-byte header for LZ4-compressed messages</li>
+          <li>Protobuf-encoded payloads (prost, proto2 schema)</li>
+          <li>Generated from rippled's official xrpl.proto</li>
+        </ul>
+      </div>
+      <div class="proto-box">
+        <h4>Supported Message Types</h4>
+        <ul>
+          <li>TMProposeSet &mdash; validator proposals</li>
+          <li>TMValidation &mdash; ledger validations</li>
+          <li>TMManifests &mdash; ephemeral key delegation</li>
+          <li>TMTransaction &mdash; transaction relay</li>
+          <li>TMGetLedger / TMLedgerData &mdash; state sync</li>
+          <li>TMEndpoints &mdash; peer discovery (v2 with IPv6)</li>
+          <li>TMStatusChange &mdash; node status broadcasts</li>
+          <li>TMPing / TMPong &mdash; latency measurement</li>
+          <li>TMSquelch &mdash; validator suppression</li>
+        </ul>
+      </div>
+      <div class="proto-box">
+        <h4>Cryptographic Primitives</h4>
+        <ul>
+          <li>secp256k1 ECDSA &mdash; signing &amp; verification</li>
+          <li>Ed25519 &mdash; signing &amp; verification</li>
+          <li>SHA-512-Half &mdash; primary hash (first 256 bits of SHA-512)</li>
+          <li>SHA-256 + RIPEMD-160 &mdash; account ID derivation</li>
+          <li>HMAC-SHA-512 &mdash; key derivation from family seeds</li>
+          <li>Base58Check &mdash; XRPL custom alphabet encoding</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3 style="margin-top: 48px; margin-bottom: 16px;">SHAMap &mdash; The Merkle State Tree</h3>
+    <div class="card" style="max-width: 900px;">
+      <p>The XRP Ledger stores all account state in a radix-16 Merkle tree called the SHAMap. Each leaf node contains a serialized ledger entry (AccountRoot, Offer, RippleState, etc.) keyed by its SHA-512-Half hash. Inner nodes aggregate 16 child hashes into a single parent hash, enabling efficient proof-of-inclusion and incremental state sync.</p>
+      <p style="margin-top: 12px;">xLedgRS implements the SHAMap with NuDB-backed content-addressed storage, a 256MB LRU cache for hot inner nodes, and a sparse overlay mode for follower nodes that only materializes branches that change between ledgers.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ TRANSACTIONS ════════════════════════ -->
+<section id="transactions" class="alt">
+  <div class="container">
+    <div class="section-header">
+      <div class="tag">Transaction Engine</div>
+      <h2>22 transaction types, parity-tested against rippled</h2>
+      <p>Each handler implements the full lifecycle: preflight validation, preclaim checks, state application, and metadata generation.</p>
+    </div>
+
+    <div class="tx-list">
+      <div class="tx-pill">Payment <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">OfferCreate <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">OfferCancel <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">TrustSet <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">AccountSet <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">AccountDelete <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">SetRegularKey <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">EscrowCreate <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">EscrowFinish <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">EscrowCancel <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">PayChanCreate <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">PayChanFund <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">PayChanClaim <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">CheckCreate <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">CheckCash <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">CheckCancel <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">NFTokenMint <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">NFTokenBurn <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">NFTCreateOffer <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">NFTAcceptOffer <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">NFTCancelOffer <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">TicketCreate <span class="ok">&#x2713;</span></div>
+      <div class="tx-pill">DepositPreauth <span class="ok">&#x2713;</span></div>
+    </div>
+
+    <h3 style="margin-top: 48px; margin-bottom: 16px;">DEX Engine</h3>
+    <div class="card" style="max-width: 900px;">
+      <p>The OfferCreate handler implements the full XRPL decentralized exchange: order book crossing with quality-sorted BTreeMap iteration, partial fills with IOU precision arithmetic (16-digit mantissa, round-half-even normalization matching rippled's STAmount), self-offer replacement, ticket-based sequence management, reserve checks (tecINSUFFICIENT_RESERVE), and funding validation (tecUNFUNDED_OFFER).</p>
+    </div>
+
+    <h3 style="margin-top: 32px; margin-bottom: 16px;">RPC Methods</h3>
+    <table class="data-table" style="max-width: 700px;">
+      <thead><tr><th>Method</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><code>server_info</code></td><td>Node status, peer count, memory, uptime, validated ledger</td></tr>
+        <tr><td><code>account_info</code></td><td>Account balance, sequence, owner count, flags</td></tr>
+        <tr><td><code>account_lines</code></td><td>Trust lines with balances and limits</td></tr>
+        <tr><td><code>account_offers</code></td><td>Open DEX orders for an account</td></tr>
+        <tr><td><code>account_tx</code></td><td>Transaction history per account</td></tr>
+        <tr><td><code>tx</code></td><td>Look up transaction by hash</td></tr>
+        <tr><td><code>ledger</code></td><td>Ledger header by sequence or "validated"</td></tr>
+        <tr><td><code>ledger_data</code></td><td>All ledger objects (paginated)</td></tr>
+        <tr><td><code>book_offers</code></td><td>Order book for a currency pair</td></tr>
+        <tr><td><code>submit</code></td><td>Submit a signed transaction</td></tr>
+        <tr><td><code>sign</code></td><td>Server-side transaction signing (all 22 types)</td></tr>
+        <tr><td><code>fee</code></td><td>Current transaction fee (escalation-aware)</td></tr>
+        <tr><td><code>feature</code></td><td>Amendment status</td></tr>
+        <tr><td><code>ripple_path_find</code></td><td>Cross-currency pathfinding</td></tr>
+        <tr><td><code>ping</code></td><td>Connectivity check</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ════════════════════════ QUICK START ════════════════════════ -->
+<section id="quickstart">
+  <div class="container">
+    <div class="section-header">
+      <div class="tag">Quick Start</div>
+      <h2>Build and connect in under 5 minutes</h2>
+      <p>Requires Rust 1.75+, OpenSSL dev headers, and a network connection.</p>
+    </div>
+
+    <div class="code-block">
+      <div class="code-bar"><div class="d d1"></div><div class="d d2"></div><div class="d d3"></div><div class="fname">Terminal</div></div>
+      <pre><span class="cm"># Clone and build (release mode, ~2 min)</span>
+<span class="kw">git</span> clone https://github.com/realJDP/xLedgRS.git
+<span class="kw">cd</span> xLedgRS
+<span class="kw">cargo</span> build --release
+
+<span class="cm"># Run on mainnet as a follower node</span>
+./target/release/<span class="fn">xledgrs</span> --config cfg/xrplnode.cfg
+
+<span class="cm"># Run on testnet</span>
+./target/release/<span class="fn">xledgrs</span> --config cfg/testnet.cfg
+
+<span class="cm"># Query your node</span>
+<span class="kw">curl</span> -s http://127.0.0.1:<span class="nm">5005</span> \
+  -d <span class="st">'{"method":"server_info"}'</span> | jq .result.info
+
+<span class="cm"># Check account balance</span>
+<span class="kw">curl</span> -s http://127.0.0.1:<span class="nm">5005</span> \
+  -d <span class="st">'{"method":"account_info","params":[{"account":"rN7n3473SaZBCG4dFL83w7p1W9cgZw6iTP"}]}'</span> | jq .</pre>
+    </div>
+
+    <div class="code-block" style="margin-top: 16px;">
+      <div class="code-bar"><div class="d d1"></div><div class="d d2"></div><div class="d d3"></div><div class="fname">cfg/xrplnode.cfg</div></div>
+      <pre><span class="cm"># rippled-compatible configuration format</span>
+
+[server]
+port_rpc
+port_peer
+
+[port_rpc]
+port = <span class="nm">5005</span>
+ip = <span class="nm">0.0.0.0</span>
+protocol = http
+
+[port_peer]
+port = <span class="nm">51235</span>
+ip = <span class="nm">0.0.0.0</span>
+protocol = peer
+
+[ips]
+s1.ripple.com <span class="nm">51235</span>
+s2.ripple.com <span class="nm">51235</span>
+r.ripple.com <span class="nm">51235</span>
+
+[peers_max]
+<span class="nm">21</span>
+
+[node_db]
+path=./data
+
+[xledgrs]
+enable_consensus_close_loop = <span class="nm">1</span></pre>
+    </div>
+
+    <div style="margin-top: 40px;">
+      <h3 style="margin-bottom: 16px;">System Requirements</h3>
+      <div class="card-grid card-grid-3">
+        <div class="card">
+          <h3 style="color: var(--accent); font-size: 14px;">Build</h3>
+          <p style="font-family: 'SF Mono', monospace; font-size: 12px; color: var(--text); line-height: 2;">
+            Rust 1.75+ (stable)<br>
+            OpenSSL dev headers<br>
+            protoc (prost-build)<br>
+            ~2 min build time
+          </p>
+        </div>
+        <div class="card">
+          <h3 style="color: var(--green); font-size: 14px;">Runtime</h3>
+          <p style="font-family: 'SF Mono', monospace; font-size: 12px; color: var(--text); line-height: 2;">
+            Linux x86_64 (primary)<br>
+            macOS ARM64 (dev)<br>
+            512 MB RAM (follower)<br>
+            ~10 GB disk (state)
+          </p>
+        </div>
+        <div class="card">
+          <h3 style="color: var(--yellow); font-size: 14px;">Network</h3>
+          <p style="font-family: 'SF Mono', monospace; font-size: 12px; color: var(--text); line-height: 2;">
+            Port 51235 (peer)<br>
+            Port 5005 (JSON-RPC)<br>
+            Port 6006 (WebSocket)<br>
+            Outbound TCP required
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ COMPARISON ════════════════════════ -->
+<section id="comparison" class="alt">
+  <div class="container">
+    <div class="section-header">
+      <div class="tag">Comparison</div>
+      <h2>How xLedgRS compares to rippled</h2>
+      <p>Feature-by-feature comparison against the reference C++ implementation.</p>
+    </div>
+
+    <table class="data-table">
+      <thead><tr><th>Capability</th><th>rippled (C++)</th><th>xLedgRS (Rust)</th></tr></thead>
+      <tbody>
+        <tr><td>Language</td><td>C++17</td><td class="y">Rust (memory-safe)</td></tr>
+        <tr><td>Async Model</td><td>Boost.Asio</td><td class="y">Tokio (async/await)</td></tr>
+        <tr><td>Peer Protocol (RTXP)</td><td class="y">Full</td><td class="y">Full</td></tr>
+        <tr><td>TLS + Session Signatures</td><td class="y">Full</td><td class="y">Full</td></tr>
+        <tr><td>Consensus Protocol</td><td class="y">Full</td><td class="y">Full</td></tr>
+        <tr><td>State Sync (Peer)</td><td class="y">Full</td><td class="y">Full (7-9K obj/sec)</td></tr>
+        <tr><td>Ledger Following</td><td class="y">Full</td><td class="y">Full</td></tr>
+        <tr><td>Transaction Engine</td><td class="y">30+ types</td><td class="y">22 types</td></tr>
+        <tr><td>JSON-RPC API</td><td class="y">Full (~50 methods)</td><td class="y">15 methods</td></tr>
+        <tr><td>WebSocket API</td><td class="y">Full</td><td class="y">subscribe/unsubscribe</td></tr>
+        <tr><td>DEX Order Book</td><td class="y">Full</td><td class="y">Full (BTreeMap quality sort)</td></tr>
+        <tr><td>NFToken Support</td><td class="y">Full</td><td class="y">Mint/Burn/Offer/Accept</td></tr>
+        <tr><td>Escrow &amp; PayChan</td><td class="y">Full</td><td class="y">Full</td></tr>
+        <tr><td>Checks</td><td class="y">Full</td><td class="y">Full</td></tr>
+        <tr><td>Validator Mode</td><td class="y">Full</td><td class="p">In Progress</td></tr>
+        <tr><td>Amendment Voting</td><td class="y">Full</td><td class="p">Tracking Only</td></tr>
+        <tr><td>History Sharding</td><td class="y">Full</td><td class="p">Planned</td></tr>
+        <tr><td>Config Format</td><td>rippled .cfg</td><td class="y">rippled .cfg + TOML</td></tr>
+        <tr><td>Build System</td><td>CMake + Conan</td><td class="y">Cargo (single command)</td></tr>
+        <tr><td>Binary Size</td><td>~80 MB</td><td class="y">~13 MB</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ════════════════════════ DEPS ════════════════════════ -->
+<section>
+  <div class="container">
+    <div class="section-header">
+      <div class="tag">Dependencies</div>
+      <h2>Minimal, audited, production-grade</h2>
+      <p>No framework bloat. Every dependency earns its place.</p>
+    </div>
+    <div class="dep-grid">
+      <div class="dep"><span class="name">tokio</span><span class="what">Async runtime</span></div>
+      <div class="dep"><span class="name">prost</span><span class="what">Protobuf codec</span></div>
+      <div class="dep"><span class="name">openssl</span><span class="what">TLS + session sigs</span></div>
+      <div class="dep"><span class="name">rustls</span><span class="what">TLS (ring backend)</span></div>
+      <div class="dep"><span class="name">secp256k1</span><span class="what">ECDSA signing</span></div>
+      <div class="dep"><span class="name">ed25519-dalek</span><span class="what">Ed25519 signing</span></div>
+      <div class="dep"><span class="name">sha2 / sha3</span><span class="what">Hash functions</span></div>
+      <div class="dep"><span class="name">ripemd</span><span class="what">Account ID hash</span></div>
+      <div class="dep"><span class="name">lz4_flex</span><span class="what">Message compression</span></div>
+      <div class="dep"><span class="name">nudb</span><span class="what">Content-addressed store</span></div>
+      <div class="dep"><span class="name">rusqlite</span><span class="what">SQLite (bundled)</span></div>
+      <div class="dep"><span class="name">serde_json</span><span class="what">JSON serialization</span></div>
+      <div class="dep"><span class="name">tokio-tungstenite</span><span class="what">WebSocket server</span></div>
+      <div class="dep"><span class="name">clap</span><span class="what">CLI argument parsing</span></div>
+      <div class="dep"><span class="name">tracing</span><span class="what">Structured logging</span></div>
+      <div class="dep"><span class="name">arc-swap</span><span class="what">Lock-free atomics</span></div>
+      <div class="dep"><span class="name">num-bigint</span><span class="what">Arbitrary precision</span></div>
+      <div class="dep"><span class="name">rcgen</span><span class="what">Certificate generation</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ CTA ════════════════════════ -->
+<section class="alt" style="text-align: center; padding: 80px 0;">
+  <div class="container">
+    <h2 style="font-size: 32px; margin-bottom: 16px;">Open Source. MIT Licensed.</h2>
+    <p style="color: var(--text-dim); font-size: 17px; margin-bottom: 32px; max-width: 500px; margin-left: auto; margin-right: auto;">
+      Built in the open. Contributions welcome.<br>Run it, fork it, improve it.
+    </p>
+    <div class="actions" style="justify-content: center;">
+      <a href="https://github.com/realJDP/xLedgRS" class="btn btn-primary">View on GitHub</a>
+      <a href="https://github.com/realJDP/xLedgRS/issues" class="btn btn-outline">Report Issue</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="f-links">
+      <a href="https://github.com/realJDP/xLedgRS">GitHub</a>
+      <a href="https://github.com/realJDP/xLedgRS/issues">Issues</a>
+      <a href="https://github.com/realJDP/xLedgRS/releases">Releases</a>
+      <a href="https://xrpl.org">XRPL.org</a>
+    </div>
+    <p>xLedgRS is an independent implementation of the XRP Ledger protocol.</p>
+    <p style="margin-top: 6px; color: #334155;">Not affiliated with Ripple Labs, Inc. &middot; MIT License &middot; 2026</p>
+  </div>
+</footer>
+
+</body>
+</html>

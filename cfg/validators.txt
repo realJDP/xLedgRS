@@ -1,0 +1,10 @@
+[validators]
+# Follower mode does not require a local validator list yet.
+# Keep this file present so rippled-style config loading succeeds.
+#
+# rippled also supports:
+# - [validator_list_sites]
+# - [validator_list_keys]
+# - [validator_list_threshold]
+#
+# Those sections are not wired into xLedgRS yet. See CONFIG_PARITY.md.

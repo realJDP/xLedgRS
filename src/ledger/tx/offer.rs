@@ -1,0 +1,716 @@
+//! Offer — IMPLEMENTED
+
+use crate::ledger::LedgerState;
+use crate::ledger::directory;
+use crate::ledger::offer::{amount_exponent, amount_is_zero, amount_to_i128, rate_gte, scale_amount, subtract_amount, BookKey};
+use crate::transaction::amount::{Amount, IouValue};
+use crate::transaction::ParsedTx;
+use super::ApplyResult;
+
+// ── Quality-based crossing arithmetic (rippled parity) ──────────────────────
+//
+// Rippled computes offer-crossing fills using the Quality rate **stored in
+// the book directory key** at offer creation, not re-derived from the
+// offer's current (taker_pays, taker_gets). For offers that have been
+// partially filled in earlier ledgers, the two can differ by a few
+// mantissa bits of rounding. Rippled's flow:
+//
+//   Quality::ceil_out_strict(amount, limit, roundUp)
+//     → mulRoundStrict(limit, quality.rate(), in_asset, roundUp)
+//       → muldiv_round(m1, m2, 10^14, bias)  // u128 precision
+//         where bias = (10^14 - 1) to round away from zero when needed
+//
+//   Quality::ceil_in_strict(amount, limit, roundUp)
+//     → divRoundStrict(limit, quality.rate(), out_asset, roundUp)
+//       → muldiv_round(numVal, 10^17, denVal, bias)
+//         where bias = (denVal - 1) to round away from zero when needed
+//
+// The rate encoding is (exp_biased_by_100 << 56) | mantissa_56bits, matching
+// getRate(offerOut, offerIn) = offerIn/offerOut at offer-creation time.
+
+const TEN_TO_17: u128 = 100_000_000_000_000_000;
+
+/// Decode the stored rate from a book directory key. Returns the rate as an
+/// `IouValue` representing `offerIn / offerOut` (how much IN per unit OUT).
+fn quality_rate_from_book_dir(book_directory: &[u8; 32]) -> IouValue {
+    let mut q = [0u8; 8];
+    q.copy_from_slice(&book_directory[24..32]);
+    let raw = u64::from_be_bytes(q);
+    if raw == 0 {
+        return IouValue::ZERO;
+    }
+    let mantissa = (raw & 0x00FF_FFFF_FFFF_FFFF) as i64;
+    let exponent = ((raw >> 56) as i32) - 100;
+    IouValue { mantissa, exponent }
+}
+
+/// Normalize a u128 mantissa to the canonical 16-digit range [1e15, 1e16),
+/// adjusting exponent. Rounding direction is controlled by `round_up`:
+///   - `round_up = false`: truncate toward zero (matches rippled's
+///     canonicalizeRoundStrict for positive results with roundUp=false).
+///   - `round_up = true`: round away from zero (matches rippled's
+///     canonicalizeRoundStrict for positive results with roundUp=true).
+///
+/// The ripple Number class distinguishes these two modes strictly; using
+/// round-half-even here would leak 1 ULP of precision vs rippled at the
+/// 16-digit truncation step that follows a mulRoundStrict/divRoundStrict.
+fn normalize_u128(mantissa_abs: u128, exp: i32, round_up: bool) -> (u128, i32) {
+    if mantissa_abs == 0 {
+        return (0, 0);
+    }
+    const MAX16: u128 = 9_999_999_999_999_999;
+    const MIN16: u128 = 1_000_000_000_000_000;
+    let mut abs = mantissa_abs;
+    let mut e = exp;
+    while abs > MAX16 {
+        let rem = abs % 10;
+        abs /= 10;
+        if round_up && rem != 0 {
+            abs += 1;
+        }
+        e += 1;
+    }
+    while abs < MIN16 && abs != 0 {
+        abs *= 10;
+        e -= 1;
+    }
+    (abs, e)
+}
+
+/// Convert an Amount to an IouValue (dimensionless) for canonical arithmetic.
+/// For XRP, treats drops as the mantissa with exponent 0, then normalizes.
+fn amount_to_iou_value(a: &Amount) -> IouValue {
+    match a {
+        Amount::Xrp(drops) => {
+            let mut v = IouValue { mantissa: *drops as i64, exponent: 0 };
+            v.normalize();
+            v
+        }
+        Amount::Iou { value, .. } => *value,
+        Amount::Mpt(_) => IouValue::ZERO,
+    }
+}
+
+/// Convert an IouValue back to an Amount using `template` to determine the
+/// output type. For XRP templates, the value is converted to drops (u64).
+/// For IOU templates, the value's canonical form is preserved.
+fn iou_value_to_amount(v: &IouValue, template: &Amount) -> Amount {
+    match template {
+        Amount::Xrp(_) => {
+            if v.mantissa <= 0 {
+                return Amount::Xrp(0);
+            }
+            let m = v.mantissa as u128;
+            let drops: u128 = if v.exponent >= 0 {
+                m.saturating_mul(10u128.saturating_pow(v.exponent as u32))
+            } else {
+                let scale = 10u128.saturating_pow((-v.exponent) as u32);
+                m / scale
+            };
+            Amount::Xrp(drops.min(u64::MAX as u128) as u64)
+        }
+        Amount::Iou { currency, issuer, .. } => Amount::Iou {
+            value: *v,
+            currency: currency.clone(),
+            issuer: *issuer,
+        },
+        Amount::Mpt(_) => template.clone(),
+    }
+}
+
+/// Rippled's `Quality::ceil_in_strict` subset: given an offer's (in, out) and
+/// a limit on the IN side, compute the corresponding OUT side using the
+/// stored quality rate. `round_up = true` rounds away from zero on positive
+/// results, matching rippled's bias for offer crossing.
+///
+/// Returns (filled_in, filled_out) pair. If `limit_in >= offer_in`, uses
+/// the full offer unchanged. Otherwise scales the out down via
+/// `divRoundStrict(limit_in, rate)` where `rate = offer_in / offer_out`.
+fn ceil_in_strict_via_quality(
+    offer_in:  &Amount,
+    offer_out: &Amount,
+    limit_in:  &Amount,
+    book_directory: &[u8; 32],
+    round_up:  bool,
+) -> (Amount, Amount) {
+    // Compare limit_in to offer_in. If we can take the whole offer, do so.
+    let limit_iou = amount_to_iou_value(limit_in);
+    let offer_in_iou = amount_to_iou_value(offer_in);
+
+    // Use i128 comparison at common exponent for correctness
+    let cmp_result = {
+        let a = limit_iou.mantissa as i128 * 10i128.pow(limit_iou.exponent.max(0) as u32);
+        let _ = a;
+        // Simpler: both are non-negative at this point. Compare via f64 for
+        // monotonic decision — we only need to know which is larger.
+        limit_iou.to_f64() >= offer_in_iou.to_f64()
+    };
+    if cmp_result {
+        return (offer_in.clone(), offer_out.clone());
+    }
+
+    // new_out = limit_in / rate, where rate = offerIn / offerOut
+    let rate = quality_rate_from_book_dir(book_directory);
+    if rate.mantissa == 0 {
+        // Fallback: no valid stored quality, return the whole offer.
+        return (offer_in.clone(), offer_out.clone());
+    }
+
+    // divRoundStrict: muldiv_round(num, 10^17, den, bias)
+    let num_val = limit_iou.mantissa.unsigned_abs() as u128;
+    let den_val = rate.mantissa.unsigned_abs() as u128;
+    let result_negative = (limit_iou.mantissa < 0) != (rate.mantissa < 0);
+    let bias: u128 = if result_negative != round_up { den_val - 1 } else { 0 };
+    let num_scaled = num_val.saturating_mul(TEN_TO_17).saturating_add(bias);
+    let result_mantissa_u128 = num_scaled / den_val;
+    let result_exp = limit_iou.exponent - rate.exponent - 17;
+
+    let (mant_norm, exp_norm) = normalize_u128(result_mantissa_u128, result_exp, round_up);
+    let new_out_iou = IouValue {
+        mantissa: if result_negative { -(mant_norm as i64) } else { mant_norm as i64 },
+        exponent: exp_norm,
+    };
+
+    let new_out = iou_value_to_amount(&new_out_iou, offer_out);
+    (limit_in.clone(), new_out)
+}
+
+/// Apply an OfferCreate: attempt to cross against the opposite book,
+/// then place any unfilled remainder as a standing order.
+pub(crate) fn apply_offer_create(
+    state:      &mut LedgerState,
+    tx:         &ParsedTx,
+    close_time: u64,
+) -> ApplyResult {
+    let mut owner_count_deltas: std::collections::BTreeMap<[u8; 20], i32> =
+        std::collections::BTreeMap::new();
+    let mut released_gets_from_cancel: Option<Amount> = None;
+
+    let mut remaining_pays = match &tx.taker_pays {
+        Some(a) => a.clone(),
+        None    => return ApplyResult::ClaimedCost("temBAD_OFFER"),
+    };
+    let mut remaining_gets = match &tx.taker_gets {
+        Some(a) => a.clone(),
+        None    => return ApplyResult::ClaimedCost("temBAD_OFFER"),
+    };
+
+    let offer_seq = super::sequence_proxy(tx);
+
+    // Validate offer amounts are non-zero
+    if amount_is_zero(&remaining_pays) || amount_is_zero(&remaining_gets) {
+        return ApplyResult::ClaimedCost("temBAD_OFFER");
+    }
+
+    if let Some(expiration) = tx.expiration {
+        if close_time >= expiration as u64 {
+            return ApplyResult::ClaimedCost("tecEXPIRED");
+        }
+    }
+
+    // Explicit cancellation: if OfferSequence is set, cancel that specific old offer
+    // before processing the new one (rippled OfferCreate.cpp behavior).
+    if let Some(cancel_seq) = tx.offer_sequence {
+        let cancel_key = crate::ledger::offer::shamap_key(&tx.account, cancel_seq);
+        // Hydrate from NuDB if not in typed map — offers from earlier ledgers
+        // live only in NuDB until explicitly loaded. Without this, remove_offer
+        // returns None and the cancellation is silently skipped, leaving a
+        // stale offer + book directory entry. This was Bug C.
+        if state.get_offer(&cancel_key).is_none() {
+            if let Some(raw) = state.get_raw_owned(&cancel_key) {
+                if let Some(decoded) = crate::ledger::Offer::decode_from_sle(&raw) {
+                    state.hydrate_offer(decoded);
+                }
+            }
+        }
+        if let Some(old) = state.remove_offer(&cancel_key) {
+            let old_offer_key = crate::ledger::offer::shamap_key(&old.account, old.sequence);
+            directory::dir_remove(state, &old.account, &old_offer_key.0);
+            if old.book_directory != [0u8; 32] {
+                directory::dir_remove_root(
+                    state,
+                    &crate::ledger::Key(old.book_directory),
+                    &old_offer_key.0,
+                );
+            }
+            *owner_count_deltas.entry(old.account).or_insert(0) -= 1;
+            released_gets_from_cancel = Some(old.taker_gets.clone());
+        }
+    }
+
+    // Funding check: does the account have enough of TakerGets to back the offer?
+    // rippled returns tecUNFUNDED_OFFER if the account can't fund the offer.
+    let funded = match &remaining_gets {
+        Amount::Xrp(drops) => {
+            // For XRP: account must have balance > reserve + offer amount
+            let fees = crate::ledger::fees::Fees::default();
+            let acct = state.get_account(&tx.account);
+            let balance = acct.map(|a| a.balance).unwrap_or(0);
+            let owner_count = acct.map(|a| a.owner_count).unwrap_or(0);
+            let reserve = fees.reserve_base + (owner_count as u64 * fees.reserve_inc);
+            let released = match released_gets_from_cancel.as_ref() {
+                Some(Amount::Xrp(d)) => *d,
+                _ => 0,
+            };
+            balance
+                .saturating_add(released)
+                .saturating_sub(reserve)
+                >= *drops
+        }
+        Amount::Iou { value, currency, issuer } => {
+            if &tx.account == issuer {
+                true
+            } else {
+            // For IOU: trust line must have sufficient balance
+                let key = crate::ledger::trustline::shamap_key(&tx.account, issuer, currency);
+                let mut available = if let Some(tl) = state.get_trustline(&key) {
+                    tl.balance_for(&tx.account)
+                } else if let Some(raw) = state.get_raw_owned(&key) {
+                    // Hydrate from NuDB
+                    if let Some(tl) = crate::ledger::RippleState::decode_from_sle(&raw) {
+                        let available = tl.balance_for(&tx.account);
+                        state.hydrate_trustline(tl);
+                        available
+                    } else {
+                        IouValue::ZERO
+                    }
+                } else {
+                    IouValue::ZERO
+                };
+
+                if let Some(Amount::Iou { value: released, currency: rel_currency, issuer: rel_issuer }) =
+                    released_gets_from_cancel.as_ref()
+                {
+                    if rel_currency == currency && rel_issuer == issuer {
+                        available = available.add(released);
+                    }
+                }
+
+                !available.sub(value).is_negative()
+            }
+        }
+        _ => true,
+    };
+    if !funded {
+        return ApplyResult::ClaimedCost("tecUNFUNDED_OFFER");
+    }
+
+    // ── Cross against the opposite book ──────────────────────────────────────
+    let opposite_key = BookKey::from_amounts(&remaining_gets, &remaining_pays);
+
+    // Collect crossing offer keys (can't mutate state while iterating)
+    let crossing_keys: Vec<crate::ledger::Key> = state.get_book(&opposite_key)
+        .map(|book| book.iter_by_quality().cloned().collect())
+        .unwrap_or_default();
+
+    let mut offers_to_remove = Vec::new();
+    const MAX_CROSSING_STEPS: usize = 850; // matches rippled
+    let mut steps = 0;
+
+    for key in &crossing_keys {
+        if steps >= MAX_CROSSING_STEPS { break; }
+        steps += 1;
+        let book_offer = match state.get_offer(key) {
+            Some(o) => o.clone(),
+            None    => continue,
+        };
+        // Track that this account's owner count may change (consumed offer = -1)
+
+        if amount_is_zero(&book_offer.taker_gets) { continue; }
+        if amount_is_zero(&remaining_gets) { break; }
+        // Skip expired offers (rippled: OfferCreate.cpp removes expired offers during crossing)
+        if let Some(expiration) = book_offer.expiration {
+            if close_time >= expiration as u64 {
+                offers_to_remove.push(*key);
+                continue;
+            }
+        }
+        // Quality gate: stop crossing when the book offer's quality is worse
+        // than what the taker specified. tfSell does NOT bypass this check —
+        // it only affects which side constrains the fill (confirmed: rippled
+        // with tfSell still respects quality and rejects worse-rate offers).
+        //
+        // This gate must be evaluated BEFORE the self-owned check: rippled's
+        // BookStep::limitSelfCrossQuality (src/libxrpl/tx/paths/BookStep.cpp
+        // :404-409) only removes self-owned offers when `offer.quality() >=
+        // qualityThreshold_`. Reversing the order caused our engine to
+        // silently cancel a previous same-account offer in the opposite book
+        // whenever the new offer walked the book, even when the prices
+        // didn't actually overlap.
+        let crosses = rate_gte(&book_offer.taker_gets, &book_offer.taker_pays,
+                     &remaining_pays, &remaining_gets);
+        if !crosses {
+            break;
+        }
+
+        // Self-owned offers at a crossing quality: rippled's
+        // limitSelfCrossQuality removes them even though no actual trade
+        // happens. Same-account "trade" would be meaningless, so the old
+        // offer is cancelled and we continue walking the book.
+        if book_offer.account == tx.account {
+            offers_to_remove.push(*key);
+            continue;
+        }
+
+        let we_want_i = amount_to_i128(&remaining_pays);
+        let they_give_i = amount_to_i128(&book_offer.taker_gets);
+        let we_can_pay_i = amount_to_i128(&remaining_gets);
+        let they_want_i = amount_to_i128(&book_offer.taker_pays);
+        let exp_want = amount_exponent(&remaining_pays);
+        let exp_give = amount_exponent(&book_offer.taker_gets);
+        let exp_can_pay = amount_exponent(&remaining_gets);
+        let exp_they_want = amount_exponent(&book_offer.taker_pays);
+
+        if they_give_i <= 0 || they_want_i <= 0 { continue; }
+
+        // Fill ratio is bounded by BOTH sides:
+        // 1) what we still want to receive (remaining_pays / offer_gets)
+        // 2) what we can still pay         (remaining_gets / offer_pays)
+        //
+        // tfSell semantics (rippled CreateOffer / FlowCross): the maker has
+        // committed to spending all of `taker_gets` and will accept whatever
+        // amount of `taker_pays` the book provides. The quality gate above
+        // still applies (we won't cross worse-than-requested rates), but
+        // within that gate we ignore the "at-least-want" receive floor and
+        // bind only by `ratio_pay`. For non-tfSell offers we keep the
+        // canonical min(receive, pay) behavior.
+        const TF_SELL: u32 = 0x00080000;
+        let is_sell = (tx.flags & TF_SELL) != 0;
+        let ratio_receive = normalize_ratio(we_want_i, exp_want, they_give_i, exp_give);
+        let ratio_pay = normalize_ratio(we_can_pay_i, exp_can_pay, they_want_i, exp_they_want);
+        let (mut fill_num, fill_den) = if is_sell {
+            ratio_pay
+        } else {
+            min_ratio(ratio_receive, ratio_pay)
+        };
+        if fill_num > fill_den {
+            fill_num = fill_den;
+        }
+
+        // For tfSell, match rippled's exact arithmetic: use the stored
+        // book-directory quality as the rate and compute filled_out via
+        // divRoundStrict (ceil_in_strict). This avoids the precision loss
+        // of re-deriving the rate from the offer's current (taker_pays,
+        // taker_gets) pair via a ratio-based scale. Non-tfSell continues to
+        // use the ratio-based scale_amount until the full Quality ceil_out
+        // path is ported.
+        let (filled_pay, filled_receive) = if is_sell {
+            let limit_in = if fill_num >= fill_den {
+                book_offer.taker_pays.clone()
+            } else {
+                scale_amount(&book_offer.taker_pays, fill_num, fill_den)
+            };
+            let (fin, fout) = ceil_in_strict_via_quality(
+                &book_offer.taker_pays,
+                &book_offer.taker_gets,
+                &limit_in,
+                &book_offer.book_directory,
+                false, // roundUp=false: taker receives rounded toward zero,
+                       // matches rippled's canonicalizeRoundStrict path
+            );
+            (fin, fout)
+        } else {
+            let filled_receive = scale_amount(&book_offer.taker_gets, fill_num, fill_den);
+            let filled_pay     = scale_amount(&book_offer.taker_pays, fill_num, fill_den);
+            (filled_pay, filled_receive)
+        };
+
+        // Transfer assets between the two parties
+        transfer_amount(state, &tx.account, true,  &filled_receive);
+        transfer_amount(state, &tx.account, false, &filled_pay);
+        transfer_amount(state, &book_offer.account, true,  &filled_pay);
+        transfer_amount(state, &book_offer.account, false, &filled_receive);
+
+        // Update our remaining want/give
+        remaining_pays = subtract_amount(&remaining_pays, &filled_receive);
+        remaining_gets = subtract_amount(&remaining_gets, &filled_pay);
+
+        let fully_consumed = fill_num >= fill_den;
+        if fully_consumed {
+            offers_to_remove.push(*key);
+        } else {
+            state.remove_offer(key);
+            let new_gets = subtract_amount(&book_offer.taker_gets, &filled_receive);
+            let new_pays = subtract_amount(&book_offer.taker_pays, &filled_pay);
+            if !amount_is_zero(&new_gets) && !amount_is_zero(&new_pays) {
+                let mut updated = book_offer.clone();
+                updated.taker_gets = new_gets;
+                updated.taker_pays = new_pays;
+                updated.raw_sle = None;
+                state.insert_offer(updated);
+            } else {
+                // Offer fully consumed (remainder is zero) — remove from owner and book directories
+                let offer_key = crate::ledger::offer::shamap_key(&book_offer.account, book_offer.sequence);
+                let removed_owner = directory::dir_remove(state, &book_offer.account, &offer_key.0);
+                *owner_count_deltas.entry(book_offer.account).or_insert(0) -= 1;
+                if book_offer.book_directory != [0u8; 32] {
+                    let removed_book = directory::dir_remove_root(
+                        state,
+                        &crate::ledger::Key(book_offer.book_directory),
+                        &offer_key.0,
+                    );
+                    if !removed_owner || !removed_book {
+                        let owner_still_has_entry =
+                            directory::owner_dir_contains_entry(state, &book_offer.account, &offer_key.0);
+                        tracing::warn!(
+                            "offer replay remove miss (zero remainder): account={} seq={} owner_removed={} book_removed={} owner_has_entry={}",
+                            hex::encode_upper(book_offer.account),
+                            book_offer.sequence,
+                            removed_owner,
+                            removed_book,
+                            owner_still_has_entry,
+                        );
+                    }
+                } else if !removed_owner {
+                    let owner_still_has_entry =
+                        directory::owner_dir_contains_entry(state, &book_offer.account, &offer_key.0);
+                    tracing::warn!(
+                        "offer replay owner-dir remove miss (zero remainder): account={} seq={} owner_has_entry={}",
+                        hex::encode_upper(book_offer.account),
+                        book_offer.sequence,
+                        owner_still_has_entry,
+                    );
+                }
+            }
+        }
+
+        if amount_is_zero(&remaining_pays) {
+            break;
+        }
+    }
+
+    // Remove consumed offers and decrement their owners' counts
+    for key in &offers_to_remove {
+        // Hydrate from NuDB if not in typed map (same hydration gap as trust lines)
+        if state.get_offer(key).is_none() {
+            if let Some(raw) = state.get_raw_owned(key) {
+                if let Some(decoded) = crate::ledger::Offer::decode_from_sle(&raw) {
+                    state.hydrate_offer(decoded);
+                }
+            }
+        }
+        if let Some(removed) = state.remove_offer(key) {
+            // Remove from owner and book directories
+            let offer_key = crate::ledger::offer::shamap_key(&removed.account, removed.sequence);
+            let removed_owner = directory::dir_remove(state, &removed.account, &offer_key.0);
+            *owner_count_deltas.entry(removed.account).or_insert(0) -= 1;
+            if removed.book_directory != [0u8; 32] {
+                let removed_book = directory::dir_remove_root(
+                    state,
+                    &crate::ledger::Key(removed.book_directory),
+                    &offer_key.0,
+                );
+                if !removed_owner || !removed_book {
+                    let owner_still_has_entry =
+                        directory::owner_dir_contains_entry(state, &removed.account, &offer_key.0);
+                    tracing::warn!(
+                        "offer replay remove miss (consumed): account={} seq={} owner_removed={} book_removed={} owner_has_entry={}",
+                        hex::encode_upper(removed.account),
+                        removed.sequence,
+                        removed_owner,
+                        removed_book,
+                        owner_still_has_entry,
+                    );
+                }
+            } else if !removed_owner {
+                let owner_still_has_entry =
+                    directory::owner_dir_contains_entry(state, &removed.account, &offer_key.0);
+                tracing::warn!(
+                    "offer replay owner-dir remove miss (consumed): account={} seq={} owner_has_entry={}",
+                    hex::encode_upper(removed.account),
+                    removed.sequence,
+                    owner_still_has_entry,
+                );
+            }
+        }
+    }
+
+    // ── OfferCreate flags (rippled: OfferCreate.cpp) ──
+    const TF_IMMEDIATE_OR_CANCEL: u32 = 0x00020000;
+    const TF_FILL_OR_KILL: u32 = 0x00040000;
+
+    // tfFillOrKill: cancel entire offer if any remainder (must be fully filled)
+    if (tx.flags & TF_FILL_OR_KILL) != 0
+        && (!amount_is_zero(&remaining_pays) || !amount_is_zero(&remaining_gets))
+    {
+        // Offer not fully filled — return tecKILLED (fee claimed, no offer placed)
+        return ApplyResult::ClaimedCost("tecKILLED");
+    }
+
+    // tfImmediateOrCancel: don't place remainder as standing offer
+    let place_remainder = (tx.flags & TF_IMMEDIATE_OR_CANCEL) == 0;
+
+    // ── Place remainder as standing offer ────────────────────────────────────
+    if place_remainder && !amount_is_zero(&remaining_pays) && !amount_is_zero(&remaining_gets) {
+        let offer_key = crate::ledger::offer::shamap_key(&tx.account, offer_seq);
+        let owner_node = directory::dir_add(state, &tx.account, offer_key.0);
+        let book_key = BookKey::from_amounts(&remaining_pays, &remaining_gets);
+        let book_quality = directory::offer_quality(&remaining_gets, &remaining_pays);
+        let (book_directory, book_node) =
+            directory::dir_add_book(state, &book_key, book_quality, offer_key.0);
+        // Translate transaction flags → ledger entry flags.
+        // rippled: OfferCreate.cpp sets SLE flags from tx flags:
+        //   tfPassive  (0x00010000) → lsfPassive (0x00010000)
+        //   tfSell     (0x00080000) → lsfSell    (0x00020000)
+        let mut sle_flags: u32 = 0;
+        if (tx.flags & 0x00010000) != 0 { sle_flags |= crate::ledger::offer::LSF_PASSIVE; }
+        if (tx.flags & 0x00080000) != 0  { sle_flags |= crate::ledger::offer::LSF_SELL; } // tfSell
+
+        let offer = crate::ledger::Offer {
+            account:    tx.account,
+            sequence:   offer_seq,
+            taker_pays: remaining_pays,
+            taker_gets: remaining_gets,
+            flags:      sle_flags,
+            book_directory: book_directory.0, book_node, owner_node,
+            expiration: tx.expiration, domain_id: None, additional_books: Vec::new(),
+            previous_txn_id: [0u8; 32], previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        state.insert_offer(offer);
+        *owner_count_deltas.entry(tx.account).or_insert(0) += 1;
+    }
+
+    // Update owner counts via explicit deltas — NOT by recomputing from
+    // directory entry count. rippled's adjustOwnerCount is called exactly
+    // once per object add/remove: +1 for offers placed, -1 for offers
+    // cancelled or consumed. Recomputing from the raw directory entry count
+    // produces wrong results because some directory entries (trust lines,
+    // tickets, etc. from other tx types) don't map 1:1 with OwnerCount.
+    for (account, delta) in owner_count_deltas {
+        if delta == 0 { continue; }
+        if let Some(acct) = state.get_account(&account) {
+            let mut updated = acct.clone();
+            updated.owner_count = if delta > 0 {
+                updated.owner_count.saturating_add(delta as u32)
+            } else {
+                updated.owner_count.saturating_sub((-delta) as u32)
+            };
+            state.insert_account(updated);
+        }
+    }
+
+    ApplyResult::Success
+}
+
+/// Transfer an amount to/from an account.
+/// `receive = true` credits, `receive = false` debits.
+fn transfer_amount(
+    state:   &mut LedgerState,
+    account: &[u8; 20],
+    receive: bool,
+    amount:  &Amount,
+) {
+    match amount {
+        Amount::Xrp(drops) => {
+            if let Some(acct) = state.get_account(account) {
+                let mut acct = acct.clone();
+                if receive {
+                    acct.balance = acct.balance.saturating_add(*drops);
+                } else {
+                    acct.balance = acct.balance.saturating_sub(*drops);
+                }
+                state.insert_account(acct);
+            }
+        }
+        Amount::Iou { value, currency, issuer } => {
+            let key = crate::ledger::trustline::shamap_key(account, issuer, currency);
+            let mut tl = if let Some(existing) = state.get_trustline(&key) {
+                existing.clone()
+            } else if let Some(raw) = state.get_raw_owned(&key) {
+                // Trust line exists in NuDB but wasn't hydrated into typed map.
+                // Decode and hydrate before mutating to preserve existing fields
+                // (flags, limits, balances, PreviousTxnID, etc.).
+                if let Some(decoded) = crate::ledger::RippleState::decode_from_sle(&raw) {
+                    state.hydrate_trustline(decoded.clone());
+                    decoded
+                } else {
+                    crate::ledger::RippleState::new(account, issuer, currency.clone())
+                }
+            } else {
+                crate::ledger::RippleState::new(account, issuer, currency.clone())
+            };
+            if receive {
+                tl.transfer(issuer, value);
+            } else {
+                tl.transfer(account, value);
+            }
+            state.insert_trustline(tl);
+        }
+        Amount::Mpt(_) => {
+            // MPT amounts not yet supported for balance transfers
+        }
+    }
+}
+
+fn normalize_ratio(num: i128, num_exp: i32, den: i128, den_exp: i32) -> (i128, i128) {
+    if den <= 0 {
+        return (0, 1);
+    }
+    if num <= 0 {
+        return (0, 1);
+    }
+    if num_exp == den_exp {
+        return (num, den);
+    }
+    if num_exp > den_exp {
+        let shift = (num_exp - den_exp).min(38) as u32;
+        (num.saturating_mul(10i128.pow(shift)), den)
+    } else {
+        let shift = (den_exp - num_exp).min(38) as u32;
+        (num, den.saturating_mul(10i128.pow(shift)))
+    }
+}
+
+fn min_ratio(a: (i128, i128), b: (i128, i128)) -> (i128, i128) {
+    let (an, ad) = a;
+    let (bn, bd) = b;
+    if an <= 0 || ad <= 0 {
+        return (0, 1);
+    }
+    if bn <= 0 || bd <= 0 {
+        return (0, 1);
+    }
+    match an.checked_mul(bd).zip(bn.checked_mul(ad)) {
+        Some((lhs, rhs)) => {
+            if lhs <= rhs { a } else { b }
+        }
+        None => {
+            // Rare overflow on cross-multiply: fall back to conservative lower bound.
+            if an.saturating_mul(bd) <= bn.saturating_mul(ad) { a } else { b }
+        }
+    }
+}
+
+/// Apply an OfferCancel: remove a standing offer from the DEX.
+pub(crate) fn apply_offer_cancel(
+    state:  &mut LedgerState,
+    tx:     &ParsedTx,
+) -> ApplyResult {
+    let target_seq = match tx.offer_sequence {
+        Some(s) => s,
+        None    => return ApplyResult::ClaimedCost("temMALFORMED"),
+    };
+
+    let key = crate::ledger::offer::shamap_key(&tx.account, target_seq);
+    if let Some(_removed) = state.remove_offer(&key) {
+        if !directory::dir_remove(state, &tx.account, &key.0) {
+            let owner_still_has_entry =
+                directory::owner_dir_contains_entry(state, &tx.account, &key.0);
+            tracing::warn!(
+                "offer cancel owner-dir remove miss: account={} seq={} owner_has_entry={}",
+                hex::encode_upper(tx.account),
+                target_seq,
+                owner_still_has_entry,
+            );
+        }
+    }
+
+    if let Some(acct) = state.get_account(&tx.account) {
+        let mut updated = acct.clone();
+        updated.owner_count = crate::ledger::directory::owner_dir_entry_count(state, &tx.account) as u32;
+        state.insert_account(updated);
+    }
+
+    ApplyResult::Success
+}

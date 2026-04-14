@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>xLedgRS mainnet observer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0e17; color: #c8d6e5; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 14px; padding: 20px; }
+h1 { color: #00d2ff; font-size: 22px; margin-bottom: 20px; letter-spacing: 1px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 1000px; }
+.panel { background: #111927; border: 1px solid #1e2d3d; border-radius: 8px; padding: 16px; }
+.panel h2 { color: #00d2ff; font-size: 14px; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 2px; border-bottom: 1px solid #1e2d3d; padding-bottom: 8px; }
+.row { display: flex; justify-content: space-between; padding: 4px 0; }
+.label { color: #6b7c93; }
+.value { color: #e8f0fe; font-weight: bold; }
+.green { color: #00e676; }
+.red { color: #ff5252; }
+.yellow { color: #ffd740; }
+.blue { color: #40c4ff; }
+.purple { color: #ce93d8; }
+.full-width { grid-column: 1 / -1; }
+.feed { max-height: 220px; overflow-y: auto; font-size: 12px; }
+.feed-line { padding: 3px 0; border-bottom: 1px solid #0d1520; color: #8899aa; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.status-dot.on { background: #00e676; box-shadow: 0 0 6px #00e676; }
+.status-dot.off { background: #ff5252; }
+#connection { position: fixed; top: 10px; right: 20px; font-size: 12px; color: #6b7c93; }
+.big { font-size: 24px; }
+</style>
+</head>
+<body>
+
+<h1>xLedgRS mainnet observer</h1>
+<div id="connection">connecting...</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Ledger Follower</h2>
+    <div class="row"><span class="label">Status</span><span class="value" id="f-status">-</span></div>
+    <div class="row"><span class="label">Current Ledger</span><span class="value blue big" id="f-seq">-</span></div>
+    <div class="row"><span class="label">Ledgers Applied</span><span class="value" id="f-ledgers">-</span></div>
+    <div class="row"><span class="label">Transactions</span><span class="value yellow" id="f-txs">-</span></div>
+    <div class="row"><span class="label">Rate</span><span class="value" id="f-rate">-</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>State Changes</h2>
+    <div class="row"><span class="label">Created</span><span class="value green" id="f-created">-</span></div>
+    <div class="row"><span class="label">Modified</span><span class="value purple" id="f-modified">-</span></div>
+    <div class="row"><span class="label">Deleted</span><span class="value red" id="f-deleted">-</span></div>
+    <div class="row" style="margin-top:8px; border-top:1px solid #1e2d3d; padding-top:8px">
+      <span class="label">Hash Matches</span><span class="value green" id="f-match">-</span>
+    </div>
+    <div class="row"><span class="label">Hash Mismatches</span><span class="value red" id="f-mismatch">-</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>Node</h2>
+    <div class="row"><span class="label">Network</span><span class="value" id="n-network">-</span></div>
+    <div class="row"><span class="label">Version</span><span class="value" id="n-version">-</span></div>
+    <div class="row"><span class="label">Peers</span><span class="value" id="n-peers">-</span></div>
+    <div class="row"><span class="label">Memory</span><span class="value" id="n-mem">-</span></div>
+    <div class="row"><span class="label">Uptime</span><span class="value" id="n-uptime">-</span></div>
+    <div class="row"><span class="label">Objects in Store</span><span class="value blue" id="n-objects">-</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>RPC Sync</h2>
+    <div class="row"><span class="label">Status</span><span class="value" id="s-status">-</span></div>
+    <div class="row"><span class="label">Objects</span><span class="value" id="s-objects">-</span></div>
+    <div class="row"><span class="label">Accounts</span><span class="value" id="s-accounts">-</span></div>
+    <div class="row"><span class="label">Pages</span><span class="value" id="s-pages">-</span></div>
+  </div>
+
+  <div class="panel full-width">
+    <h2>Live Feed</h2>
+    <div class="feed" id="feed"></div>
+  </div>
+</div>
+
+<script>
+const RPC_URL = window.location.origin;
+let prevTxs = 0, prevCreated = 0, prevModified = 0, prevDeleted = 0, prevTime = 0;
+
+function fmt(n) {
+  if (n == null) return '-';
+  return Number(n).toLocaleString();
+}
+
+function uptime(s) {
+  if (!s) return '-';
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d > 0) return d + 'd ' + h + 'h';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm ' + (s%60) + 's';
+}
+
+async function poll() {
+  try {
+    const r = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"method":"server_info"}',
+    });
+    const d = await r.json();
+    const info = d.result?.info;
+    if (!info) return;
+
+    document.getElementById('connection').innerHTML = '<span class="status-dot on"></span>connected';
+
+    // Node
+    document.getElementById('n-network').textContent = info.network_id || '-';
+    document.getElementById('n-version').textContent = info.build_version || '-';
+    document.getElementById('n-peers').textContent = fmt(info.peers);
+    document.getElementById('n-mem').textContent = fmt(info.memory_mb) + ' MB';
+    document.getElementById('n-uptime').textContent = uptime(info.uptime);
+    document.getElementById('n-objects').textContent = fmt(info.objects_stored);
+
+    // Follower
+    const f = info.follower;
+    if (f) {
+      document.getElementById('f-status').innerHTML = f.running
+        ? '<span class="status-dot on"></span>FOLLOWING' : '<span class="status-dot off"></span>stopped';
+      document.getElementById('f-seq').textContent = fmt(f.current_seq);
+      document.getElementById('f-ledgers').textContent = fmt(f.ledgers_applied);
+      document.getElementById('f-txs').textContent = fmt(f.txs_applied);
+      document.getElementById('f-created').textContent = fmt(f.objects_created);
+      document.getElementById('f-modified').textContent = fmt(f.objects_modified);
+      document.getElementById('f-deleted').textContent = fmt(f.objects_deleted);
+      document.getElementById('f-match').textContent = fmt(f.hash_matches);
+      document.getElementById('f-mismatch').textContent = fmt(f.hash_mismatches);
+
+      // Rate
+      const now = Date.now();
+      if (prevTime > 0) {
+        const dt = (now - prevTime) / 1000;
+        if (dt > 0) {
+          const txR = ((f.txs_applied - prevTxs) / dt).toFixed(1);
+          const cR = f.objects_created - prevCreated;
+          const mR = f.objects_modified - prevModified;
+          const dR = f.objects_deleted - prevDeleted;
+          document.getElementById('f-rate').textContent = txR + ' tx/s';
+
+          // Feed line
+          const feed = document.getElementById('feed');
+          const line = document.createElement('div');
+          line.className = 'feed-line';
+          const ts = new Date().toLocaleTimeString();
+          line.innerHTML = ts
+            + ' <span class="blue">#' + fmt(f.current_seq) + '</span>'
+            + ' <span class="yellow">+' + (f.txs_applied - prevTxs) + ' tx</span>'
+            + ' <span class="green">+' + cR + '</span>'
+            + ' <span class="purple">~' + mR + '</span>'
+            + ' <span class="red">-' + dR + '</span>';
+          feed.insertBefore(line, feed.firstChild);
+          while (feed.children.length > 60) feed.removeChild(feed.lastChild);
+        }
+      }
+      prevTxs = f.txs_applied;
+      prevCreated = f.objects_created;
+      prevModified = f.objects_modified;
+      prevDeleted = f.objects_deleted;
+      prevTime = now;
+    }
+
+    // RPC sync
+    const s = info.rpc_sync;
+    if (s) {
+      document.getElementById('s-status').innerHTML = s.complete
+        ? '<span class="status-dot on"></span>COMPLETE'
+        : (s.running ? '<span class="status-dot on"></span>SYNCING' : 'idle');
+      document.getElementById('s-objects').textContent = fmt(s.objects);
+      document.getElementById('s-accounts').textContent = fmt(s.accounts);
+      document.getElementById('s-pages').textContent = fmt(s.pages);
+    }
+  } catch(e) {
+    document.getElementById('connection').innerHTML = '<span class="status-dot off"></span>disconnected';
+  }
+}
+
+setInterval(poll, 2000);
+poll();
+</script>
+</body>
+</html>

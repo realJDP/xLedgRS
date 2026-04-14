@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xLedgRS // testnet</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0a; color: #e0e0e0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; padding: 20px; }
+  h1 { color: #00ff88; font-size: 22px; margin-bottom: 4px; }
+  .subtitle { color: #666; font-size: 12px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .card { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px; }
+  .card h2 { color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  .stat { font-size: 28px; font-weight: bold; color: #00ff88; }
+  .stat.warn { color: #ffaa00; }
+  .stat.off { color: #ff4444; }
+  .stat-label { color: #555; font-size: 11px; margin-top: 2px; }
+  .wide { grid-column: 1 / -1; }
+  .half { grid-column: span 2; }
+  .feed { max-height: 350px; overflow-y: auto; }
+  .feed-item { padding: 5px 0; border-bottom: 1px solid #1a1a1a; display: flex; gap: 10px; font-size: 12px; }
+  .feed-item:last-child { border-bottom: none; }
+  .feed-time { color: #444; min-width: 80px; }
+  .feed-type { min-width: 100px; font-weight: bold; }
+  .feed-type.proposal { color: #4488ff; }
+  .feed-type.validation { color: #ff88ff; }
+  .feed-type.manifest { color: #ffaa44; }
+  .feed-type.status_change { color: #44ffaa; }
+  .feed-type.status { color: #44ffaa; }
+  .feed-type.transaction { color: #ff4444; }
+  .feed-type.tx { color: #ff4444; }
+  .feed-type.ledger { color: #00ff88; }
+  .feed-type.ping { color: #666; }
+  .feed-type.disconnect { color: #ff4444; }
+  .feed-type.reconnect { color: #ffaa00; }
+  .feed-detail { color: #888; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.on { background: #00ff88; box-shadow: 0 0 6px #00ff8844; }
+  .dot.off { background: #ff4444; }
+  .info-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #1a1a1a; font-size: 13px; }
+  .info-key { color: #666; }
+  .info-val { color: #ccc; }
+  .counter { display: inline-block; background: #1a1a1a; padding: 2px 8px; border-radius: 4px; font-size: 12px; color: #888; margin-left: 8px; }
+  #connection-status { font-size: 11px; }
+  .bench-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .bench-stat { font-size: 20px; font-weight: bold; color: #00ff88; }
+  .event-log { max-height: 120px; overflow-y: auto; font-size: 11px; }
+  .event-log-item { padding: 3px 0; border-bottom: 1px solid #1a1a1a; color: #888; }
+  .event-log-item.error { color: #ff4444; }
+</style>
+</head>
+<body>
+
+<h1>xLedgRS <span style="color:#444">//</span> <span style="color:#ffaa00">testnet</span></h1>
+<div class="subtitle" id="connection-status"><span class="dot off"></span> connecting...</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Peers</h2>
+    <div class="stat" id="peer-count">-</div>
+    <div class="stat-label">connected</div>
+  </div>
+  <div class="card">
+    <h2>Ledger</h2>
+    <div class="stat" id="ledger-seq">-</div>
+    <div class="stat-label" id="ledger-hash">-</div>
+  </div>
+  <div class="card">
+    <h2>Uptime</h2>
+    <div class="stat" id="uptime">-</div>
+    <div class="stat-label" id="server-state">-</div>
+  </div>
+</div>
+
+<!-- Overnight benchmark stats -->
+<div class="bench-grid">
+  <div class="card">
+    <h2>Ledgers / Hour</h2>
+    <div class="bench-stat" id="ledgers-per-hour">0</div>
+    <div class="stat-label" id="ledgers-total">0 total</div>
+  </div>
+  <div class="card">
+    <h2>Avg Msg / Ledger</h2>
+    <div class="bench-stat" id="avg-msg-per-ledger">-</div>
+    <div class="stat-label">messages between closes</div>
+  </div>
+  <div class="card">
+    <h2>Peak MSG/S</h2>
+    <div class="bench-stat" id="peak-msg-s">0</div>
+    <div class="stat-label" id="peak-msg-time">-</div>
+  </div>
+  <div class="card">
+    <h2>Memory</h2>
+    <div class="bench-stat" id="memory-current">-</div>
+    <div class="stat-label" id="memory-range">-</div>
+  </div>
+  <div class="card">
+    <h2>Disconnects</h2>
+    <div class="bench-stat" id="disconnect-count">0</div>
+    <div class="stat-label" id="last-disconnect">none</div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card half">
+    <h2>Server Info</h2>
+    <div id="server-info">
+      <div class="info-row"><span class="info-key">build</span><span class="info-val" id="build-version">-</span></div>
+      <div class="info-row"><span class="info-key">network</span><span class="info-val" id="network-id">-</span></div>
+      <div class="info-row"><span class="info-key">complete ledgers</span><span class="info-val" id="complete-ledgers">-</span></div>
+      <div class="info-row"><span class="info-key">base fee</span><span class="info-val" id="base-fee">-</span></div>
+      <div class="info-row"><span class="info-key">reserve</span><span class="info-val" id="reserve">-</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Message Counts</h2>
+    <div id="msg-counts" style="font-size: 13px;">
+      <div class="info-row"><span class="info-key">proposals</span><span class="info-val" id="cnt-proposals">0</span></div>
+      <div class="info-row"><span class="info-key">validations</span><span class="info-val" id="cnt-validations">0</span></div>
+      <div class="info-row"><span class="info-key">manifests</span><span class="info-val" id="cnt-manifests">0</span></div>
+      <div class="info-row"><span class="info-key">status changes</span><span class="info-val" id="cnt-status">0</span></div>
+      <div class="info-row"><span class="info-key">transactions</span><span class="info-val" id="cnt-tx">0</span></div>
+      <div class="info-row"><span class="info-key">total</span><span class="info-val" id="cnt-total">0</span></div>
+    </div>
+  </div>
+
+  <div class="card wide">
+    <h2>Live Feed <span class="counter" id="feed-rate">0 msg/s</span></h2>
+    <div class="feed" id="feed"></div>
+  </div>
+
+  <div class="card wide">
+    <h2>Event Log</h2>
+    <div class="event-log" id="event-log"></div>
+  </div>
+</div>
+
+<script>
+const RPC = 'http://127.0.0.1:5006';
+const WS_URL = 'ws://127.0.0.1:6007';
+
+const counts = { proposals: 0, validations: 0, manifests: 0, status: 0, tx: 0, total: 0 };
+let msgPerSec = 0;
+let msgThisSecond = 0;
+const MAX_FEED = 200;
+
+// Benchmark state
+let ledgerCount = 0;
+let firstLedgerTime = null;
+let msgSinceLedger = 0;
+let ledgerMsgSamples = [];
+let peakMsgPerSec = 0;
+let peakMsgTime = '-';
+let disconnectCount = 0;
+let lastDisconnect = null;
+let wsConnected = false;
+let lastValidationTime = null;
+let lastPeerCount = 0;
+let memoryMin = Infinity;
+let memoryMax = 0;
+
+function $(id) { return document.getElementById(id); }
+
+function time() {
+  return new Date().toLocaleTimeString('en-US', { hour12: false });
+}
+
+function logEvent(msg, isError) {
+  const log = $('event-log');
+  const item = document.createElement('div');
+  item.className = 'event-log-item' + (isError ? ' error' : '');
+  item.textContent = `${time()} - ${msg}`;
+  log.insertBefore(item, log.firstChild);
+  while (log.children.length > 100) log.removeChild(log.lastChild);
+}
+
+function addFeedItem(type, detail) {
+  const feed = $('feed');
+  const item = document.createElement('div');
+  item.className = 'feed-item';
+  item.innerHTML = `<span class="feed-time">${time()}</span><span class="feed-type ${type}">${type}</span><span class="feed-detail">${detail}</span>`;
+  feed.insertBefore(item, feed.firstChild);
+  while (feed.children.length > MAX_FEED) feed.removeChild(feed.lastChild);
+  msgThisSecond++;
+  msgSinceLedger++;
+  counts.total++;
+  $('cnt-total').textContent = counts.total.toLocaleString();
+}
+
+function updateBenchmarks() {
+  // Ledgers per hour
+  if (firstLedgerTime && ledgerCount > 0) {
+    const elapsed = (Date.now() - firstLedgerTime) / 1000 / 3600; // hours
+    const rate = elapsed > 0 ? (ledgerCount / elapsed) : 0;
+    $('ledgers-per-hour').textContent = rate < 10 ? rate.toFixed(1) : Math.round(rate);
+  }
+  $('ledgers-total').textContent = ledgerCount + ' total';
+
+  // Avg msg per ledger
+  if (ledgerMsgSamples.length > 0) {
+    const avg = ledgerMsgSamples.reduce((a, b) => a + b, 0) / ledgerMsgSamples.length;
+    $('avg-msg-per-ledger').textContent = Math.round(avg);
+  }
+
+  // Peak msg/s
+  $('peak-msg-s').textContent = peakMsgPerSec;
+  $('peak-msg-time').textContent = peakMsgTime;
+
+  // Disconnects
+  $('disconnect-count').textContent = disconnectCount;
+  $('disconnect-count').className = 'bench-stat' + (disconnectCount > 0 ? ' style="color:#ff4444"' : '');
+  $('last-disconnect').textContent = lastDisconnect || 'none';
+}
+
+async function fetchServerInfo() {
+  try {
+    const res = await fetch(RPC, {
+      method: 'POST',
+      body: JSON.stringify({ method: 'server_info', params: [], id: 1 }),
+    });
+    const data = await res.json();
+    const info = data.result.info;
+    const vl = info.validated_ledger;
+
+    $('peer-count').textContent = info.peers;
+    $('peer-count').className = 'stat' + (info.peers > 0 ? '' : ' warn');
+
+    // Track peer disconnections
+    if (lastPeerCount > 0 && info.peers === 0) {
+      disconnectCount++;
+      lastDisconnect = time();
+      logEvent(`All peers disconnected (was ${lastPeerCount})`, true);
+      addFeedItem('disconnect', 'All peers lost');
+    } else if (lastPeerCount > info.peers && info.peers > 0) {
+      const lost = lastPeerCount - info.peers;
+      logEvent(`Lost ${lost} peer(s) (${lastPeerCount} -> ${info.peers})`, true);
+    } else if (info.peers > lastPeerCount && lastPeerCount >= 0) {
+      const gained = info.peers - lastPeerCount;
+      if (lastPeerCount > 0) logEvent(`Gained ${gained} peer(s) (${lastPeerCount} -> ${info.peers})`);
+    }
+    lastPeerCount = info.peers;
+
+    $('ledger-seq').textContent = vl.seq.toLocaleString();
+    $('ledger-hash').textContent = vl.hash.substring(0, 16) + '...';
+    $('server-state').textContent = info.server_state;
+    $('build-version').textContent = info.build_version;
+    $('network-id').textContent = info.network_id;
+    $('complete-ledgers').textContent = info.complete_ledgers;
+    $('base-fee').textContent = vl.base_fee_xrp + ' XRP';
+    $('reserve').textContent = vl.reserve_base_xrp + ' / ' + vl.reserve_inc_xrp + ' XRP';
+
+    // Uptime from server
+    const secs = info.uptime || 0;
+    const mins = Math.floor(secs / 60);
+    const hrs = Math.floor(mins / 60);
+    const days = Math.floor(hrs / 24);
+    if (days > 0) $('uptime').textContent = `${days}d ${hrs%24}h`;
+    else if (hrs > 0) $('uptime').textContent = `${hrs}h ${mins%60}m`;
+    else if (mins > 0) $('uptime').textContent = `${mins}m ${secs%60}s`;
+    else $('uptime').textContent = `${secs}s`;
+
+    $('connection-status').innerHTML = '<span class="dot on"></span> connected to node';
+  } catch (e) {
+    $('connection-status').innerHTML = '<span class="dot off"></span> RPC unreachable';
+    $('peer-count').textContent = '-';
+    $('peer-count').className = 'stat off';
+    logEvent('RPC unreachable - node may have crashed', true);
+    disconnectCount++;
+    lastDisconnect = time();
+  }
+}
+
+// Memory tracking via /proc or ps
+async function fetchMemory() {
+  try {
+    // Use a custom RPC or estimate from the node
+    // Since we can't read /proc from JS, we'll poll via a sidecar
+    // For now, try to get it from the node's server_info if we add it later
+    // Placeholder: show "N/A" until we wire memory reporting
+    const res = await fetch(RPC, {
+      method: 'POST',
+      body: JSON.stringify({ method: 'server_info', params: [], id: 3 }),
+    });
+    const data = await res.json();
+    const info = data.result.info;
+    if (info.memory_mb) {
+      const mb = info.memory_mb;
+      $('memory-current').textContent = mb + ' MB';
+      if (mb < memoryMin) memoryMin = mb;
+      if (mb > memoryMax) memoryMax = mb;
+      $('memory-range').textContent = `min ${memoryMin} / max ${memoryMax} MB`;
+    } else {
+      $('memory-current').textContent = 'N/A';
+      $('memory-range').textContent = 'add memory_mb to server_info';
+    }
+  } catch(_) {}
+}
+
+function connectWS() {
+  const ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    if (!wsConnected) {
+      addFeedItem('status', 'WebSocket connected');
+      logEvent('WebSocket connected');
+    } else {
+      addFeedItem('reconnect', 'WebSocket reconnected');
+      logEvent('WebSocket reconnected after disconnect');
+    }
+    wsConnected = true;
+    ws.send(JSON.stringify({ command: 'subscribe', streams: ['ledger', 'transactions', 'peer_messages'] }));
+  };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'ledgerClosed') {
+        // Record messages since last ledger
+        if (ledgerCount > 0) {
+          ledgerMsgSamples.push(msgSinceLedger);
+          if (ledgerMsgSamples.length > 1000) ledgerMsgSamples.shift();
+        }
+        msgSinceLedger = 0;
+        ledgerCount++;
+        if (!firstLedgerTime) firstLedgerTime = Date.now();
+
+        addFeedItem('ledger', `ledger ${msg.ledger_index || msg.ledger_seq} closed  hash=${(msg.ledger_hash||'').substring(0,16)}...  txs=${msg.txn_count || msg.tx_count || 0}`);
+        fetchServerInfo();
+        updateBenchmarks();
+      } else if (msg.type === 'peerMessage') {
+        const t = msg.msg_type;
+        addFeedItem(t, msg.detail);
+        if (t === 'proposal') { counts.proposals++; $('cnt-proposals').textContent = counts.proposals.toLocaleString(); }
+        else if (t === 'validation') {
+          counts.validations++;
+          $('cnt-validations').textContent = counts.validations.toLocaleString();
+          // Each unique validation round = one testnet ledger close
+          // Count the first validation per ~4s window as a ledger close
+          const now = Date.now();
+          if (!lastValidationTime || now - lastValidationTime > 2000) {
+            lastValidationTime = now;
+            // Record messages since last ledger
+            if (ledgerCount > 0) {
+              ledgerMsgSamples.push(msgSinceLedger);
+              if (ledgerMsgSamples.length > 1000) ledgerMsgSamples.shift();
+            }
+            msgSinceLedger = 0;
+            ledgerCount++;
+            if (!firstLedgerTime) firstLedgerTime = Date.now();
+            updateBenchmarks();
+          }
+        }
+        else if (t === 'manifest') { counts.manifests++; $('cnt-manifests').textContent = counts.manifests.toLocaleString(); }
+        else if (t === 'status_change') { counts.status++; $('cnt-status').textContent = counts.status.toLocaleString(); }
+        else if (t === 'transaction') { counts.tx++; $('cnt-tx').textContent = counts.tx.toLocaleString(); }
+      }
+    } catch (_) {}
+  };
+  ws.onclose = () => {
+    if (wsConnected) {
+      logEvent('WebSocket disconnected', true);
+      disconnectCount++;
+      lastDisconnect = time();
+      updateBenchmarks();
+    }
+    wsConnected = false;
+    setTimeout(connectWS, 3000);
+  };
+  ws.onerror = () => {};
+}
+
+// Rate counter + peak tracking
+setInterval(() => {
+  msgPerSec = msgThisSecond;
+  msgThisSecond = 0;
+  $('feed-rate').textContent = msgPerSec + ' msg/s';
+  if (msgPerSec > peakMsgPerSec) {
+    peakMsgPerSec = msgPerSec;
+    peakMsgTime = time();
+    $('peak-msg-s').textContent = peakMsgPerSec;
+    $('peak-msg-time').textContent = 'at ' + peakMsgTime;
+  }
+}, 1000);
+
+// Periodic updates
+fetchServerInfo();
+setInterval(fetchServerInfo, 3000);
+setInterval(fetchMemory, 10000);
+setInterval(updateBenchmarks, 5000);
+connectWS();
+logEvent('Dashboard started - monitoring overnight run');
+</script>
+</body>
+</html>

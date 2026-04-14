@@ -1,0 +1,16 @@
+.git
+target
+debug-runs
+cfg/cfg
+cfg/testnet.cfg
+cfg/validator-mainnet.cfg
+cfg/validator-testnet.cfg
+cfg/xledgrs-example.cfg
+cfg/xrplnode.cfg
+deploy-xledgrs.sh
+deploy-validator.sh
+checkpoint-sync-base.sh
+restore-sync-base.sh
+watch.sh
+VALIDATOR_PLAN.md
+PLAN_20260404.md

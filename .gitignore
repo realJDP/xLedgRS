@@ -1,0 +1,11 @@
+target/
+.DS_Store
+.claude/
+debug-runs/
+*.log
+*.sqlite*
+*.db
+*.db-shm
+*.db-wal
+*.redb
+*.nudb
