@@ -61,7 +61,7 @@ The main binary is:
 1. Copy the mainnet template:
 
 ```bash
-cp cfg/xrplnode.cfg ./xledgrs-mainnet.cfg
+cp cfg/xledgrs.cfg ./xledgrs.cfg
 ```
 
 2. Review listener addresses and storage path.
@@ -69,7 +69,7 @@ cp cfg/xrplnode.cfg ./xledgrs-mainnet.cfg
 3. Start the node:
 
 ```bash
-./target/release/xledgrs --config ./xledgrs-mainnet.cfg
+./target/release/xledgrs --config ./xledgrs.cfg
 ```
 
 4. Query local RPC:
@@ -87,7 +87,7 @@ cp cfg/testnet.cfg ./xledgrs-testnet.cfg
 
 ## Configuration Templates
 
-- `cfg/xrplnode.cfg` mainnet follower template
+- `cfg/xledgrs.cfg` mainnet follower template
 - `cfg/testnet.cfg` testnet follower template
 - `cfg/validator-mainnet.cfg` mainnet validator template
 - `cfg/validator-testnet.cfg` testnet validator template

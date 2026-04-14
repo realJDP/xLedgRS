@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WIPE=false
 NETWORK="mainnet"
-CFG_FILE="${CFG_FILE:-xrplnode.cfg}"
+CFG_FILE="${CFG_FILE:-xledgrs.cfg}"
 BIN_NAME="${BIN_NAME:-xledgrs}"
 BUILD_DIR="${BUILD_DIR:-~/xledgrs-src}"
 REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-xledgrs-data}"

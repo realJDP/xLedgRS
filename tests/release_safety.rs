@@ -173,7 +173,7 @@ fn export_ignore_excludes_private_operational_files() {
     let ignore = read_text(&repo_root().join("release").join("export-ignore.txt"));
     let entries = ignore.lines().map(str::trim).collect::<Vec<_>>();
     let required = [
-        "cfg/xrplnode.cfg",
+        "cfg/xledgrs.cfg",
         "cfg/validator-mainnet.cfg",
         "cfg/validator-testnet.cfg",
         "deploy-xledgrs.sh",
