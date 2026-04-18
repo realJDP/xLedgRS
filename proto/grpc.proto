@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package org.xrpl.rpc.v1;
+option java_package = "org.xrpl.rpc.v1";
+option java_multiple_files = true;
+
+// Extension surface for local server info and submit.
+service Xledgrs {
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+}
+
+// Primary rippled-parity surface.
+service XRPLedgerAPIService {
+  // Get a specific ledger, optionally including transactions and any modified,
+  // added or deleted ledger objects.
+  rpc GetLedger(GetLedgerRequest) returns (GetLedgerResponse);
+
+  // Get a specific ledger object from a specific ledger.
+  rpc GetLedgerEntry(GetLedgerEntryRequest) returns (GetLedgerEntryResponse);
+
+  // Iterate through all ledger objects in a specific ledger.
+  rpc GetLedgerData(GetLedgerDataRequest) returns (GetLedgerDataResponse);
+
+  // Get all ledger objects that are different between the two specified
+  // ledgers. Note, this method has no JSON equivalent.
+  rpc GetLedgerDiff(GetLedgerDiffRequest) returns (GetLedgerDiffResponse);
+}
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  string build_version = 1;
+  uint32 ledger_seq = 2;
+  bytes ledger_hash = 3;
+  uint32 peer_count = 4;
+  uint64 object_count = 5;
+  uint32 network_id = 6;
+  bool sync_done = 7;
+  uint32 load_factor = 8;
+  string grpc_addr = 9;
+}
+
+message SubmitRequest {
+  bytes tx_blob = 1;
+}
+
+message SubmitResponse {
+  string status = 1;
+  bool accepted = 2;
+  bool applied = 3;
+  bool broadcast = 4;
+  string engine_result = 5;
+  int32 engine_result_code = 6;
+  string engine_result_message = 7;
+  string tx_hash = 8;
+  string message = 9;
+}
+
+// Next field: 4
+message LedgerSpecifier {
+  // Next field: 4
+  enum Shortcut {
+    SHORTCUT_UNSPECIFIED = 0;
+    SHORTCUT_VALIDATED = 1;
+    SHORTCUT_CLOSED = 2;
+    SHORTCUT_CURRENT = 3;
+  }
+
+  oneof ledger {
+    Shortcut shortcut = 1;
+    uint32 sequence = 2;
+    // 32 bytes
+    bytes hash = 3;
+  }
+}
+
+// Next field: 3
+message RawLedgerObject {
+  // Raw data of the ledger object. In GetLedgerResponse and
+  // GetLedgerDiffResponse, data will be empty if the object was deleted.
+  bytes data = 1;
+
+  // Key of the ledger object.
+  bytes key = 2;
+
+  enum ModificationType {
+    UNSPECIFIED = 0;
+    CREATED = 1;
+    MODIFIED = 2;
+    DELETED = 3;
+  }
+
+  // Whether the object was created, modified or deleted.
+  ModificationType mod_type = 3;
+
+  // Key of the object preceding this object in the desired ledger.
+  bytes predecessor = 4;
+
+  // Key of the object succeeding this object in the desired ledger.
+  bytes successor = 5;
+}
+
+message RawLedgerObjects {
+  repeated RawLedgerObject objects = 1;
+}
+
+// Successor information for book directories. The book base is usually not an
+// actual object, but callers still need a way to ask for its successor.
+message BookSuccessor {
+  // Base of the book in question.
+  bytes book_base = 1;
+
+  // First book directory in the book. An empty value here means the entire
+  // book is deleted.
+  bytes first_book = 2;
+}
+
+message TransactionHashList {
+  repeated bytes hashes = 1;
+}
+
+message TransactionAndMetadata {
+  bytes transaction_blob = 1;
+  bytes metadata_blob = 2;
+}
+
+message TransactionAndMetadataList {
+  repeated TransactionAndMetadata transactions = 1;
+}
+
+message GetLedgerRequest {
+  LedgerSpecifier ledger = 1;
+  bool transactions = 2;
+  bool expand = 3;
+  bool get_objects = 4;
+  string client_ip = 5;
+  string user = 6;
+  bool get_object_neighbors = 7;
+}
+
+message GetLedgerResponse {
+  bytes ledger_header = 1;
+
+  oneof transactions {
+    TransactionHashList hashes_list = 2;
+    TransactionAndMetadataList transactions_list = 3;
+  }
+
+  bool validated = 4;
+  RawLedgerObjects ledger_objects = 5;
+  bool skiplist_included = 6;
+  bool is_unlimited = 7;
+  bool objects_included = 8;
+  bool object_neighbors_included = 9;
+  repeated BookSuccessor book_successors = 10;
+}
+
+message GetLedgerEntryRequest {
+  bytes key = 1;
+  LedgerSpecifier ledger = 2;
+  string client_ip = 3;
+}
+
+message GetLedgerEntryResponse {
+  RawLedgerObject ledger_object = 1;
+  LedgerSpecifier ledger = 2;
+}
+
+message GetLedgerDataRequest {
+  bytes marker = 1;
+  LedgerSpecifier ledger = 2;
+  bytes end_marker = 3;
+  string client_ip = 4;
+  string user = 6;
+}
+
+message GetLedgerDataResponse {
+  uint32 ledger_index = 1;
+  bytes ledger_hash = 2;
+  RawLedgerObjects ledger_objects = 3;
+  bytes marker = 4;
+  bool is_unlimited = 7;
+}
+
+message GetLedgerDiffRequest {
+  LedgerSpecifier base_ledger = 1;
+  LedgerSpecifier desired_ledger = 2;
+  bool include_blobs = 3;
+  string client_ip = 4;
+}
+
+message GetLedgerDiffResponse {
+  RawLedgerObjects ledger_objects = 1;
+}

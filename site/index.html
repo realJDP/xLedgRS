@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xLedgRS | XRP Ledger Node in Rust</title>
+<meta name="description" content="xLedgRS is an XRP Ledger node implementation in Rust with native peer networking, JSON-RPC, WebSocket, optional gRPC, configuration templates, and built-in process lifecycle commands.">
+<meta property="og:title" content="xLedgRS | XRP Ledger Node in Rust">
+<meta property="og:description" content="Fast, information-first operator docs for xLedgRS.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://xledgrs.com">
+<link rel="canonical" href="https://xledgrs.com">
+<style>
+:root {
+  --bg: #f5f7fb;
+  --panel: #ffffff;
+  --panel-2: #eef3fb;
+  --line: #d9e1ee;
+  --text: #142033;
+  --muted: #5d6a7c;
+  --soft: #7b8798;
+  --accent: #0f6fff;
+  --accent-2: #0b57c7;
+  --good: #0e9f6e;
+  --warn: #c98500;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: var(--sans);
+  color: var(--text);
+  background: var(--bg);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code, pre, .mono {
+  font-family: var(--mono);
+}
+
+.wrap {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 0 20px 64px;
+}
+
+.topbar {
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.topbar .wrap {
+  padding-top: 14px;
+  padding-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.brand img {
+  width: 34px;
+  height: 34px;
+  display: block;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.1;
+}
+
+.brand p {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 13px;
+}
+
+.hero {
+  padding: 28px 0 18px;
+}
+
+.hero-grid {
+  display: grid;
+  grid-template-columns: 1.35fr 0.9fr;
+  gap: 18px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 18px;
+}
+
+.hero h2 {
+  margin: 0 0 10px;
+  font-size: clamp(28px, 4vw, 42px);
+  line-height: 1.05;
+}
+
+.hero p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 16px;
+}
+
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 14px 0 18px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 16px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  text-decoration: none;
+  border-color: var(--accent);
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn-primary:hover {
+  background: var(--accent-2);
+  border-color: var(--accent-2);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--good);
+}
+
+.quick {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.quick .item {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+
+.quick .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--soft);
+  margin-bottom: 6px;
+}
+
+.quick .value {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.stack {
+  display: grid;
+  gap: 16px;
+}
+
+.section {
+  padding-top: 14px;
+}
+
+.section h3 {
+  margin: 0 0 12px;
+  font-size: 22px;
+}
+
+.section p.lead {
+  margin: 0 0 14px;
+  color: var(--muted);
+}
+
+.grid-2,
+.grid-3 {
+  display: grid;
+  gap: 14px;
+}
+
+.grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.list li + li {
+  margin-top: 6px;
+}
+
+.code {
+  background: #0f1725;
+  color: #d9e6ff;
+  border-radius: 12px;
+  padding: 14px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.65;
+  border: 1px solid #22314a;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+th, td {
+  text-align: left;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+th {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--soft);
+}
+
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+.good { color: var(--good); }
+.warn { color: var(--warn); }
+
+.footer {
+  margin-top: 28px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  color: var(--soft);
+  font-size: 13px;
+}
+
+@media (max-width: 920px) {
+  .hero-grid,
+  .grid-2,
+  .grid-3 {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar .wrap {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 680px) {
+  .quick {
+    grid-template-columns: 1fr;
+  }
+
+  .wrap {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <img src="xledgrs-mark.png" alt="xLedgRS mark">
+      <div>
+        <h1>xLedgRS</h1>
+        <p>XRPL node implementation in Rust</p>
+      </div>
+    </div>
+    <nav class="nav" aria-label="Primary">
+      <a href="https://github.com/realJDP/xLedgRS" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/realJDP/xLedgRS/archive/HEAD.zip" target="_blank" rel="noopener">Download</a>
+      <a href="#build">Build</a>
+      <a href="#run">Run</a>
+      <a href="#config">Config</a>
+      <a href="#surfaces">Surfaces</a>
+      <a href="#repo">Repo</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <div class="hero-grid">
+      <div class="card">
+        <h2>Fast operator reference for xLedgRS 1.0beta.</h2>
+        <p>
+          xLedgRS is an XRP Ledger node implementation in Rust focused on protocol
+          compatibility, operational clarity, and practical deployment.
+        </p>
+        <div class="actions">
+          <a class="btn btn-primary" href="https://github.com/realJDP/xLedgRS" target="_blank" rel="noopener">Open GitHub</a>
+          <a class="btn" href="https://github.com/realJDP/xLedgRS/archive/HEAD.zip" target="_blank" rel="noopener">Download ZIP</a>
+          <a class="btn" href="https://github.com/realJDP/xLedgRS#readme" target="_blank" rel="noopener">README</a>
+        </div>
+        <div class="badge-row">
+          <span class="badge">Version <strong>1.0beta</strong></span>
+          <span class="badge">Updated <strong>2026-04-17</strong></span>
+          <span class="badge">Default ports <strong>51235 / 5005 / 6006</strong></span>
+        </div>
+        <div class="quick">
+          <div class="item">
+            <div class="label">Primary binary</div>
+            <div class="value mono">xledgrs</div>
+          </div>
+          <div class="item">
+            <div class="label">Lifecycle</div>
+            <div class="value mono">--start --stop --status</div>
+          </div>
+          <div class="item">
+            <div class="label">Mainnet config</div>
+            <div class="value mono">cfg/xledgrs.cfg</div>
+          </div>
+          <div class="item">
+            <div class="label">Validator config</div>
+            <div class="value mono">cfg/validator-mainnet.cfg</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="card">
+          <h3>Included in 1.0beta</h3>
+          <ul class="list small">
+            <li>Native peer protocol runtime</li>
+            <li>JSON-RPC and WebSocket services</li>
+            <li>Optional gRPC surface</li>
+          <li>Configuration templates</li>
+            <li>Built-in process lifecycle commands</li>
+            <li>Default rippled-style ports in shipped configs</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Default operator settings</h3>
+          <ul class="list small">
+            <li>Mainnet follower data dir: <span class="mono">./xledgrs-data</span></li>
+            <li>Mainnet validator data dir: <span class="mono">./xledgrs-validator-data</span></li>
+            <li>PID/log files default into the configured data dir</li>
+            <li>Built-in peer bootstrap list uses public XRPL hubs</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="build" class="section">
+    <h3>Build</h3>
+    <p class="lead">
+      Build the binary, choose a configuration template, and start the node with the built-in lifecycle commands.
+    </p>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Prerequisites</h3>
+        <ul class="list">
+          <li>Rust stable toolchain</li>
+          <li>OpenSSL development headers</li>
+          <li><span class="mono">protobuf</span> / <span class="mono">protobuf-compiler</span></li>
+        </ul>
+        <div class="code"><pre>macOS
+brew install openssl pkg-config protobuf
+
+Ubuntu / Debian
+sudo apt update
+sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compiler</pre></div>
+      </div>
+      <div class="card">
+        <h3>Release build</h3>
+        <div class="code"><pre>cargo build --release
+./target/release/xledgrs --help</pre></div>
+        <p class="muted small">
+          The binary path is <span class="mono">./target/release/xledgrs</span>.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section id="run" class="section">
+    <h3>Run</h3>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Mainnet follower</h3>
+        <div class="code"><pre>cp cfg/xledgrs.cfg ./xledgrs.cfg
+./target/release/xledgrs --start --config ./xledgrs.cfg
+./target/release/xledgrs --status --config ./xledgrs.cfg</pre></div>
+      </div>
+      <div class="card">
+        <h3>Testnet follower</h3>
+        <div class="code"><pre>cp cfg/testnet.cfg ./xledgrs-testnet.cfg
+./target/release/xledgrs --start --config ./xledgrs-testnet.cfg</pre></div>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:14px;">
+      <div class="card">
+        <h3>Foreground run</h3>
+        <div class="code"><pre>./target/release/xledgrs --config ./xledgrs.cfg</pre></div>
+        <p class="muted small">
+          Use this mode for direct terminal debugging. The process stays attached and exits on
+          <span class="mono">Ctrl-C</span> or <span class="mono">SIGTERM</span>.
+        </p>
+      </div>
+      <div class="card">
+        <h3>RPC smoke check</h3>
+        <div class="code"><pre>curl -s http://127.0.0.1:5005 \
+  -d '{"method":"server_info","params":[{}]}'</pre></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="config" class="section">
+    <h3>Configuration</h3>
+    <div class="table-wrap card">
+      <table>
+        <thead>
+          <tr>
+            <th>Template</th>
+            <th>Use</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">cfg/xledgrs.cfg</td>
+            <td>Mainnet follower</td>
+            <td>Default release-safe mainnet node template</td>
+          </tr>
+          <tr>
+            <td class="mono">cfg/testnet.cfg</td>
+            <td>Testnet follower</td>
+            <td>Release-safe testnet template</td>
+          </tr>
+          <tr>
+            <td class="mono">cfg/validator-mainnet.cfg</td>
+            <td>Mainnet validator</td>
+            <td>Requires operator-supplied validation identity</td>
+          </tr>
+          <tr>
+            <td class="mono">cfg/validator-testnet.cfg</td>
+            <td>Testnet validator</td>
+            <td>Validator-mode testnet template</td>
+          </tr>
+          <tr>
+            <td class="mono">cfg/xledgrs-example.cfg</td>
+            <td>Generic example</td>
+            <td>Example template using the current config section names</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="grid-3" style="margin-top:14px;">
+      <div class="card">
+        <h3>Default ports</h3>
+        <ul class="list small">
+          <li>Peer: <span class="mono">51235</span></li>
+          <li>JSON-RPC: <span class="mono">5005</span></li>
+          <li>WebSocket: <span class="mono">6006</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Key settings</h3>
+        <ul class="list small">
+          <li><span class="mono">[port_peer]</span></li>
+          <li><span class="mono">[port_rpc]</span></li>
+          <li><span class="mono">[port_ws]</span></li>
+          <li><span class="mono">[node_db]</span></li>
+          <li><span class="mono">[validators_file]</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Lifecycle files</h3>
+        <ul class="list small">
+          <li>PID: <span class="mono">xledgrs.pid</span></li>
+          <li>Log: <span class="mono">xledgrs.log</span></li>
+          <li>Default location: configured data dir</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="surfaces" class="section">
+    <h3>Runtime surfaces</h3>
+    <div class="grid-3">
+      <div class="card">
+        <h3>JSON-RPC</h3>
+        <ul class="list small">
+          <li><span class="mono">server_info</span></li>
+          <li><span class="mono">server_state</span></li>
+          <li><span class="mono">ledger</span></li>
+          <li><span class="mono">ledger_data</span></li>
+          <li><span class="mono">ledger_entry</span></li>
+          <li><span class="mono">submit</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>WebSocket</h3>
+        <p class="muted small">
+          Local event-driven surface for consumers and operator tooling when the configured
+          WebSocket listener is enabled.
+        </p>
+      </div>
+      <div class="card">
+        <h3>gRPC</h3>
+        <p class="muted small">
+          Optional service layer with <span class="mono">XRPLedgerAPIService</span> and the
+          <span class="mono">Xledgrs</span> extension surface when a gRPC address is configured.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section id="repo" class="section">
+    <h3>Source and docs</h3>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Primary references</h3>
+        <ul class="list">
+          <li><a href="https://github.com/realJDP/xLedgRS">GitHub repository</a></li>
+          <li><span class="mono">README.md</span> for install, config, and lifecycle</li>
+          <li><span class="mono">cfg/</span> for release-safe config templates</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Deployment model</h3>
+        <ul class="list">
+          <li>Run the node directly with the <span class="mono">xledgrs</span> binary</li>
+          <li>Use shipped configuration templates as the starting point</li>
+          <li>Use the built-in lifecycle commands for background process control</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <div class="footer">
+    xLedgRS static site.
+  </div>
+</main>
+</body>
+</html>

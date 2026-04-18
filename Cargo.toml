@@ -1,0 +1,72 @@
+[package]
+name = "xledgrs"
+version = "1.0.0-beta"
+edition = "2021"
+description = "A Rust implementation of an XRP Ledger node"
+license = "MIT"
+repository = "https://github.com/realJDP/xLedgRS"
+readme = "README.md"
+keywords = ["xrpl", "xrp", "blockchain", "ledger", "ripple"]
+categories = ["cryptography::cryptocurrencies", "network-programming"]
+
+[[bin]]
+name = "xledgrs"
+path = "src/main.rs"
+
+[[bin]]
+name = "replay_fixture"
+path = "src/bin/replay_fixture.rs"
+
+[lib]
+name = "xrpl"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+arc-swap = "1"
+sha2 = "0.10"
+sha3 = "0.10"
+ripemd = "0.1"
+hmac = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+secp256k1 = { version = "0.28", features = ["rand-std", "global-context"] }
+rand = "0.8"
+num-bigint = "0.4"
+base64 = "0.22"
+hex = "0.4"
+bytes = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = "0.26"
+rcgen = "0.12"
+tokio-tungstenite = "0.24"
+redb = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+toml = "0.8"
+bincode = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+lz4_flex = "0.11"
+openssl = "0.10"
+tokio-openssl = "0.6"
+libc = "0.2.184"
+nudb = { path = "../nudb-rs" }
+webpki-roots = "0.26"
+rustls-pki-types = "1"
+bitflags = "2.11.0"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+prost-build = "0.13"
+tonic-build = "0.12"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
