@@ -505,6 +505,37 @@ impl PeerSyncManager {
         true
     }
 
+    /// Accept a same-ledger GetObjects reply whose cookie aged out of the
+    /// outstanding set, but only if import already proved the payload useful.
+    pub fn accept_useful_stale_object_response(
+        &mut self,
+        resp_hash: &[u8],
+        seq: Option<u32>,
+        imported_count: usize,
+    ) -> bool {
+        if imported_count == 0 {
+            return false;
+        }
+        let Some(s32) = seq.map(|s| s as u32) else {
+            return false;
+        };
+        let ltclosed = self.ledger_hash == [0u8; 32];
+        if resp_hash.len() != 32 {
+            return false;
+        }
+        if !ltclosed && resp_hash != self.ledger_hash {
+            return false;
+        }
+        if self.outstanding_object_queries.contains(&s32)
+            || self.responded_object_queries.contains(&s32)
+        {
+            return false;
+        }
+        self.responded_object_queries.insert(s32);
+        self.last_response = std::time::Instant::now();
+        true
+    }
+
     pub fn clear_recent(&mut self) {
         self.recent_nodes.clear();
     }
@@ -2000,6 +2031,25 @@ mod tests {
         assert!(!peer.outstanding_object_queries.contains(&77));
         assert!(peer.responded_object_queries.contains(&77));
         assert!(!peer.accept_object_response(&[0xEF; 32], Some(78)));
+    }
+
+    #[test]
+    fn test_peer_sync_manager_accepts_useful_stale_object_response_for_matching_ledger() {
+        let mut peer = PeerSyncManager::new(10, [0xEF; 32], [0xCD; 32]);
+
+        assert!(peer.accept_useful_stale_object_response(&[0xEF; 32], Some(77), 4));
+        assert!(peer.responded_object_queries.contains(&77));
+        assert!(!peer.accept_useful_stale_object_response(&[0xEF; 32], Some(77), 4));
+    }
+
+    #[test]
+    fn test_peer_sync_manager_rejects_non_useful_or_wrong_hash_stale_object_response() {
+        let mut peer = PeerSyncManager::new(10, [0xEF; 32], [0xCD; 32]);
+
+        assert!(!peer.accept_useful_stale_object_response(&[0xEF; 32], Some(77), 0));
+        assert!(!peer.accept_useful_stale_object_response(&[0xAA; 32], Some(77), 4));
+        assert!(!peer.accept_useful_stale_object_response(&[0xEF; 32], None, 4));
+        assert!(peer.responded_object_queries.is_empty());
     }
 
     #[test]

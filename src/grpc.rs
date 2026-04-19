@@ -3,9 +3,9 @@
 //! This exposes the binary ledger RPC surface plus a local extension service
 //! for server information and transaction submission convenience.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 use tonic::{Request, Response, Status};
@@ -15,9 +15,7 @@ pub mod pb {
 }
 
 use pb::xledgrs_server::{Xledgrs, XledgrsServer};
-use pb::xrp_ledger_api_service_server::{
-    XrpLedgerApiService, XrpLedgerApiServiceServer,
-};
+use pb::xrp_ledger_api_service_server::{XrpLedgerApiService, XrpLedgerApiServiceServer};
 
 pub struct GrpcRuntime {
     join: tokio::task::JoinHandle<()>,
@@ -25,10 +23,7 @@ pub struct GrpcRuntime {
 }
 
 impl GrpcRuntime {
-    pub async fn spawn(
-        node: Arc<xrpl::node::Node>,
-        addr: SocketAddr,
-    ) -> anyhow::Result<Self> {
+    pub async fn spawn(node: Arc<xrpl::node::Node>, addr: SocketAddr) -> anyhow::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -152,7 +147,10 @@ impl GrpcService {
             } else {
                 Some(pb::get_ledger_response::Transactions::HashesList(
                     pb::TransactionHashList {
-                        hashes: tx_records.iter().map(|record| record.hash.to_vec()).collect(),
+                        hashes: tx_records
+                            .iter()
+                            .map(|record| record.hash.to_vec())
+                            .collect(),
                     },
                 ))
             }
@@ -195,7 +193,7 @@ impl GrpcService {
                     &req.client_ip,
                     &req.user,
                 )
-                    .await?
+                .await?
             } else {
                 LedgerPage {
                     ledger_index: ledger_seq,
@@ -286,7 +284,9 @@ impl GrpcService {
     ) -> Result<pb::GetLedgerDiffResponse, Status> {
         let base = self
             .collect_ledger_page(
-                req.base_ledger.as_ref().and_then(|spec| spec.ledger.as_ref()),
+                req.base_ledger
+                    .as_ref()
+                    .and_then(|spec| spec.ledger.as_ref()),
                 "base_ledger",
                 None,
                 None,
@@ -369,13 +369,17 @@ impl GrpcService {
         loop {
             params.insert("limit".to_string(), json!(256u32));
             if let Some(ref current_marker) = next_marker {
-                params.insert("marker".to_string(), json!(hex::encode_upper(current_marker)));
+                params.insert(
+                    "marker".to_string(),
+                    json!(hex::encode_upper(current_marker)),
+                );
             } else {
                 params.remove("marker");
             }
 
-            let result = xrpl::rpc::handlers::ledger_data(&serde_json::Value::Object(params.clone()), &ctx)
-                .map_err(map_rpc_error_to_status)?;
+            let result =
+                xrpl::rpc::handlers::ledger_data(&serde_json::Value::Object(params.clone()), &ctx)
+                    .map_err(map_rpc_error_to_status)?;
             if ledger_index.is_none() {
                 ledger_index = result
                     .get("ledger_index")
@@ -441,8 +445,10 @@ impl GrpcService {
         }
 
         Ok(LedgerPage {
-            ledger_index: ledger_index.ok_or_else(|| Status::internal("ledger_data omitted ledger_index"))?,
-            ledger_hash: ledger_hash.ok_or_else(|| Status::internal("ledger_data omitted ledger_hash"))?,
+            ledger_index: ledger_index
+                .ok_or_else(|| Status::internal("ledger_data omitted ledger_index"))?,
+            ledger_hash: ledger_hash
+                .ok_or_else(|| Status::internal("ledger_data omitted ledger_hash"))?,
             objects,
             marker: continuation_marker,
         })
@@ -500,7 +506,10 @@ fn ledger_neighbors(keys: &[[u8; 32]], key: [u8; 32]) -> (Vec<u8>, Vec<u8>) {
                 .and_then(|idx| keys.get(idx))
                 .map(|value| value.to_vec())
                 .unwrap_or_default();
-            let successor = keys.get(index + 1).map(|value| value.to_vec()).unwrap_or_default();
+            let successor = keys
+                .get(index + 1)
+                .map(|value| value.to_vec())
+                .unwrap_or_default();
             (predecessor, successor)
         }
         Err(index) => {
@@ -509,7 +518,10 @@ fn ledger_neighbors(keys: &[[u8; 32]], key: [u8; 32]) -> (Vec<u8>, Vec<u8>) {
                 .and_then(|idx| keys.get(idx))
                 .map(|value| value.to_vec())
                 .unwrap_or_default();
-            let successor = keys.get(index).map(|value| value.to_vec()).unwrap_or_default();
+            let successor = keys
+                .get(index)
+                .map(|value| value.to_vec())
+                .unwrap_or_default();
             (predecessor, successor)
         }
     }
@@ -537,10 +549,7 @@ fn ledger_object_from_key_data(key: Vec<u8>, data: Vec<u8>) -> pb::RawLedgerObje
     }
 }
 
-fn raw_objects_from_page(
-    page: &LedgerPage,
-    include_neighbors: bool,
-) -> Vec<pb::RawLedgerObject> {
+fn raw_objects_from_page(page: &LedgerPage, include_neighbors: bool) -> Vec<pb::RawLedgerObject> {
     let desired_keys: Vec<[u8; 32]> = page.objects.keys().copied().collect();
     page.objects
         .iter()
@@ -660,7 +669,8 @@ impl XrpLedgerApiService for GrpcService {
         request: Request<pb::GetLedgerEntryRequest>,
     ) -> Result<Response<pb::GetLedgerEntryResponse>, Status> {
         Ok(Response::new(
-            self.get_ledger_entry_response_impl(request.into_inner()).await?,
+            self.get_ledger_entry_response_impl(request.into_inner())
+                .await?,
         ))
     }
 
@@ -669,7 +679,8 @@ impl XrpLedgerApiService for GrpcService {
         request: Request<pb::GetLedgerDataRequest>,
     ) -> Result<Response<pb::GetLedgerDataResponse>, Status> {
         Ok(Response::new(
-            self.get_ledger_data_response_impl(request.into_inner()).await?,
+            self.get_ledger_data_response_impl(request.into_inner())
+                .await?,
         ))
     }
 
@@ -678,7 +689,8 @@ impl XrpLedgerApiService for GrpcService {
         request: Request<pb::GetLedgerDiffRequest>,
     ) -> Result<Response<pb::GetLedgerDiffResponse>, Status> {
         Ok(Response::new(
-            self.get_ledger_diff_response_impl(request.into_inner()).await?,
+            self.get_ledger_diff_response_impl(request.into_inner())
+                .await?,
         ))
     }
 }
@@ -824,7 +836,9 @@ mod tests {
         };
 
         let err = service
-            .submit(Request::new(pb::SubmitRequest { tx_blob: Vec::new() }))
+            .submit(Request::new(pb::SubmitRequest {
+                tx_blob: Vec::new(),
+            }))
             .await
             .expect_err("empty blob should be rejected");
 
@@ -998,6 +1012,9 @@ mod tests {
         )
         .expect("validated shortcut should map");
 
-        assert_eq!(params.get("ledger_index").and_then(|v| v.as_str()), Some("validated"));
+        assert_eq!(
+            params.get("ledger_index").and_then(|v| v.as_str()),
+            Some("validated")
+        );
     }
 }

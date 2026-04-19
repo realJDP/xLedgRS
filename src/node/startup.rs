@@ -1,11 +1,49 @@
 use super::*;
 
 impl Node {
+    async fn run_consensus_close_loop_supervisor(self: Arc<Self>) {
+        let mut last_reason: Option<&'static str> = None;
+        loop {
+            if self.is_shutting_down() {
+                info!("consensus close loop supervisor: shutdown");
+                return;
+            }
+
+            if let Some(reason) = self.consensus_close_loop_pause_reason().await {
+                if last_reason != Some(reason) {
+                    info!("consensus close loop waiting: {reason}");
+                    last_reason = Some(reason);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+
+            if last_reason.take().is_some() {
+                info!("consensus close loop ready");
+            } else {
+                info!("consensus close loop enabled");
+            }
+
+            self.clone().run_ledger_close_loop().await;
+
+            if self.is_shutting_down() {
+                info!("consensus close loop supervisor: shutdown");
+                return;
+            }
+
+            info!("consensus close loop paused; waiting for healthy restart conditions");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
     /// Start the node: peer listener, RPC server, and bootstrap dialing.
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         info!(
             "xledgrs node starting — peer={} rpc={} tls={} standalone={}",
-            self.config.peer_addr, self.config.rpc_addr, self.config.use_tls, self.config.standalone
+            self.config.peer_addr,
+            self.config.rpc_addr,
+            self.config.use_tls,
+            self.config.standalone
         );
 
         if !self.config.full_history_peers.is_empty() {
@@ -82,10 +120,9 @@ impl Node {
         }
 
         if self.config.enable_consensus_close_loop {
-            info!("consensus close loop enabled");
             let node4 = self.clone();
             tokio::spawn(async move {
-                node4.run_ledger_close_loop().await;
+                node4.run_consensus_close_loop_supervisor().await;
             });
         } else {
             info!("consensus close loop disabled; running in follower mode");

@@ -350,21 +350,13 @@ impl SHAMap {
 
         // Also flush the root inner node itself if dirty
         if self.root.dirty {
-            let hash = self.root.hash(mt);
-            let mut store_data = Vec::with_capacity(16 * 32);
-            for child in self.root.children.iter_mut() {
-                match child {
-                    Some(n) => store_data.extend_from_slice(&n.hash(mt)),
-                    None => store_data.extend_from_slice(&[0u8; 32]),
-                }
-            }
-            batch.push((hash, store_data));
-            self.root.dirty = false;
+            batch.push(serialize_inner_node_for_store(&mut self.root, mt));
         }
 
         let count = batch.len();
         if !batch.is_empty() {
             backend.store_batch(&batch)?;
+            clear_dirty_flags(&mut self.root);
         }
         Ok(count)
     }
@@ -899,6 +891,7 @@ fn insert_node(
                     // Key already exists — update data
                     leaf.data = data;
                     leaf.cached_hash = None;
+                    leaf.dirty = true;
                     return false; // not a new insertion
                 }
                 // Key collision at this depth — need to push both leaves deeper
@@ -1393,18 +1386,18 @@ enum StoredNode {
 }
 
 fn decode_validated_store_node(expected_hash: &[u8; 32], data: &[u8]) -> Option<StoredNode> {
+    let mut inner_hash = None;
     if data.len() == 16 * 32 {
         let mut inner = deserialize_inner_from_store(data)?;
-        if inner.hash(MapType::AccountState) != *expected_hash {
-            tracing::warn!(
-                "shamap backend inner node hash mismatch: expected={} len={}",
-                hex::encode_upper(&expected_hash[..8]),
-                data.len(),
-            );
-            return None;
+        let computed = inner.hash(MapType::AccountState);
+        if computed == *expected_hash {
+            inner.cached_hash = Some(*expected_hash);
+            return Some(StoredNode::Inner(inner));
         }
-        inner.cached_hash = Some(*expected_hash);
-        return Some(StoredNode::Inner(inner));
+        // Persisted leaves can also be exactly 512 bytes long (480 bytes of
+        // payload plus a 32-byte key), so only reject after trying the leaf
+        // decoders too.
+        inner_hash = Some(computed);
     }
 
     if data.len() < 32 {
@@ -1447,17 +1440,49 @@ fn decode_validated_store_node(expected_hash: &[u8; 32], data: &[u8]) -> Option<
         return Some(StoredNode::Leaf(tx_leaf));
     }
 
-    tracing::warn!(
-        "shamap backend leaf hash mismatch: expected={} state={} tx={}",
-        hex::encode_upper(&expected_hash[..8]),
-        hex::encode_upper(&state_hash[..8]),
-        hex::encode_upper(&tx_hash[..8]),
-    );
+    if let Some(inner_hash) = inner_hash {
+        tracing::warn!(
+            "shamap backend 512-byte object hash mismatch: expected={} inner={} state={} tx={}",
+            hex::encode_upper(&expected_hash[..8]),
+            hex::encode_upper(&inner_hash[..8]),
+            hex::encode_upper(&state_hash[..8]),
+            hex::encode_upper(&tx_hash[..8]),
+        );
+    } else {
+        tracing::warn!(
+            "shamap backend leaf hash mismatch: expected={} state={} tx={}",
+            hex::encode_upper(&expected_hash[..8]),
+            hex::encode_upper(&state_hash[..8]),
+            hex::encode_upper(&tx_hash[..8]),
+        );
+    }
     None
 }
 
 /// Collect dirty nodes (full leaves + inner nodes) for flushing to the backend.
 /// Each entry is (content_hash, serialized_bytes).
+fn serialize_inner_node_for_store(node: &mut InnerNode, map_type: MapType) -> ([u8; 32], Vec<u8>) {
+    let hash = node.hash(map_type);
+    let mut store_data = Vec::with_capacity(16 * 32);
+    for child_hash in node.child_hashes {
+        store_data.extend_from_slice(&child_hash);
+    }
+    (hash, store_data)
+}
+
+fn clear_dirty_flags(node: &mut InnerNode) {
+    node.dirty = false;
+    for child in node.children.iter_mut() {
+        if let Some(boxed) = child {
+            match boxed.as_mut() {
+                Node::Leaf(leaf) => leaf.dirty = false,
+                Node::Inner(inner) => clear_dirty_flags(inner),
+                Node::Stub { .. } => {}
+            }
+        }
+    }
+}
+
 fn collect_dirty_nodes(
     node: &mut InnerNode,
     map_type: MapType,
@@ -1474,23 +1499,12 @@ fn collect_dirty_nodes(
                     store_data.extend_from_slice(&leaf.data);
                     store_data.extend_from_slice(&leaf.key.0);
                     batch.push((hash, store_data));
-                    leaf.dirty = false; // Mark clean
                 }
                 Node::Inner(inner) => {
                     // Recurse into inner nodes
                     collect_dirty_nodes(inner, map_type, batch);
                     if inner.dirty {
-                        // Dirty inner node — serialize children hashes
-                        let hash = inner.hash(map_type);
-                        let mut store_data = Vec::with_capacity(16 * 32);
-                        for child in inner.children.iter_mut() {
-                            match child {
-                                Some(n) => store_data.extend_from_slice(&n.hash(map_type)),
-                                None => store_data.extend_from_slice(&[0u8; 32]),
-                            }
-                        }
-                        batch.push((hash, store_data));
-                        inner.dirty = false;
+                        batch.push(serialize_inner_node_for_store(inner, map_type));
                     }
                 }
                 _ => {} // Stubs and clean leaves don't need flushing
@@ -1762,6 +1776,121 @@ mod tests {
         m.insert(k, b"updated".to_vec());
         let data = m.get(&k).unwrap();
         assert_eq!(data, b"updated");
+    }
+
+    #[test]
+    fn test_backend_loaded_leaf_update_flushes_persisted_bytes() {
+        use crate::ledger::node_store::MemNodeStore;
+
+        let backend = Arc::new(MemNodeStore::new());
+        let key = key(0x52);
+
+        let mut seeded = SHAMap::with_backend(MapType::AccountState, backend.clone());
+        seeded.insert(key, b"original".to_vec());
+        let original_root = seeded.root_hash();
+        seeded.flush_dirty().unwrap();
+
+        let mut restarted = SHAMap::with_backend(MapType::AccountState, backend.clone());
+        assert!(restarted.load_root_from_hash(original_root).unwrap());
+        assert_eq!(restarted.get(&key), Some(b"original".to_vec()));
+
+        restarted.insert(key, b"updated".to_vec());
+        let updated_root = restarted.root_hash();
+        restarted.flush_dirty().unwrap();
+
+        let mut reloaded = SHAMap::with_backend(MapType::AccountState, backend);
+        assert!(reloaded.load_root_from_hash(updated_root).unwrap());
+        assert_eq!(reloaded.get(&key), Some(b"updated".to_vec()));
+    }
+
+    #[test]
+    fn test_flush_preserves_unresolved_sibling_hashes_after_restart() {
+        use crate::ledger::node_store::MemNodeStore;
+
+        let backend = Arc::new(MemNodeStore::new());
+        let key_a = key2(0x10, 0x00);
+        let key_b = key2(0x10, 0x10);
+
+        let mut seeded = SHAMap::with_backend(MapType::AccountState, backend.clone());
+        seeded.insert(key_a, b"alpha".to_vec());
+        seeded.insert(key_b, b"beta".to_vec());
+        let original_root = seeded.root_hash();
+        seeded.flush_dirty().unwrap();
+
+        let mut restarted = SHAMap::with_backend(MapType::AccountState, backend.clone());
+        assert!(restarted.load_root_from_hash(original_root).unwrap());
+        assert_eq!(restarted.get(&key_a), Some(b"alpha".to_vec()));
+
+        restarted.insert(key_a, b"alpha-updated".to_vec());
+        let updated_root = restarted.root_hash();
+        restarted.flush_dirty().unwrap();
+
+        let mut reloaded = SHAMap::with_backend(MapType::AccountState, backend);
+        assert!(reloaded.load_root_from_hash(updated_root).unwrap());
+        assert_eq!(reloaded.get(&key_a), Some(b"alpha-updated".to_vec()));
+        assert_eq!(reloaded.get(&key_b), Some(b"beta".to_vec()));
+    }
+
+    struct FailOnceBatchStore {
+        inner: crate::ledger::node_store::MemNodeStore,
+        failed_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailOnceBatchStore {
+        fn new() -> Self {
+            Self {
+                inner: crate::ledger::node_store::MemNodeStore::new(),
+                failed_once: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl crate::ledger::node_store::NodeStore for FailOnceBatchStore {
+        fn store(&self, hash: &[u8; 32], data: &[u8]) -> std::io::Result<()> {
+            self.inner.store(hash, data)
+        }
+
+        fn fetch(&self, hash: &[u8; 32]) -> std::io::Result<Option<Vec<u8>>> {
+            self.inner.fetch(hash)
+        }
+
+        fn count(&self) -> u64 {
+            self.inner.count()
+        }
+
+        fn store_batch(&self, nodes: &[([u8; 32], Vec<u8>)]) -> std::io::Result<()> {
+            if !self
+                .failed_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "synthetic batch failure",
+                ));
+            }
+            self.inner.store_batch(nodes)
+        }
+    }
+
+    #[test]
+    fn test_flush_dirty_keeps_nodes_dirty_when_batch_store_fails() {
+        let backend = Arc::new(FailOnceBatchStore::new());
+        let key = key(0x77);
+
+        let mut map = SHAMap::with_backend(MapType::AccountState, backend.clone());
+        map.insert(key, b"retry-me".to_vec());
+        let root_hash = map.root_hash();
+
+        let err = map.flush_dirty().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(backend.fetch(&root_hash).unwrap().is_none());
+
+        let flushed = map.flush_dirty().unwrap();
+        assert!(flushed > 0);
+
+        let mut reloaded = SHAMap::with_backend(MapType::AccountState, backend);
+        assert!(reloaded.load_root_from_hash(root_hash).unwrap());
+        assert_eq!(reloaded.get(&key), Some(b"retry-me".to_vec()));
     }
 
     #[test]
@@ -2424,6 +2553,29 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].0, target.to_wire());
         assert_eq!(nodes[0].1.last().copied(), Some(WIRE_TYPE_ACCOUNT_STATE));
+    }
+
+    #[test]
+    fn test_get_lazy_stub_accepts_exact_512_byte_leaf_from_backend() {
+        let backend: std::sync::Arc<dyn crate::ledger::node_store::NodeStore> =
+            std::sync::Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let mut map = SHAMap::with_backend(MapType::AccountState, backend.clone());
+
+        let key = key(0xCC);
+        let data = vec![0x42; 480];
+        let leaf_hash = crate::ledger::sparse_shamap::leaf_hash(&data, &key.0);
+        let mut store_data = data.clone();
+        store_data.extend_from_slice(&key.0);
+        assert_eq!(
+            store_data.len(),
+            16 * 32,
+            "fixture must be exactly 512 bytes"
+        );
+
+        backend.store(&leaf_hash, &store_data).unwrap();
+        map.insert_stub(key, leaf_hash);
+
+        assert_eq!(map.get(&key), Some(data));
     }
 
     #[test]

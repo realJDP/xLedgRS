@@ -52,8 +52,8 @@ pub mod meta;
 pub mod nft_page;
 pub mod nftoken;
 pub mod node_store;
-pub mod open_ledger;
 pub mod offer;
+pub mod open_ledger;
 pub mod paychan;
 pub mod pool;
 pub mod shamap;
@@ -84,9 +84,51 @@ pub use ticket::Ticket;
 pub use trustline::RippleState;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::MutexGuard;
+use std::sync::{LazyLock, MutexGuard};
 
 use serde::{Deserialize, Serialize};
+
+fn amendment_hash(name: &str) -> [u8; 32] {
+    crate::crypto::sha512_first_half(name.as_bytes())
+}
+
+static FEATURE_FIX_PREVIOUS_TXN_ID: LazyLock<[u8; 32]> =
+    LazyLock::new(|| amendment_hash("fixPreviousTxnID"));
+
+pub(crate) fn fix_previous_txn_id_enabled(state: &LedgerState) -> bool {
+    state.is_amendment_active(&FEATURE_FIX_PREVIOUS_TXN_ID)
+}
+
+pub(crate) fn should_thread_previous_txn_fields_with_fix_previous_txn_id(
+    fix_previous_txn_id_enabled: bool,
+    entry_type: sle::LedgerEntryType,
+) -> bool {
+    let has_previous_txn_fields = !matches!(entry_type, sle::LedgerEntryType::LedgerHashes);
+    if !has_previous_txn_fields {
+        return false;
+    }
+
+    let gated_by_fix_previous_txn_id = matches!(
+        entry_type,
+        sle::LedgerEntryType::DirectoryNode
+            | sle::LedgerEntryType::Amendments
+            | sle::LedgerEntryType::FeeSettings
+            | sle::LedgerEntryType::NegativeUNL
+            | sle::LedgerEntryType::AMM
+    );
+
+    !gated_by_fix_previous_txn_id || fix_previous_txn_id_enabled
+}
+
+pub(crate) fn should_thread_previous_txn_fields(
+    state: &LedgerState,
+    entry_type: sle::LedgerEntryType,
+) -> bool {
+    should_thread_previous_txn_fields_with_fix_previous_txn_id(
+        fix_previous_txn_id_enabled(state),
+        entry_type,
+    )
+}
 
 // ── Fee settings (from FeeSettings ledger object) ────────────────────────────
 
@@ -640,6 +682,7 @@ impl LedgerHeader {
 // ── Dirty tracking ────────────────────────────────────────────────────────────
 
 /// Snapshot of which entries were modified or deleted since the last save.
+#[derive(Clone, Default)]
 pub struct DirtyState {
     pub dirty_accounts: HashSet<[u8; 20]>,
     pub deleted_accounts: HashSet<[u8; 20]>,
@@ -877,6 +920,40 @@ impl LedgerState {
             Some(mut map) => map.load_root_from_hash(root_hash),
             None => Ok(false),
         }
+    }
+
+    /// After re-pointing the live NuDB-backed SHAMap at a known-good root,
+    /// clear any buffered overlay and deferred replay bookkeeping so stale
+    /// in-memory state cannot shadow the reloaded tree.
+    pub fn reset_overlay_after_root_rehydrate(&mut self) {
+        self.state_map = SHAMap::new_state();
+        self.sparse_map = None;
+
+        self.dirty_accounts.clear();
+        self.deleted_accounts.clear();
+        self.dirty_trustlines.clear();
+        self.deleted_trustlines.clear();
+        self.dirty_checks.clear();
+        self.deleted_checks.clear();
+        self.dirty_deposit_preauths.clear();
+        self.deleted_deposit_preauths.clear();
+        self.dirty_dids.clear();
+        self.deleted_dids.clear();
+        self.dirty_escrows.clear();
+        self.deleted_escrows.clear();
+        self.dirty_paychans.clear();
+        self.deleted_paychans.clear();
+        self.dirty_tickets.clear();
+        self.deleted_tickets.clear();
+        self.dirty_offers.clear();
+        self.deleted_offers.clear();
+        self.dirty_directories.clear();
+        self.deleted_directories.clear();
+        self.dirty_raw.clear();
+        self.deleted_raw.clear();
+        self.tx_journal = None;
+        self.tx_snapshot = None;
+        self.defer_storage = false;
     }
 
     /// Diagnostic-only: take a lazy snapshot of the current NuDB-backed SHAMap.
@@ -1323,6 +1400,13 @@ impl LedgerState {
         self.directories.remove(key);
     }
 
+    /// Clear any cached typed view for a SHAMap key without mutating raw
+    /// state. Used by authoritative repair paths before re-hydrating a key
+    /// from known-good bytes.
+    pub fn clear_typed_entry_for_key(&mut self, key: &Key) {
+        self.remove_typed_entry_silent(key);
+    }
+
     /// Restore a typed entry from a snapshot.  Re-inserts into the correct
     /// typed collection and rebuilds secondary indexes.  Does NOT touch
     /// raw SHAMap state (that's handled separately via journal).
@@ -1414,6 +1498,8 @@ impl LedgerState {
 
     /// Alias for backward compat.
     pub fn update_account_typed(&mut self, account: AccountRoot) {
+        self.deleted_accounts.remove(&account.account_id);
+        self.dirty_accounts.remove(&account.account_id);
         self.hydrate_account(account);
     }
 
@@ -1484,6 +1570,9 @@ impl LedgerState {
 
     /// Alias for backward compat.
     pub fn update_trustline_typed(&mut self, tl: RippleState) {
+        let key = tl.key();
+        self.deleted_trustlines.remove(&key);
+        self.dirty_trustlines.remove(&key);
         self.hydrate_trustline(tl);
     }
 
@@ -2181,6 +2270,11 @@ impl LedgerState {
         self.nft_offers.insert(key, off);
     }
 
+    pub fn hydrate_nft_offer(&mut self, off: NFTokenOffer) {
+        let key = off.key();
+        self.nft_offers.insert(key, off);
+    }
+
     pub fn remove_nft_offer(&mut self, key: &Key) -> Option<NFTokenOffer> {
         if self.nft_offers.contains_key(key) {
             let off = self.nft_offers.remove(key).unwrap();
@@ -2242,6 +2336,9 @@ impl LedgerState {
     }
 
     pub fn update_offer_typed(&mut self, off: Offer) {
+        let key = off.key();
+        self.deleted_offers.remove(&key);
+        self.dirty_offers.remove(&key);
         self.hydrate_offer(off);
     }
 
@@ -2312,6 +2409,13 @@ impl LedgerState {
     pub fn hydrate_directory(&mut self, dir: DirectoryNode) {
         let key = dir.shamap_key();
         self.directories.insert(key, dir);
+    }
+
+    pub fn update_directory_typed(&mut self, dir: DirectoryNode) {
+        let key = dir.shamap_key();
+        self.deleted_directories.remove(&key);
+        self.dirty_directories.remove(&key);
+        self.hydrate_directory(dir);
     }
 
     pub fn insert_directory(&mut self, dir: DirectoryNode) {
@@ -2406,7 +2510,7 @@ impl LedgerState {
     // ── Dirty tracking ─────────────────────────────────────────────────────
 
     /// Drain all dirty/deleted tracking sets and return them as a snapshot.
-    pub fn take_dirty(&mut self) -> DirtyState {
+    fn drain_dirty_state(&mut self) -> DirtyState {
         let dirty_accounts = std::mem::take(&mut self.dirty_accounts);
         let deleted_accounts = std::mem::take(&mut self.deleted_accounts);
         let dirty_trustlines = std::mem::take(&mut self.dirty_trustlines);
@@ -2451,7 +2555,7 @@ impl LedgerState {
         dirty_raw.extend(dirty_directories.iter().copied());
         deleted_raw.extend(deleted_directories.iter().copied());
 
-        let result = DirtyState {
+        DirtyState {
             dirty_accounts,
             deleted_accounts,
             dirty_trustlines,
@@ -2474,8 +2578,55 @@ impl LedgerState {
             deleted_directories,
             dirty_raw,
             deleted_raw,
-        };
+        }
+    }
 
+    fn restore_dirty_state(&mut self, result: &DirtyState) {
+        self.dirty_accounts
+            .extend(result.dirty_accounts.iter().copied());
+        self.deleted_accounts
+            .extend(result.deleted_accounts.iter().copied());
+        self.dirty_trustlines
+            .extend(result.dirty_trustlines.iter().copied());
+        self.deleted_trustlines
+            .extend(result.deleted_trustlines.iter().copied());
+        self.dirty_checks
+            .extend(result.dirty_checks.iter().copied());
+        self.deleted_checks
+            .extend(result.deleted_checks.iter().copied());
+        self.dirty_deposit_preauths
+            .extend(result.dirty_deposit_preauths.iter().copied());
+        self.deleted_deposit_preauths
+            .extend(result.deleted_deposit_preauths.iter().copied());
+        self.dirty_dids.extend(result.dirty_dids.iter().copied());
+        self.deleted_dids
+            .extend(result.deleted_dids.iter().copied());
+        self.dirty_escrows
+            .extend(result.dirty_escrows.iter().copied());
+        self.deleted_escrows
+            .extend(result.deleted_escrows.iter().copied());
+        self.dirty_paychans
+            .extend(result.dirty_paychans.iter().copied());
+        self.deleted_paychans
+            .extend(result.deleted_paychans.iter().copied());
+        self.dirty_tickets
+            .extend(result.dirty_tickets.iter().copied());
+        self.deleted_tickets
+            .extend(result.deleted_tickets.iter().copied());
+        self.dirty_offers
+            .extend(result.dirty_offers.iter().copied());
+        self.deleted_offers
+            .extend(result.deleted_offers.iter().copied());
+        self.dirty_directories
+            .extend(result.dirty_directories.iter().copied());
+        self.deleted_directories
+            .extend(result.deleted_directories.iter().copied());
+        self.dirty_raw.extend(result.dirty_raw.iter().copied());
+        self.deleted_raw.extend(result.deleted_raw.iter().copied());
+    }
+
+    fn take_dirty_impl(&mut self) -> Result<DirtyState, (DirtyState, std::io::Error)> {
+        let result = self.drain_dirty_state();
         if let Some(mut map) = self.nudb_map_guard() {
             for key in &result.deleted_raw {
                 map.remove(key);
@@ -2490,11 +2641,26 @@ impl LedgerState {
         // Flush NuDB-backed SHAMap dirty nodes to disk after each ledger.
         if self.nudb_shamap.is_some() {
             if let Err(e) = self.flush_nudb() {
-                tracing::warn!("failed to flush NuDB SHAMap: {e}");
+                self.restore_dirty_state(&result);
+                return Err((result, e));
             }
         }
 
-        result
+        Ok(result)
+    }
+
+    pub fn try_take_dirty(&mut self) -> std::io::Result<DirtyState> {
+        self.take_dirty_impl().map_err(|(_, err)| err)
+    }
+
+    pub fn take_dirty(&mut self) -> DirtyState {
+        match self.take_dirty_impl() {
+            Ok(result) => result,
+            Err((result, err)) => {
+                tracing::warn!("failed to flush NuDB SHAMap: {err}");
+                result
+            }
+        }
     }
 
     /// Mark every entry in state as dirty (used for initial full save).
@@ -2609,10 +2775,16 @@ impl LedgerState {
             return;
         }
 
-        // Write to NuDB-backed SHAMap if available (content-addressed, disk-primary)
-        if let Some(mut map) = self.nudb_map_guard() {
-            map.insert(key, data);
-            return; // NuDB is the primary store — no need for state_map
+        // Write to NuDB-backed SHAMap if available (content-addressed, disk-primary).
+        // Keep state_map mirrored too: follower repair and dirty-flush paths still
+        // read overlay bytes from state_map, and stale buffered bytes here can
+        // overwrite authoritative direct-NuDB repairs during take_dirty().
+        if self.nudb_shamap.is_some() {
+            if let Some(mut map) = self.nudb_map_guard() {
+                map.insert(key, data.clone());
+            }
+            self.state_map.insert(key, data);
+            return;
         }
 
         // Legacy path: write to state_map
@@ -2646,10 +2818,14 @@ impl LedgerState {
             return;
         }
 
-        // Remove from NuDB-backed SHAMap if available
-        if let Some(mut map) = self.nudb_map_guard() {
-            map.remove(key);
-            return; // NuDB is the primary store
+        // Remove from NuDB-backed SHAMap if available and clear any mirrored
+        // overlay bytes so stale entries cannot shadow the authoritative delete.
+        if self.nudb_shamap.is_some() {
+            if let Some(mut map) = self.nudb_map_guard() {
+                map.remove(key);
+            }
+            self.state_map.remove(key);
+            return;
         }
 
         // Legacy path: remove from state_map
@@ -2989,6 +3165,43 @@ mod tests {
             previous_txn_lgr_seq: 0,
             raw_sle: None,
         }
+    }
+
+    #[test]
+    fn previous_txn_threading_matches_fix_previous_txn_id_gate() {
+        let mut state = LedgerState::new();
+
+        assert!(should_thread_previous_txn_fields(
+            &state,
+            sle::LedgerEntryType::AccountRoot,
+        ));
+        assert!(should_thread_previous_txn_fields(
+            &state,
+            sle::LedgerEntryType::RippleState,
+        ));
+        assert!(!should_thread_previous_txn_fields(
+            &state,
+            sle::LedgerEntryType::DirectoryNode,
+        ));
+        assert!(!should_thread_previous_txn_fields(
+            &state,
+            sle::LedgerEntryType::AMM,
+        ));
+        assert!(!should_thread_previous_txn_fields(
+            &state,
+            sle::LedgerEntryType::LedgerHashes,
+        ));
+
+        state.enable_amendment(*FEATURE_FIX_PREVIOUS_TXN_ID);
+
+        assert!(should_thread_previous_txn_fields(
+            &state,
+            sle::LedgerEntryType::DirectoryNode,
+        ));
+        assert!(should_thread_previous_txn_fields(
+            &state,
+            sle::LedgerEntryType::AMM,
+        ));
     }
 
     #[test]
@@ -3353,6 +3566,36 @@ mod tests {
         let mut new_map = new_map;
         assert_eq!(old_map.get(&key), Some(old_data));
         assert_eq!(new_map.get(&key), Some(new_data));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn direct_nudb_insert_raw_overwrites_stale_buffered_overlay_bytes() {
+        use crate::ledger::node_store::NuDBNodeStore;
+
+        let dir = std::env::temp_dir().join("ledger_state_direct_nudb_insert_raw_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = std::sync::Arc::new(NuDBNodeStore::open(&dir).unwrap());
+
+        let key = Key([0x44; 32]);
+        let old_data = vec![0xAA; 24];
+        let new_data = vec![0xCC; 24];
+
+        let mut state = LedgerState::new();
+        state.set_nudb_shamap(SHAMap::with_backend(MapType::AccountState, backend));
+        state.set_defer_storage(true);
+        state.insert_raw(key, old_data.clone());
+        state.set_defer_storage(false);
+        let _ = state.take_dirty();
+
+        state.insert_raw(key, new_data.clone());
+        assert_eq!(state.get_raw_owned(&key), Some(new_data.clone()));
+
+        let _ = state.take_dirty();
+        let root = state.nudb_root_hash().unwrap();
+        let mut historical = state.historical_state_map_from_root(root).unwrap();
+        assert_eq!(historical.get(&key), Some(new_data));
 
         std::fs::remove_dir_all(&dir).ok();
     }

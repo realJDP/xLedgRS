@@ -372,57 +372,59 @@ impl Node {
 
         let trigger_start = std::time::Instant::now();
         let had_useful_epoch = !epoch_peer_useful_counts.is_empty();
-        let (target_peers, total_reqs, _trigger_sync_seq) =
-            if should_issue_reply_followup(outcome, had_useful_epoch) {
-                let target_peers = {
-                    let state = self.state.read().await;
-                    self.select_reply_sync_peers(&state, sync_info.2, epoch_peer_useful_counts, 6)
-                };
-                let num_peers = target_peers.len().max(1);
+        let (target_peers, total_reqs, _trigger_sync_seq) = if should_issue_reply_followup(
+            outcome,
+            had_useful_epoch,
+        ) {
+            let target_peers = {
+                let state = self.state.read().await;
+                self.select_reply_sync_peers(&state, sync_info.2, epoch_peer_useful_counts, 6)
+            };
+            let num_peers = target_peers.len().max(1);
 
-                let sync_arc_trigger = self.sync_runtime.sync_arc();
-                let trigger_result = tokio::task::spawn_blocking(move || {
-                    crate::sync_epoch::build_reply_followup_requests(sync_arc_trigger, num_peers)
-                })
-                .await;
-                let crate::sync_epoch::ReplyFollowupBuildResult { reqs, sync_seq } =
-                    match trigger_result {
-                        Ok(r) => r,
-                        Err(e) => {
-                            error!("sync trigger(Reply) panicked: {}", e);
-                            crate::sync_epoch::ReplyFollowupBuildResult {
-                                reqs: vec![],
-                                sync_seq: 0,
-                            }
-                        }
-                    };
-
-                let mut total_reqs = 0usize;
-                if !reqs.is_empty() {
-                    if target_peers.is_empty() {
-                        self.sync_send_request(&reqs[0], sync_seq, None).await;
-                        total_reqs = 1;
-                    } else {
-                        for (i, req) in reqs.iter().enumerate() {
-                            let peer_idx = i % target_peers.len();
-                            let pid = target_peers[peer_idx];
-                            self.sync_send_request(req, sync_seq, Some(pid)).await;
-                            total_reqs += 1;
+            let sync_arc_trigger = self.sync_runtime.sync_arc();
+            let trigger_result = tokio::task::spawn_blocking(move || {
+                crate::sync_epoch::build_reply_followup_requests(sync_arc_trigger, num_peers)
+            })
+            .await;
+            let crate::sync_epoch::ReplyFollowupBuildResult { reqs, sync_seq } =
+                match trigger_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("sync trigger(Reply) panicked: {}", e);
+                        crate::sync_epoch::ReplyFollowupBuildResult {
+                            reqs: vec![],
+                            sync_seq: 0,
                         }
                     }
+                };
+
+            let mut total_reqs = 0usize;
+            if !reqs.is_empty() {
+                if target_peers.is_empty() {
+                    self.sync_send_request(&reqs[0], sync_seq, None).await;
+                    total_reqs = 1;
+                } else {
+                    for (i, req) in reqs.iter().enumerate() {
+                        let peer_idx = i % target_peers.len();
+                        let pid = target_peers[peer_idx];
+                        self.sync_send_request(req, sync_seq, Some(pid)).await;
+                        total_reqs += 1;
+                    }
                 }
-                (target_peers, total_reqs, sync_seq)
-            } else {
-                if matches!(outcome, "Continue" | "PassComplete") {
-                    info!(
+            }
+            (target_peers, total_reqs, sync_seq)
+        } else {
+            if matches!(outcome, "Continue" | "PassComplete") {
+                info!(
                         "reply follow-up skipped after zero-useful epoch: responses={} batches={} walk={}ms",
                         batch_len,
                         epoch_batch_count,
                         walk_ms,
                     );
-                }
-                (Vec::new(), 0usize, 0u32)
-            };
+            }
+            (Vec::new(), 0usize, 0u32)
+        };
         let trigger_ms = trigger_start.elapsed().as_millis();
 
         self.debug_log(&crate::sync_epoch::processed_debug_line(
@@ -456,8 +458,7 @@ impl Node {
         }
 
         {
-            static LAST_LOG: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -572,7 +573,10 @@ impl Node {
                 epoch_batch_count += 1;
                 epoch_response_count += batch_len;
 
-                self.debug_log(&format!("BATCH: {} responses, collecting leaves", batch_len));
+                self.debug_log(&format!(
+                    "BATCH: {} responses, collecting leaves",
+                    batch_len
+                ));
 
                 let sync_arc = self.sync_runtime.sync_arc();
                 let max_sync = self.config.max_sync;

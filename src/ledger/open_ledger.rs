@@ -436,7 +436,11 @@ impl OpenLedger {
                     } else {
                         *failed_transactions = failed_transactions.saturating_add(1);
                     }
-                    open.raw_tx_insert(crate::ledger::Key(entry.hash), entry.blob.clone(), Vec::new());
+                    open.raw_tx_insert(
+                        crate::ledger::Key(entry.hash),
+                        entry.blob.clone(),
+                        Vec::new(),
+                    );
                     changes = changes.saturating_add(1);
                 } else if Self::is_permanent_failure(&result.ter) {
                     failed_set.insert(entry.hash);
@@ -531,7 +535,12 @@ impl OpenLedger {
             &mut skipped_transactions,
         );
 
-        (open, applied_transactions, failed_transactions, skipped_transactions)
+        (
+            open,
+            applied_transactions,
+            failed_transactions,
+            skipped_transactions,
+        )
     }
 
     fn build_live_candidate(
@@ -749,7 +758,13 @@ impl OpenLedger {
             self.accept_closed_ledger(header, queued_transactions, candidate_set_hash, metrics);
         self.base_ledger = Some(base.clone());
         let (mut open, applied_transactions, failed_transactions, skipped_transactions) =
-            Self::build_live_candidate_from_sources(base.clone(), current, locals, retries, retries_first);
+            Self::build_live_candidate_from_sources(
+                base.clone(),
+                current,
+                locals,
+                retries,
+                retries_first,
+            );
         let modifier_changed = f(&mut open);
         let view_changed = self.commit_live_view(
             base.as_ref(),
@@ -854,9 +869,7 @@ mod tests {
     }
 
     fn genesis_kp() -> KeyPair {
-        KeyPair::Secp256k1(
-            Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb").unwrap(),
-        )
+        KeyPair::Secp256k1(Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb").unwrap())
     }
 
     #[test]
@@ -883,7 +896,10 @@ mod tests {
         assert_eq!(snapshot.queued_transactions, 6);
         assert_eq!(snapshot.parent_hash, hex::encode_upper([0xAA; 32]));
         assert_eq!(snapshot.candidate_set_hash, hex::encode_upper([0xDD; 32]));
-        assert_eq!(snapshot.escalation_multiplier, metrics.escalation_multiplier);
+        assert_eq!(
+            snapshot.escalation_multiplier,
+            metrics.escalation_multiplier
+        );
         assert_eq!(snapshot.txns_expected, metrics.txns_expected);
         assert_eq!(snapshot.max_queue_size, metrics.max_queue_size());
         assert_eq!(snapshot.open_fee_level, metrics.escalated_fee_level(7));
@@ -1050,13 +1066,7 @@ mod tests {
         let metrics = pool.metrics.clone();
 
         let mut open = OpenLedger::default();
-        assert!(open.sync_with_pool(
-            base,
-            &pool,
-            pool.len(),
-            pool.canonical_set_hash(),
-            &metrics,
-        ));
+        assert!(open.sync_with_pool(base, &pool, pool.len(), pool.canonical_set_hash(), &metrics,));
 
         let snapshot = open.snapshot();
         assert!(snapshot.has_open_view);
@@ -1065,7 +1075,10 @@ mod tests {
         assert_eq!(snapshot.open_view_failed_transactions, 0);
         assert_eq!(snapshot.open_view_skipped_transactions, 0);
         assert_eq!(snapshot.open_view_tx_count, 1);
-        assert_ne!(snapshot.open_view_state_hash, hex::encode_upper(base_state_hash));
+        assert_ne!(
+            snapshot.open_view_state_hash,
+            hex::encode_upper(base_state_hash)
+        );
         assert_ne!(snapshot.open_view_tx_hash, hex::encode_upper([0u8; 32]));
     }
 
@@ -1103,13 +1116,7 @@ mod tests {
         let metrics = pool.metrics.clone();
 
         let mut open = OpenLedger::default();
-        assert!(open.sync_with_pool(
-            base,
-            &pool,
-            pool.len(),
-            pool.canonical_set_hash(),
-            &metrics,
-        ));
+        assert!(open.sync_with_pool(base, &pool, pool.len(), pool.canonical_set_hash(), &metrics,));
 
         let txs = open.current_transactions();
         assert_eq!(txs.len(), 1);
@@ -1181,22 +1188,16 @@ mod tests {
         let extra_keylet = keylet::account(&extra);
         let extra_data = make_account_data(&extra, 5_000_000, 1);
 
-        assert!(open.accept_with_modify(
-            base,
-            &header,
-            &pool,
-            0,
-            [0; 32],
-            &metrics,
-            |view| {
+        assert!(
+            open.accept_with_modify(base, &header, &pool, 0, [0; 32], &metrics, |view| {
                 view.raw_insert(Arc::new(SLE::new(
                     extra_keylet.key,
                     LedgerEntryType::AccountRoot,
                     extra_data.clone(),
                 )));
                 true
-            },
-        ));
+            },)
+        );
 
         let snapshot = open.snapshot();
         assert!(snapshot.has_open_view);

@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use tokio::sync::{mpsc, Notify};
 
-use crate::network::peer::PeerId;
 use crate::network::message::RtxpMessage;
+use crate::network::peer::PeerId;
 
 pub struct HeaderBootstrapPlan {
     pub progress: crate::sync_coordinator::SyncProgress,
@@ -17,6 +17,7 @@ pub struct HeaderTriggerPlan {
     pub ignore_mismatched_fixed_target: Option<(u32, [u8; 32])>,
     pub restart_fixed_target: bool,
     pub installed_syncer: bool,
+    pub sync_lock_busy: bool,
     pub sync_completed_from_disk: bool,
     pub bootstrap: Option<HeaderBootstrapPlan>,
 }
@@ -45,15 +46,16 @@ impl SyncRuntime {
         }
     }
 
-    pub fn lock_sync(
-        &self,
-    ) -> MutexGuard<'_, Option<crate::sync_coordinator::SyncCoordinator>> {
+    pub fn lock_sync(&self) -> MutexGuard<'_, Option<crate::sync_coordinator::SyncCoordinator>> {
         self.sync.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn try_lock_sync(
         &self,
-    ) -> Result<MutexGuard<'_, Option<crate::sync_coordinator::SyncCoordinator>>, TryLockError<MutexGuard<'_, Option<crate::sync_coordinator::SyncCoordinator>>>> {
+    ) -> Result<
+        MutexGuard<'_, Option<crate::sync_coordinator::SyncCoordinator>>,
+        TryLockError<MutexGuard<'_, Option<crate::sync_coordinator::SyncCoordinator>>>,
+    > {
         self.sync.try_lock()
     }
 
@@ -85,9 +87,9 @@ impl SyncRuntime {
 
     pub fn inactive_target(&self) -> Option<(u32, [u8; 32])> {
         self.try_lock_sync().ok().and_then(|guard| {
-            guard
-                .as_ref()
-                .and_then(|syncer| (!syncer.active()).then_some((syncer.ledger_seq(), *syncer.ledger_hash())))
+            guard.as_ref().and_then(|syncer| {
+                (!syncer.active()).then_some((syncer.ledger_seq(), *syncer.ledger_hash()))
+            })
         })
     }
 
@@ -144,49 +146,51 @@ impl SyncRuntime {
             ignore_mismatched_fixed_target: None,
             restart_fixed_target: false,
             installed_syncer: false,
+            sync_lock_busy: false,
             sync_completed_from_disk: false,
             bootstrap: None,
         };
 
-        if self.has_syncer() && !already_syncing {
-            if let Ok(mut guard) = self.try_lock_sync() {
-                if let Some(ref s) = *guard {
-                    if !s.active() {
-                        let target_hash = *s.ledger_hash();
-                        let target_seq = s.ledger_seq();
-                        let target_header = s.sync_header.clone();
-                        if header.hash != target_hash {
-                            plan.ignore_mismatched_fixed_target = Some((target_seq, target_hash));
-                            return plan;
-                        }
-                        let mut restarted = crate::sync_coordinator::SyncCoordinator::new(
-                            target_header.sequence,
-                            target_header.hash,
-                            target_header.account_hash,
-                            backend.clone(),
-                            target_header,
-                        );
-                        if let Some(lc) = leaf_count {
-                            restarted.set_leaf_count(lc);
-                        }
-                        let seed_count = open_peers.max(1);
-                        plan.bootstrap = Self::bootstrap_plan_from_wire(
-                            &mut restarted,
-                            ld,
-                            seed_count,
-                            true,
-                        );
-                        let h8 = u64::from_be_bytes(target_hash[..8].try_into().unwrap());
-                        self.set_target_hash8(h8);
-                        *guard = Some(restarted);
-                        plan.restart_fixed_target = true;
+        let mut guard = match self.try_lock_sync_for_header_trigger() {
+            Some(guard) => guard,
+            None => {
+                plan.sync_lock_busy = true;
+                return plan;
+            }
+        };
+
+        if !already_syncing {
+            if let Some(syncer) = guard.as_ref() {
+                if !syncer.active() {
+                    let target_hash = *syncer.ledger_hash();
+                    let target_seq = syncer.ledger_seq();
+                    let target_header = syncer.sync_header.clone();
+                    if header.hash != target_hash {
+                        plan.ignore_mismatched_fixed_target = Some((target_seq, target_hash));
+                        return plan;
                     }
+                    let mut restarted = crate::sync_coordinator::SyncCoordinator::new(
+                        target_header.sequence,
+                        target_header.hash,
+                        target_header.account_hash,
+                        backend.clone(),
+                        target_header,
+                    );
+                    if let Some(lc) = leaf_count {
+                        restarted.set_leaf_count(lc);
+                    }
+                    let seed_count = open_peers.max(1);
+                    plan.bootstrap =
+                        Self::bootstrap_plan_from_wire(&mut restarted, ld, seed_count, true);
+                    let h8 = u64::from_be_bytes(target_hash[..8].try_into().unwrap());
+                    self.set_target_hash8(h8);
+                    *guard = Some(restarted);
+                    plan.restart_fixed_target = true;
                 }
             }
         }
 
-        let has_syncer_now = self.has_syncer();
-        if !(has_syncer_now || already_syncing || sync_in_progress) {
+        if guard.is_none() && !(already_syncing || sync_in_progress) {
             let mut syncer = crate::sync_coordinator::SyncCoordinator::new(
                 header.sequence,
                 header.hash,
@@ -204,27 +208,27 @@ impl SyncRuntime {
             if sync_completed_from_disk {
                 syncer.set_active(false);
             }
-            plan.installed_syncer = self.install_syncer(syncer);
+            let target_hash8 = u64::from_be_bytes(syncer.ledger_hash()[..8].try_into().unwrap());
+            self.set_target_hash8(target_hash8);
+            *guard = Some(syncer);
+            plan.installed_syncer = true;
             plan.sync_completed_from_disk = sync_completed_from_disk;
         }
 
         if plan.bootstrap.is_none() {
-            let have_syncer_now = self.has_syncer();
-            if !already_syncing && have_syncer_now {
+            if !already_syncing {
                 let seed_count = if plan.restart_fixed_target {
                     open_peers.max(1)
                 } else {
                     6
                 };
-                if let Ok(mut guard) = self.try_lock_sync() {
-                    if let Some(syncer) = guard.as_mut() {
-                        plan.bootstrap = Self::bootstrap_plan_from_wire(
-                            syncer,
-                            ld,
-                            seed_count,
-                            plan.restart_fixed_target,
-                        );
-                    }
+                if let Some(syncer) = guard.as_mut() {
+                    plan.bootstrap = Self::bootstrap_plan_from_wire(
+                        syncer,
+                        ld,
+                        seed_count,
+                        plan.restart_fixed_target,
+                    );
                 }
             }
         }
@@ -241,6 +245,25 @@ impl SyncRuntime {
         } else {
             false
         }
+    }
+
+    fn try_lock_sync_for_header_trigger(
+        &self,
+    ) -> Option<MutexGuard<'_, Option<crate::sync_coordinator::SyncCoordinator>>> {
+        const HEADER_TRIGGER_LOCK_RETRIES: usize = 4;
+
+        for attempt in 0..HEADER_TRIGGER_LOCK_RETRIES {
+            match self.try_lock_sync() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(err)) => return Some(err.into_inner()),
+                Err(TryLockError::WouldBlock) if attempt + 1 < HEADER_TRIGGER_LOCK_RETRIES => {
+                    std::thread::yield_now();
+                }
+                Err(TryLockError::WouldBlock) => return None,
+            }
+        }
+
+        None
     }
 
     pub fn trigger_timeout_blocking(
@@ -293,7 +316,8 @@ impl SyncRuntime {
                 if lock_wait_ms > 5 || hold_ms > 20 {
                     tracing::info!(
                         "sync trigger(timeout): lock_wait={}ms hold={}ms",
-                        lock_wait_ms, hold_ms
+                        lock_wait_ms,
+                        hold_ms
                     );
                 }
                 drop(guard);
@@ -314,7 +338,8 @@ impl SyncRuntime {
                 if lock_wait_ms > 5 || hold_ms > 20 {
                     tracing::info!(
                         "sync trigger(timeout): lock_wait={}ms hold={}ms",
-                        lock_wait_ms, hold_ms
+                        lock_wait_ms,
+                        hold_ms
                     );
                 }
                 drop(guard);
@@ -330,7 +355,8 @@ impl SyncRuntime {
                 if lock_wait_ms > 5 || hold_ms > 20 {
                     tracing::info!(
                         "sync trigger(timeout): lock_wait={}ms hold={}ms",
-                        lock_wait_ms, hold_ms
+                        lock_wait_ms,
+                        hold_ms
                     );
                 }
                 drop(guard);
@@ -352,7 +378,8 @@ impl SyncRuntime {
                 if lock_wait_ms > 5 || hold_ms > 20 {
                     tracing::info!(
                         "sync trigger(timeout): lock_wait={}ms hold={}ms",
-                        lock_wait_ms, hold_ms
+                        lock_wait_ms,
+                        hold_ms
                     );
                 }
                 drop(guard);
@@ -374,7 +401,8 @@ impl SyncRuntime {
                 if lock_wait_ms > 5 || hold_ms > 20 {
                     tracing::info!(
                         "sync trigger(timeout): lock_wait={}ms hold={}ms",
-                        lock_wait_ms, hold_ms
+                        lock_wait_ms,
+                        hold_ms
                     );
                 }
                 drop(guard);
@@ -521,19 +549,9 @@ mod tests {
         assert!(runtime.install_syncer(syncer));
 
         let wrong = test_header(100, 0x22);
-        let plan = runtime.plan_header_trigger(
-            wrong,
-            &test_state_wire(),
-            None,
-            None,
-            4,
-            false,
-            false,
-        );
-        assert_eq!(
-            plan.ignore_mismatched_fixed_target,
-            Some((100, [0x11; 32]))
-        );
+        let plan =
+            runtime.plan_header_trigger(wrong, &test_state_wire(), None, None, 4, false, false);
+        assert_eq!(plan.ignore_mismatched_fixed_target, Some((100, [0x11; 32])));
         assert!(!plan.restart_fixed_target);
         assert!(plan.bootstrap.is_none());
     }
@@ -579,5 +597,54 @@ mod tests {
 
         assert!(!runtime.has_syncer());
         assert_eq!(runtime.target_hash8(), 0);
+    }
+
+    #[test]
+    fn plan_header_trigger_restarts_matching_inactive_fixed_target() {
+        let runtime = SyncRuntime::new();
+        let header = test_header(100, 0x11);
+        let mut syncer = crate::sync_coordinator::SyncCoordinator::new(
+            header.sequence,
+            header.hash,
+            header.account_hash,
+            None,
+            header.clone(),
+        );
+        syncer.set_active(false);
+        assert!(runtime.install_syncer(syncer));
+
+        let plan = runtime.plan_header_trigger(
+            header.clone(),
+            &test_state_wire(),
+            None,
+            Some(123),
+            4,
+            false,
+            false,
+        );
+
+        assert!(plan.restart_fixed_target);
+        assert!(plan.bootstrap.is_some());
+        assert!(!plan.installed_syncer);
+
+        let guard = runtime.lock_sync();
+        let syncer = guard.as_ref().expect("syncer should remain installed");
+        assert!(syncer.active());
+        assert_eq!(syncer.ledger_seq(), header.sequence);
+    }
+
+    #[test]
+    fn plan_header_trigger_reports_busy_sync_lock_without_partial_install() {
+        let runtime = SyncRuntime::new();
+        let _guard = runtime.lock_sync();
+        let header = test_header(100, 0x11);
+
+        let plan =
+            runtime.plan_header_trigger(header, &test_state_wire(), None, None, 4, false, false);
+
+        assert!(plan.sync_lock_busy);
+        assert!(!plan.installed_syncer);
+        assert!(!plan.restart_fixed_target);
+        assert!(plan.bootstrap.is_none());
     }
 }

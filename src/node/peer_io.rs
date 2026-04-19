@@ -1,6 +1,34 @@
 use super::*;
 
 impl Node {
+    fn log_tls_accept_error(addr: SocketAddr, err: &openssl::ssl::Error) {
+        static TLS_EOF_SUPPRESSED: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        static LAST_TLS_EOF_SUMMARY: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        let text = err.to_string().to_ascii_lowercase();
+        let transient_eof = text.contains("unexpected eof")
+            || text.contains("close_notify")
+            || text.contains("eof occurred in violation of protocol");
+        if !transient_eof {
+            warn!("TLS accept error from {addr}: {err}");
+            return;
+        }
+
+        let count = TLS_EOF_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let prev = LAST_TLS_EOF_SUMMARY.load(std::sync::atomic::Ordering::Relaxed);
+        if now_secs >= prev + 60 {
+            LAST_TLS_EOF_SUMMARY.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            info!("suppressed {} transient TLS accept EOFs in last 60s", count);
+            TLS_EOF_SUPPRESSED.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(super) async fn run_peer_listener(self: Arc<Self>) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.config.peer_addr).await?;
         info!(
@@ -63,7 +91,7 @@ impl Node {
                     match tokio_openssl::SslStream::new(ssl, tcp) {
                         Ok(mut stream) => {
                             if let Err(e) = std::pin::Pin::new(&mut stream).accept().await {
-                                warn!("TLS accept error from {addr}: {e}");
+                                Self::log_tls_accept_error(addr, &e);
                                 return;
                             }
                             let session_hash =

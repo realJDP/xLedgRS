@@ -6,6 +6,7 @@ use crate::ledger::node_store::NodeStore;
 
 const MAX_FETCH_PACK_NODES: usize = 16_384;
 const FETCH_PACK_RETENTION_SECS: u64 = 15 * 60;
+const MAX_QUARANTINED_HASHES: usize = 262_144;
 
 #[derive(Debug, Clone)]
 pub struct FetchPackEntrySummary {
@@ -103,6 +104,13 @@ struct FetchPackState {
 pub struct FetchPackStore {
     inner: Arc<dyn NodeStore>,
     state: Mutex<FetchPackState>,
+    quarantined: Mutex<QuarantineState>,
+}
+
+#[derive(Debug, Default)]
+struct QuarantineState {
+    hashes: std::collections::HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
 }
 
 impl FetchPackStore {
@@ -110,6 +118,7 @@ impl FetchPackStore {
         let service = Arc::new(Self {
             inner,
             state: Mutex::new(FetchPackState::default()),
+            quarantined: Mutex::new(QuarantineState::default()),
         });
         let backend: Arc<dyn NodeStore> = service.clone();
         (backend, service)
@@ -176,10 +185,7 @@ impl FetchPackStore {
         }
     }
 
-    pub fn import_verified_objects(
-        &self,
-        nodes: &[([u8; 32], Vec<u8>)],
-    ) -> FetchPackImportResult {
+    pub fn import_verified_objects(&self, nodes: &[([u8; 32], Vec<u8>)]) -> FetchPackImportResult {
         let mut result = FetchPackImportResult {
             imported: nodes.len(),
             ..FetchPackImportResult::default()
@@ -189,7 +195,11 @@ impl FetchPackStore {
             return result;
         }
 
-        let batch_error = self.inner.store_batch(nodes).err().map(|err| err.to_string());
+        let batch_error = self
+            .inner
+            .store_batch(nodes)
+            .err()
+            .map(|err| err.to_string());
         if batch_error.is_none() {
             for (hash, data) in nodes {
                 self.stash(*hash, data.clone());
@@ -206,17 +216,8 @@ impl FetchPackStore {
                     result.persisted += 1;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-                    match self.inner.store_unchecked(hash, data) {
-                        Ok(()) => {
-                            self.stash(*hash, data.clone());
-                            result.persisted += 1;
-                            result.unchecked_fallbacks += 1;
-                        }
-                        Err(fallback_err) => {
-                            result.persist_errors += 1;
-                            result.last_error = Some(fallback_err.to_string());
-                        }
-                    }
+                    result.persist_errors += 1;
+                    result.last_error = Some(err.to_string());
                 }
                 Err(err) => {
                     result.persist_errors += 1;
@@ -311,10 +312,38 @@ impl FetchPackStore {
         Self::trim_locked(&mut state, now_unix);
     }
 
+    fn is_quarantined(&self, hash: &[u8; 32]) -> bool {
+        self.quarantined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hashes
+            .contains(hash)
+    }
+
+    fn quarantine_hash(&self, hash: [u8; 32]) {
+        let mut state = self.quarantined.lock().unwrap_or_else(|e| e.into_inner());
+        if state.hashes.insert(hash) {
+            state.order.push_back(hash);
+            while state.order.len() > MAX_QUARANTINED_HASHES {
+                if let Some(evicted) = state.order.pop_front() {
+                    state.hashes.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    fn clear_overlay(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.clear();
+        state.order.clear();
+    }
+
     fn note_import_result(&self, result: &FetchPackImportResult) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.imported_total = state.imported_total.saturating_add(result.imported as u64);
-        state.persisted_total = state.persisted_total.saturating_add(result.persisted as u64);
+        state.persisted_total = state
+            .persisted_total
+            .saturating_add(result.persisted as u64);
         state.persist_errors_total = state
             .persist_errors_total
             .saturating_add(result.persist_errors as u64);
@@ -426,6 +455,9 @@ impl NodeStore for FetchPackStore {
         if let Some(data) = self.fetch_overlay(hash) {
             return Ok(Some(data));
         }
+        if self.is_quarantined(hash) {
+            return Ok(None);
+        }
         let fetched = self.inner.fetch(hash)?;
         if let Some(data) = fetched.as_ref() {
             self.stash(*hash, data.clone());
@@ -460,14 +492,7 @@ impl NodeStore for FetchPackStore {
                             self.stash(*hash, data.clone());
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-                            match self.inner.store_unchecked(hash, data) {
-                                Ok(()) => {
-                                    self.stash(*hash, data.clone());
-                                }
-                                Err(fallback_err) => {
-                                    fallback_error = Some(fallback_err.to_string());
-                                }
-                            }
+                            fallback_error = Some(err.to_string());
                         }
                         Err(err) => {
                             fallback_error = Some(err.to_string());
@@ -489,6 +514,16 @@ impl NodeStore for FetchPackStore {
         let result = self.inner.flush_to_disk();
         self.note_flush_result(started_at, &result);
         result
+    }
+
+    fn mark_corrupt(&self, hash: &[u8; 32]) {
+        self.quarantine_hash(*hash);
+        self.inner.mark_corrupt(hash);
+    }
+
+    fn clear_in_memory(&self) {
+        self.clear_overlay();
+        self.inner.clear_in_memory();
     }
 }
 
@@ -694,27 +729,26 @@ mod tests {
     }
 
     #[test]
-    fn import_verified_objects_falls_back_to_unchecked_store() {
+    fn import_verified_objects_rejects_invaliddata_without_unchecked_store() {
         let inner = Arc::new(ImportFallbackStore::default());
         let typed_inner: Arc<dyn NodeStore> = inner.clone();
         let (backend, fetch_pack) = FetchPackStore::wrap(typed_inner);
         let hash = [0x66; 32];
         let result = fetch_pack.import_verified_objects(&[(hash, b"overlay".to_vec())]);
         assert_eq!(result.imported, 1);
-        assert_eq!(result.persisted, 1);
-        assert_eq!(result.persist_errors, 0);
-        assert_eq!(result.unchecked_fallbacks, 1);
-        assert_eq!(result.last_error, None);
+        assert_eq!(result.persisted, 0);
+        assert_eq!(result.persist_errors, 1);
+        assert_eq!(result.unchecked_fallbacks, 0);
+        assert!(result.last_error.is_some());
         assert_eq!(inner.batch_calls.load(Ordering::Relaxed), 1);
         assert_eq!(inner.store_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(inner.unchecked_calls.load(Ordering::Relaxed), 1);
-        let fetched = backend.fetch(&hash).unwrap().unwrap();
-        assert_eq!(fetched, b"overlay");
+        assert_eq!(inner.unchecked_calls.load(Ordering::Relaxed), 0);
+        assert!(backend.fetch(&hash).unwrap().is_none());
         let snapshot = fetch_pack.snapshot(4);
         assert_eq!(snapshot.imported_total, 1);
-        assert_eq!(snapshot.persisted_total, 1);
-        assert_eq!(snapshot.unchecked_fallbacks_total, 1);
-        assert_eq!(snapshot.last_import_error, None);
+        assert_eq!(snapshot.persisted_total, 0);
+        assert_eq!(snapshot.unchecked_fallbacks_total, 0);
+        assert!(snapshot.last_import_error.is_some());
     }
 
     #[test]
@@ -754,6 +788,22 @@ mod tests {
         assert_eq!(snapshot.tracked, 2);
         assert_eq!(snapshot.stashed_total, 2);
         assert_eq!(snapshot.persisted_total, 0);
+    }
+
+    #[test]
+    fn quarantined_hashes_skip_backend_until_overlay_has_replacement() {
+        let inner: Arc<dyn NodeStore> = Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let (backend, fetch_pack) = FetchPackStore::wrap(inner.clone());
+        let hash = [0xD1; 32];
+
+        inner.store(&hash, b"backend").unwrap();
+        backend.mark_corrupt(&hash);
+        assert!(backend.fetch(&hash).unwrap().is_none());
+
+        backend.store(&hash, b"overlay").unwrap();
+        assert_eq!(backend.fetch(&hash).unwrap().unwrap(), b"overlay");
+        fetch_pack.clear_overlay();
+        assert!(backend.fetch(&hash).unwrap().is_none());
     }
 
     #[test]

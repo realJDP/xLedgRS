@@ -222,7 +222,11 @@ impl ClusterManager {
                 .iter()
                 .filter(|(_, entry)| entry.connected)
                 .count(),
-            max_reported_load_factor: self.entries.values().filter_map(|entry| entry.load_factor).max(),
+            max_reported_load_factor: self
+                .entries
+                .values()
+                .filter_map(|entry| entry.load_factor)
+                .max(),
             entries,
         }
     }

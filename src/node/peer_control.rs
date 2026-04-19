@@ -19,8 +19,8 @@ impl Node {
                         let latency = sent_at.elapsed().as_millis() as u32;
                         state.peer_latency.insert(peer.id, latency);
                         if latency > 10000 {
-                            let expires = std::time::Instant::now()
-                                + std::time::Duration::from_secs(1200);
+                            let expires =
+                                std::time::Instant::now() + std::time::Duration::from_secs(1200);
                             state.sync_peer_cooldown.insert(peer.id, expires);
                             let _ = state.services.resource_manager.charge_consumer(
                                 &peer.resource_consumer,
@@ -33,8 +33,8 @@ impl Node {
                                 peer.id, latency
                             ));
                         } else if latency > 5000 {
-                            let expires = std::time::Instant::now()
-                                + std::time::Duration::from_secs(300);
+                            let expires =
+                                std::time::Instant::now() + std::time::Duration::from_secs(300);
                             state.sync_peer_cooldown.insert(peer.id, expires);
                             let _ = state.services.resource_manager.charge_consumer(
                                 &peer.resource_consumer,
@@ -96,7 +96,8 @@ impl Node {
         peer: &Peer,
         msg: &RtxpMessage,
     ) -> PeerEvent {
-        if let Ok(sc) = <crate::proto::TmStatusChange as ProstMessage>::decode(msg.payload.as_slice())
+        if let Ok(sc) =
+            <crate::proto::TmStatusChange as ProstMessage>::decode(msg.payload.as_slice())
         {
             let ledger_range = match (sc.first_seq, sc.last_seq) {
                 (Some(first), Some(last)) if first > 0 && last >= first => Some((first, last)),

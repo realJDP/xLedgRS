@@ -336,11 +336,8 @@ mod tests {
 
     fn peer(direction: Direction) -> Peer {
         let addr = "127.0.0.1:51235".parse().unwrap();
-        let consumer = crate::network::resource::ResourceManager::default().new_inbound_endpoint(
-            addr,
-            false,
-            None,
-        );
+        let consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
         Peer::new(PeerId(1), addr, direction, consumer)
     }
 

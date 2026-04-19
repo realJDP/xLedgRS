@@ -417,6 +417,8 @@ impl ConsensusRound {
 
         let current_proposers = self.proposals.len();
         let proposing = self.mode == ConsensusMode::Proposing;
+        let have_trusted_peer_proposals = current_proposers > 0;
+        let unl_requires_peer_support = !self.unl.is_empty();
 
         // Gate: not enough proposers yet AND not enough time.
         // rippled: if currentProposers < prevProposers*3/4 AND elapsed < prevRoundTime + MIN_CONSENSUS
@@ -442,11 +444,12 @@ impl ConsensusRound {
 
         // Check whether the round reached consensus.
         // Count self if proposing (rippled: count_self in checkConsensusReached).
-        let (eff_agree, eff_total) = if proposing {
-            (agree + 1, total + 1)
-        } else {
-            (agree, total)
-        };
+        let (eff_agree, eff_total) =
+            if proposing && (!unl_requires_peer_support || have_trusted_peer_proposals) {
+                (agree + 1, total + 1)
+            } else {
+                (agree, total)
+            };
 
         // Check for stalled disputes (all disputes at 80%+ agreement for 4+ rounds).
         let stalled = self.have_close_time_consensus
@@ -455,7 +458,9 @@ impl ConsensusRound {
 
         let reached_max = elapsed >= Duration::from_secs(15);
 
-        if consensus_reached(eff_agree, eff_total, reached_max, stalled) {
+        if consensus_reached(eff_agree, eff_total, reached_max, stalled)
+            && (!unl_requires_peer_support || have_trusted_peer_proposals || stalled)
+        {
             self.consensus_state = ConsensusState::Yes;
             return ConsensusState::Yes;
         }
@@ -468,7 +473,9 @@ impl ConsensusRound {
             .filter(|v| v.ledger_seq > self.ledger_seq)
             .count();
         // Conservative: don't count self, don't use stalled for MovedOn.
-        if consensus_reached(finished, current_proposers, reached_max, false) {
+        if current_proposers > 0
+            && consensus_reached(finished, current_proposers, reached_max, false)
+        {
             self.consensus_state = ConsensusState::MovedOn;
             return ConsensusState::MovedOn;
         }
@@ -1185,6 +1192,15 @@ mod tests {
     }
 
     #[test]
+    fn test_check_consensus_does_not_accept_self_only_with_nonempty_unl() {
+        let validators = make_validators(5);
+        let mut r = new_round(1, unl_from(&validators), [0u8; 32], true);
+        r.close_ledger(tx_hash(1));
+        r.establish_start = Some(Instant::now() - Duration::from_secs(50));
+        assert_eq!(r.check_consensus(), ConsensusState::Expired);
+    }
+
+    #[test]
     fn test_check_consensus_returns_no_with_insufficient_agreement() {
         let validators = make_validators(10);
         let mut r = new_round(1, unl_from(&validators), [0u8; 32], true);
@@ -1224,6 +1240,20 @@ mod tests {
         // MovedOn check: finished=4, total=5 → 4/5 = 80% → Yes!
         let state = r.check_consensus();
         assert_eq!(state, ConsensusState::MovedOn);
+    }
+
+    #[test]
+    fn test_check_consensus_does_not_move_on_without_peer_proposals() {
+        let validators = make_validators(5);
+        let mut r = new_round(1, unl_from(&validators), [0u8; 32], false);
+        r.close_ledger(tx_hash(1));
+        r.establish_start = Some(Instant::now() - Duration::from_secs(50));
+        for v in &validators[..4] {
+            let mut val = Validation::new_signed(2, tx_hash(99), 0, true, v);
+            val.ledger_seq = 2;
+            r.add_validation(val);
+        }
+        assert_eq!(r.check_consensus(), ConsensusState::Expired);
     }
 
     #[test]

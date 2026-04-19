@@ -1,5 +1,5 @@
-use super::*;
 use super::http_io::read_http_headers;
+use super::*;
 
 impl Node {
     pub(super) async fn handle_peer<S>(
@@ -51,7 +51,8 @@ impl Node {
         {
             Ok(r) => r,
             Err(e) => {
-                self.handle_failed_handshake(id, addr, &format!("{e}")).await;
+                self.handle_failed_handshake(id, addr, &format!("{e}"))
+                    .await;
                 return;
             }
         };

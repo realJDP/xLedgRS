@@ -168,6 +168,27 @@ impl NodeStore for CachedNodeStore {
         }
         Ok(())
     }
+
+    fn mark_corrupt(&self, hash: &[u8; 32]) {
+        {
+            let mut cache = self.cache_guard();
+            if let Some(old) = cache.entries.remove(hash) {
+                cache.total_bytes = cache.total_bytes.saturating_sub(old.len());
+            }
+            cache.order.retain(|key| key != hash);
+        }
+        self.backend.mark_corrupt(hash);
+    }
+
+    fn clear_in_memory(&self) {
+        {
+            let mut cache = self.cache_guard();
+            cache.entries.clear();
+            cache.order.clear();
+            cache.total_bytes = 0;
+        }
+        self.backend.clear_in_memory();
+    }
 }
 
 #[cfg(test)]

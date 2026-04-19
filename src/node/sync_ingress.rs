@@ -19,11 +19,25 @@ impl Node {
         }
 
         let already_syncing = self.sync_runtime.sync_active();
-        let (sync_done, open_peers, sync_in_progress) = {
+        let (sync_done, open_peers, sync_in_progress, pending_sync_anchor) = {
             let state = self.state.read().await;
-            (state.sync_done, state.peer_count(), state.sync_in_progress)
+            (
+                state.sync_done,
+                state.peer_count(),
+                state.sync_in_progress,
+                state.pending_sync_anchor,
+            )
         };
         if sync_done || self.storage.is_none() || open_peers < 1 {
+            return;
+        }
+        if let Some((anchor_seq, anchor_hash)) = pending_sync_anchor {
+            info!(
+                "ignoring liBASE for ledger {} while sync anchor {} ({}) is pending",
+                header.sequence,
+                anchor_seq,
+                hex::encode_upper(&anchor_hash[..8]),
+            );
             return;
         }
 
@@ -74,11 +88,7 @@ impl Node {
             }
         }
 
-        if !plan.installed_syncer
-            && !plan.restart_fixed_target
-            && !already_syncing
-            && !self.sync_runtime.has_syncer()
-        {
+        if plan.sync_lock_busy && !already_syncing && !sync_in_progress {
             warn!("sync lock busy during syncer install — will retry on next liBASE");
         }
 
@@ -379,10 +389,9 @@ impl Node {
                 };
                 if let Some(fetch_pack) = fetch_pack {
                     for node in &ld.nodes {
-                        match fetch_pack.stash_wire_node(
-                            &node.nodedata,
-                            crate::ledger::MapType::AccountState,
-                        ) {
+                        match fetch_pack
+                            .stash_wire_node(&node.nodedata, crate::ledger::MapType::AccountState)
+                        {
                             Ok(true) => stashed += 1,
                             Ok(false) => {}
                             Err(e) => {

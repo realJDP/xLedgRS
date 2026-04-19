@@ -334,6 +334,7 @@ pub struct RpcSnapshot {
     pub fees: crate::ledger::Fees,
     pub peer_count: usize,
     pub object_count: usize,
+    pub leaf_count: usize,
     pub build_version: &'static str,
     pub network_id: u32,
     pub standalone_mode: bool,
@@ -341,6 +342,7 @@ pub struct RpcSnapshot {
     pub memory_mb: usize,
     pub complete_ledgers: String,
     pub sync_done: bool,
+    pub follower_healthy: bool,
     pub validation_quorum: u32,
     /// Lightweight load/stall snapshot used by status RPCs.
     pub load_snapshot: crate::network::load::LoadSnapshot,
@@ -361,6 +363,7 @@ impl Default for RpcSnapshot {
             fees: crate::ledger::Fees::default(),
             peer_count: 0,
             object_count: 0,
+            leaf_count: 0,
             build_version: env!("CARGO_PKG_VERSION"),
             network_id: 0,
             standalone_mode: false,
@@ -368,6 +371,7 @@ impl Default for RpcSnapshot {
             memory_mb: 0,
             complete_ledgers: String::new(),
             sync_done: false,
+            follower_healthy: true,
             validation_quorum: 0,
             load_snapshot: crate::network::load::LoadSnapshot::default(),
             state_accounting_snapshot: None,
@@ -516,15 +520,13 @@ pub struct NodeContext {
     /// Force the next open ledger round to close immediately.
     pub force_ledger_accept: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Standalone/local ledger accept request coordinator.
-    pub ledger_accept_service:
-        Option<std::sync::Arc<crate::ledger::control::LedgerAcceptService>>,
+    pub ledger_accept_service: Option<std::sync::Arc<crate::ledger::control::LedgerAcceptService>>,
     /// Current online-delete keep window, if configured.
     pub online_delete: Option<u32>,
     /// Current `can_delete` advisory target.
     pub can_delete_target: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
     /// Background ledger cleaner service used by admin RPC.
-    pub ledger_cleaner:
-        Option<std::sync::Arc<crate::ledger::control::LedgerCleanerService>>,
+    pub ledger_cleaner: Option<std::sync::Arc<crate::ledger::control::LedgerCleanerService>>,
     /// Standalone mode matches rippled's local-only control plane behavior.
     pub standalone_mode: bool,
     /// Admin-only RPC methods (`sign`, `sign_for`, `submit`) are allowed only
@@ -540,8 +542,7 @@ pub struct NodeContext {
     pub validator_list_manager:
         Option<std::sync::Arc<std::sync::Mutex<crate::validator_list::ValidatorListManager>>>,
     /// Shared manifest cache populated from peer manifests.
-    pub manifest_cache:
-        Option<std::sync::Arc<std::sync::Mutex<crate::consensus::ManifestCache>>>,
+    pub manifest_cache: Option<std::sync::Arc<std::sync::Mutex<crate::consensus::ManifestCache>>>,
     /// Configured validator list sites.
     pub validator_list_sites: Vec<String>,
     /// Per-site validator list refresh status for admin inspection.

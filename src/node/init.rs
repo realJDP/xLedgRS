@@ -1,19 +1,115 @@
 use super::*;
 
-impl Node {
-    pub fn new(config: NodeConfig) -> Self {
-        let cfg = config.config_file.as_ref().and_then(|path| {
-            match crate::config::ConfigFile::load(path) {
-                Ok(c) => {
-                    info!("loaded config from {}", path.display());
-                    Some(c)
-                }
-                Err(e) => {
-                    warn!("failed to load config {}: {e}", path.display());
-                    None
+#[derive(serde::Deserialize)]
+struct ValidatorTokenPayload {
+    #[serde(default)]
+    manifest: Option<String>,
+    validation_secret_key: String,
+}
+
+fn load_validator_key_from_token(
+    token: &str,
+    manifest_cache: &Arc<std::sync::Mutex<crate::consensus::ManifestCache>>,
+) -> Option<Secp256k1KeyPair> {
+    let raw = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token) {
+        Ok(raw) => raw,
+        Err(e) => {
+            error!("failed to decode validator_token: {e}");
+            return None;
+        }
+    };
+    let payload: ValidatorTokenPayload = match serde_json::from_slice(&raw) {
+        Ok(payload) => payload,
+        Err(e) => {
+            error!("failed to parse validator_token JSON payload: {e}");
+            return None;
+        }
+    };
+
+    if let Some(manifest_b64) = payload.manifest.as_deref() {
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, manifest_b64)
+            .ok()
+            .and_then(|bytes| crate::consensus::Manifest::from_bytes(&bytes).ok())
+        {
+            Some(manifest) if manifest.verify() => {
+                let accepted = manifest_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .add_prevalidated(manifest);
+                if !accepted {
+                    warn!("validator_token manifest was already present or rejected");
                 }
             }
-        });
+            Some(_) => warn!("validator_token manifest failed signature verification"),
+            None => warn!("validator_token manifest could not be decoded"),
+        }
+    }
+
+    match Secp256k1KeyPair::from_secret_hex(&payload.validation_secret_key) {
+        Ok(kp) => Some(kp),
+        Err(e) => {
+            error!("failed to derive validator key from validator_token: {e}");
+            None
+        }
+    }
+}
+
+fn load_verified_resume_header(
+    store: &crate::storage::Storage,
+) -> Option<crate::ledger::LedgerHeader> {
+    if !store.is_sync_complete() {
+        return None;
+    }
+
+    let header = store.get_sync_ledger_header()?;
+    if let Some(seq) = store.get_sync_ledger() {
+        if header.sequence != seq as u32 {
+            warn!(
+                "sync anchor header seq {} disagrees with sync_ledger {} — falling back to storage meta",
+                header.sequence, seq
+            );
+            return None;
+        }
+    }
+    if let Some(hash) = store.get_sync_ledger_hash() {
+        if header.hash != hash {
+            warn!(
+                "sync anchor header hash {} disagrees with sync_ledger_hash {} — falling back to storage meta",
+                hex::encode_upper(&header.hash[..8]),
+                hex::encode_upper(&hash[..8]),
+            );
+            return None;
+        }
+    }
+    if let Some(account_hash) = store.get_sync_account_hash() {
+        if header.account_hash != account_hash {
+            warn!(
+                "sync anchor header account_hash {} disagrees with sync_account_hash {} — falling back to storage meta",
+                hex::encode_upper(&header.account_hash[..8]),
+                hex::encode_upper(&account_hash[..8]),
+            );
+            return None;
+        }
+    }
+
+    Some(header)
+}
+
+impl Node {
+    pub fn new(config: NodeConfig) -> Self {
+        let cfg =
+            config.config_file.as_ref().and_then(|path| {
+                match crate::config::ConfigFile::load(path) {
+                    Ok(c) => {
+                        info!("loaded config from {}", path.display());
+                        Some(c)
+                    }
+                    Err(e) => {
+                        warn!("failed to load config {}: {e}", path.display());
+                        None
+                    }
+                }
+            });
         let static_unl = cfg.as_ref().map(|c| c.unl()).unwrap_or_default();
         let validator_lists = cfg
             .as_ref()
@@ -31,9 +127,8 @@ impl Node {
         ));
         let validator_site_statuses =
             crate::validator_list::initial_site_statuses(&validator_lists.sites);
-        let manifest_cache = Arc::new(std::sync::Mutex::new(
-            crate::consensus::ManifestCache::new(),
-        ));
+        let manifest_cache =
+            Arc::new(std::sync::Mutex::new(crate::consensus::ManifestCache::new()));
         let path_requests = Arc::new(std::sync::Mutex::new(
             crate::rpc::path_requests::PathRequestManager::default(),
         ));
@@ -88,26 +183,53 @@ impl Node {
                             config.ledger_history.max_history_limit(),
                         )
                     });
-                let (mut seq, mut hash, mut header) =
-                    store
-                        .load_meta()
-                        .unwrap_or((0, "0".repeat(64), Default::default()));
-                if let Some(latest) = history_inner.latest_ledger() {
-                    let hist_seq = latest.header.sequence;
-                    let hist_hash = hex::encode_upper(latest.header.hash);
-                    if seq != hist_seq || header.sequence != hist_seq || hash != hist_hash {
-                        warn!(
-                            "storage meta disagrees with ledger history (meta_seq={}, hist_seq={}) — preferring historical latest ledger",
-                            seq, hist_seq,
-                        );
-                        seq = hist_seq;
-                        hash = hist_hash;
-                        header = latest.header.clone();
+                let resume_header = load_verified_resume_header(store);
+                let (mut seq, mut hash, mut header, prefer_history_latest) =
+                    if let Some(sync_header) = resume_header {
+                        (
+                            sync_header.sequence,
+                            hex::encode_upper(sync_header.hash),
+                            sync_header,
+                            false,
+                        )
+                    } else {
+                        let (seq, hash, header) =
+                            store
+                                .load_meta()
+                                .unwrap_or((0, "0".repeat(64), Default::default()));
+                        (
+                            seq,
+                            hash,
+                            header,
+                            crate::sync_bootstrap::should_prefer_history_latest(
+                                store.is_sync_complete(),
+                                false,
+                            ),
+                        )
+                    };
+                if prefer_history_latest {
+                    if let Some(latest) = history_inner.latest_ledger() {
+                        let hist_seq = latest.header.sequence;
+                        let hist_hash = hex::encode_upper(latest.header.hash);
+                        if seq != hist_seq || header.sequence != hist_seq || hash != hist_hash {
+                            warn!(
+                                "storage meta disagrees with ledger history (meta_seq={}, hist_seq={}) — preferring historical latest ledger",
+                                seq, hist_seq,
+                            );
+                            seq = hist_seq;
+                            hash = hist_hash;
+                            header = latest.header.clone();
+                        }
                     }
                 }
                 info!(
-                    "loaded ledger {seq} with {} accounts",
-                    ledger_state_inner.account_count()
+                    "loaded ledger {seq} with {} accounts{}",
+                    ledger_state_inner.account_count(),
+                    if prefer_history_latest {
+                        ""
+                    } else {
+                        " (resume source: sync anchor)"
+                    }
                 );
                 NodeContext {
                     network: "mainnet",
@@ -210,23 +332,28 @@ impl Node {
             crate::crypto::base58::encode(crate::crypto::base58::PREFIX_NODE_PUBLIC, &pubkey_bytes);
         info!("node public key: {}", node_pubkey_b58);
 
-        let validator_key = config.validation_seed.as_deref().and_then(|seed| {
-            match Secp256k1KeyPair::from_seed(seed) {
-                Ok(kp) => {
-                    let vk_bytes = kp.public_key_bytes();
-                    let vk_b58 = crate::crypto::base58::encode(
-                        crate::crypto::base58::PREFIX_NODE_PUBLIC,
-                        &vk_bytes,
-                    );
-                    info!("validator signing key: {}", vk_b58);
-                    Some(kp)
-                }
+        let validator_key = config
+            .validation_seed
+            .as_deref()
+            .and_then(|seed| match Secp256k1KeyPair::from_seed(seed) {
+                Ok(kp) => Some(kp),
                 Err(e) => {
                     error!("failed to derive validator key from validation_seed: {e}");
                     None
                 }
-            }
-        });
+            })
+            .or_else(|| {
+                config
+                    .validator_token
+                    .as_deref()
+                    .and_then(|token| load_validator_key_from_token(token, &manifest_cache))
+            });
+        if let Some(kp) = validator_key.as_ref() {
+            let vk_bytes = kp.public_key_bytes();
+            let vk_b58 =
+                crate::crypto::base58::encode(crate::crypto::base58::PREFIX_NODE_PUBLIC, &vk_bytes);
+            info!("validator signing key: {}", vk_b58);
+        }
         let validator_key_b58 = validator_key
             .as_ref()
             .map(|kp| {
@@ -277,8 +404,10 @@ impl Node {
         ctx.ledger_accept_service = ledger_accept_service.clone();
         ctx.online_delete = config.online_delete;
         ctx.storage = storage.clone();
-        let ledger_cleaner =
-            crate::ledger::control::LedgerCleanerService::new(storage.clone(), config.online_delete);
+        let ledger_cleaner = crate::ledger::control::LedgerCleanerService::new(
+            storage.clone(),
+            config.online_delete,
+        );
         ctx.ledger_cleaner = Some(ledger_cleaner.clone());
         let can_delete_target = Arc::new(std::sync::atomic::AtomicU32::new(
             if config.online_delete.is_some() {
@@ -373,6 +502,15 @@ impl Node {
                 }
                 info!("no sync_complete flag — clearing stale handoff metadata for fresh sync");
                 let _ = store.clear_sync_handoff();
+                if nudb_direct
+                    .as_ref()
+                    .map(|backend| backend.count())
+                    .unwrap_or(0)
+                    == 0
+                {
+                    let _ = store.save_leaf_count(0);
+                    info!("fresh sync with empty NuDB backend — reset persisted leaf_count");
+                }
             }
         }
 
@@ -434,14 +572,12 @@ impl Node {
         let initial_rpc_snapshot = Self::build_rpc_snapshot(
             &shared,
             initial_object_count,
+            Self::persisted_leaf_count(storage.as_ref()),
             &node_key,
             validator_key.as_ref(),
         );
-        let initial_rpc_read_ctx = Self::build_rpc_read_context(
-            &shared,
-            initial_object_count,
-            None,
-        );
+        let initial_rpc_read_ctx =
+            Self::build_rpc_read_context(&shared, initial_object_count, None);
         let state = Arc::new(RwLock::new(shared));
         let sync_runtime = Arc::new(crate::sync_runtime::SyncRuntime::new());
 

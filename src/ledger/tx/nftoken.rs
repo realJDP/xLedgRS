@@ -138,6 +138,15 @@ pub(crate) fn apply_nftoken_create_offer(
     // checks — the network already validated these.
     // (rippled: NFTokenCreateOffer.cpp checks via NFTokenUtils::getNFTokenPage)
 
+    // Destination offers require the destination account to exist.
+    // Without this guard, validated-replay parity breaks on tecNO_DST:
+    // the local engine would create an offer that rippled only charged a fee for.
+    if let Some(destination) = tx.destination {
+        if state.get_account(&destination).is_none() {
+            return ApplyResult::ClaimedCost("tecNO_DST");
+        }
+    }
+
     let amount = tx.amount.clone().unwrap_or(Amount::Xrp(0));
 
     // Reserve check: account must afford the new owner object.

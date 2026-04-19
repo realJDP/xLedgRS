@@ -34,10 +34,7 @@ impl Node {
         PeerEvent::MessageReceived(msg.msg_type, msg.payload.clone())
     }
 
-    pub(super) async fn handle_snapshot_header_message(
-        &self,
-        msg: &RtxpMessage,
-    ) -> PeerEvent {
+    pub(super) async fn handle_snapshot_header_message(&self, msg: &RtxpMessage) -> PeerEvent {
         if let Some(header) = crate::network::relay::decode_snapshot_header(&msg.payload) {
             info!("received snapshot header: ledger {}", header.sequence);
             let mut state = self.state.write().await;
@@ -54,10 +51,7 @@ impl Node {
         PeerEvent::MessageReceived(msg.msg_type, msg.payload.clone())
     }
 
-    pub(super) async fn handle_snapshot_chunk_message(
-        &self,
-        msg: &RtxpMessage,
-    ) -> PeerEvent {
+    pub(super) async fn handle_snapshot_chunk_message(&self, msg: &RtxpMessage) -> PeerEvent {
         if !msg.payload.is_empty() {
             let obj_type = msg.payload[0];
             let data = &msg.payload[1..];
@@ -79,10 +73,7 @@ impl Node {
         PeerEvent::MessageReceived(msg.msg_type, msg.payload.clone())
     }
 
-    pub(super) async fn handle_snapshot_end_message(
-        &self,
-        msg: &RtxpMessage,
-    ) -> PeerEvent {
+    pub(super) async fn handle_snapshot_end_message(&self, msg: &RtxpMessage) -> PeerEvent {
         if let Some((seq, hash)) = crate::network::relay::decode_snapshot_end(&msg.payload) {
             let mut state = self.state.write().await;
             let local_hash = {
@@ -134,10 +125,7 @@ impl Node {
         PeerEvent::MessageReceived(msg.msg_type, msg.payload.clone())
     }
 
-    pub(super) async fn handle_history_ledger_message(
-        &self,
-        msg: &RtxpMessage,
-    ) -> PeerEvent {
+    pub(super) async fn handle_history_ledger_message(&self, msg: &RtxpMessage) -> PeerEvent {
         if let Some((header, tx_records)) =
             crate::network::relay::decode_history_ledger(&msg.payload)
         {
@@ -157,21 +145,14 @@ impl Node {
         PeerEvent::MessageReceived(msg.msg_type, msg.payload.clone())
     }
 
-    pub(super) async fn handle_history_end_message(
-        &self,
-        msg: &RtxpMessage,
-    ) -> PeerEvent {
+    pub(super) async fn handle_history_end_message(&self, msg: &RtxpMessage) -> PeerEvent {
         info!("history download complete");
         let mut state = self.state.write().await;
         state.sync_in_progress = false;
         PeerEvent::MessageReceived(msg.msg_type, msg.payload.clone())
     }
 
-    pub(super) async fn handle_squelch_message(
-        &self,
-        peer: &Peer,
-        msg: &RtxpMessage,
-    ) -> PeerEvent {
+    pub(super) async fn handle_squelch_message(&self, peer: &Peer, msg: &RtxpMessage) -> PeerEvent {
         if let Some(sq) = crate::network::relay::decode_squelch(&msg.payload) {
             let mut state = self.state.write().await;
             if sq.squelch {

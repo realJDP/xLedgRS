@@ -79,6 +79,49 @@ fn validated_reacquired_sync_header(
     }
 }
 
+fn expand_directory_neighborhoods(
+    state: &crate::ledger::LedgerState,
+    keys: &mut std::collections::BTreeSet<crate::ledger::Key>,
+) {
+    let mut queue: std::collections::VecDeque<crate::ledger::Key> = keys.iter().copied().collect();
+
+    while let Some(key) = queue.pop_front() {
+        let Some(raw) = state.get_raw_owned(&key) else {
+            continue;
+        };
+        if raw.len() < 3 || raw[0] != 0x11 {
+            continue;
+        }
+        let sle_type = u16::from_be_bytes([raw[1], raw[2]]);
+        if sle_type != 0x0064 {
+            continue;
+        }
+
+        let Ok(dir) = crate::ledger::directory::DirectoryNode::decode(&raw, key.0) else {
+            continue;
+        };
+        let root = crate::ledger::Key(dir.root_index);
+        let mut maybe_add = |k: crate::ledger::Key| {
+            if keys.insert(k) {
+                queue.push_back(k);
+            }
+        };
+        maybe_add(root);
+        if dir.index_next != 0 {
+            maybe_add(crate::ledger::directory::page_key(
+                &dir.root_index,
+                dir.index_next,
+            ));
+        }
+        if dir.index_previous != 0 {
+            maybe_add(crate::ledger::directory::page_key(
+                &dir.root_index,
+                dir.index_previous,
+            ));
+        }
+    }
+}
+
 // ── Helper: sync typed collections from raw SLE ─────────────────────────────
 
 fn sync_typed(
@@ -87,6 +130,7 @@ fn sync_typed(
     key: &crate::ledger::Key,
     sle: &[u8],
 ) {
+    state.clear_typed_entry_for_key(key);
     match entry_type {
         0x0061 => {
             if let Ok(acct) = crate::ledger::AccountRoot::decode(sle) {
@@ -100,12 +144,17 @@ fn sync_typed(
         }
         0x0064 => {
             if let Ok(dir) = crate::ledger::DirectoryNode::decode(sle, key.0) {
-                state.hydrate_directory(dir);
+                state.update_directory_typed(dir);
             }
         }
         0x006f => {
             if let Some(off) = crate::ledger::offer::Offer::decode_from_sle(sle) {
                 state.update_offer_typed(off);
+            }
+        }
+        0x0037 => {
+            if let Some(off) = crate::ledger::nftoken::NFTokenOffer::decode_from_sle(sle) {
+                state.hydrate_nft_offer(off);
             }
         }
         _ => {}
@@ -117,20 +166,65 @@ fn remove_typed(state: &mut crate::ledger::LedgerState, entry_type: u16, key: &c
         0x0061 => {
             if let Some(sle) = state.get_raw_owned(key) {
                 if let Ok(acct) = crate::ledger::AccountRoot::decode(&sle) {
-                    state.remove_account(&acct.account_id);
+                    if state.remove_account(&acct.account_id).is_none() {
+                        state.remove_raw(key);
+                    }
+                } else {
+                    state.remove_raw(key);
                 }
+            } else {
+                state.remove_raw(key);
             }
         }
         0x0072 => {
-            state.remove_trustline(key);
+            if !state.remove_trustline(key) {
+                state.remove_raw(key);
+            }
+        }
+        0x0043 => {
+            if state.remove_check(key).is_none() {
+                state.remove_raw(key);
+            }
+        }
+        0x0070 => {
+            if state.remove_deposit_preauth(key).is_none() {
+                state.remove_raw(key);
+            }
+        }
+        0x0049 => {
+            if state.remove_did(key).is_none() {
+                state.remove_raw(key);
+            }
         }
         0x0064 => {
-            state.remove_directory(key);
+            state.remove_directory_any(key);
         }
         0x006f => {
-            state.remove_offer(key);
+            if state.remove_offer(key).is_none() {
+                state.remove_raw(key);
+            }
         }
-        _ => {}
+        0x0075 => {
+            if state.remove_escrow(key).is_none() {
+                state.remove_raw(key);
+            }
+        }
+        0x0078 => {
+            if state.remove_paychan(key).is_none() {
+                state.remove_raw(key);
+            }
+        }
+        0x0054 => {
+            if state.remove_ticket(key).is_none() {
+                state.remove_raw(key);
+            }
+        }
+        0x0037 => {
+            if state.remove_nft_offer(key).is_none() {
+                state.remove_raw(key);
+            }
+        }
+        _ => state.remove_raw(key),
     }
 }
 
@@ -624,20 +718,17 @@ fn apply_metadata_patches(
     modified_dir_overrides: &std::collections::HashMap<crate::ledger::Key, Vec<u8>>,
     state: &mut crate::ledger::LedgerState,
 ) -> MetadataPatchStats {
-    fn should_thread_entry_type(entry_type: u16) -> bool {
-        // Match rippled's fixPreviousTxnID behavior closely:
-        // these types should not be threaded when the amendment is not active.
-        // Also exclude ledger-hashes objects.
-        !matches!(
-            entry_type,
-            0x0064 // DirectoryNode
-                | 0x0066 // Amendments
-                | 0x0073 // FeeSettings
-                | 0x004E // NegativeUNL
-                | 0x0079 // AMM
-                | 0x0068 // LedgerHashes
-        )
-    }
+    let fix_previous_txn_id_enabled = crate::ledger::fix_previous_txn_id_enabled(state);
+    let should_thread_entry_type = |entry_type: u16| {
+        crate::ledger::sle::LedgerEntryType::from_u16(entry_type)
+            .map(|entry_type| {
+                crate::ledger::should_thread_previous_txn_fields_with_fix_previous_txn_id(
+                    fix_previous_txn_id_enabled,
+                    entry_type,
+                )
+            })
+            .unwrap_or(false)
+    };
     fn watch_directory_key(key: &[u8; 32]) -> bool {
         let k = hex::encode_upper(key);
         k == "28516E970A801B5AE4C34A5A5F7BB8A63263E481504D85066F61BBE1A3AC1123"
@@ -1560,6 +1651,22 @@ impl FollowerState {
     }
 }
 
+fn stop_follower(follower_state: &FollowerState) {
+    follower_state.running.store(false, Ordering::SeqCst);
+}
+
+fn request_resync_and_stop_follower(follower_state: &FollowerState) {
+    follower_state
+        .resync_requested
+        .store(true, Ordering::SeqCst);
+    stop_follower(follower_state);
+}
+
+fn try_flush_follow_state(state: &mut crate::ledger::LedgerState) -> std::io::Result<[u8; 32]> {
+    state.try_take_dirty()?;
+    Ok(state.nudb_root_hash().unwrap_or_else(|| state.state_hash()))
+}
+
 // ── Main follower loop ───────────────────────────────────────────────────────
 
 /// Run the ledger follower loop. For each validated ledger:
@@ -1958,11 +2065,27 @@ pub async fn run_follower(
 
         // Send requests (may be redundant with validation handler's pre-fetch)
         {
+            let missing_tx_nodes = {
+                let guard = inbound_ledgers.lock().unwrap_or_else(|e| e.into_inner());
+                guard.missing_tx_node_ids(&ledger_hash, 64)
+            };
             let cookie_base = crate::sync::next_cookie();
             let cookie_tx = crate::sync::next_cookie();
             let base_req = crate::network::relay::encode_get_ledger_base(&ledger_hash, cookie_base);
-            let tx_req =
-                crate::network::relay::encode_get_ledger_txs_for_hash(&ledger_hash, cookie_tx);
+            let use_root_tx_request = missing_tx_nodes.is_empty()
+                || missing_tx_nodes
+                    == vec![crate::ledger::shamap_id::SHAMapNodeID::root()
+                        .to_wire()
+                        .to_vec()];
+            let tx_req = if use_root_tx_request {
+                crate::network::relay::encode_get_ledger_txs_for_hash(&ledger_hash, cookie_tx)
+            } else {
+                crate::network::relay::encode_get_ledger_txs_for_hash_nodes(
+                    &ledger_hash,
+                    &missing_tx_nodes,
+                    cookie_tx,
+                )
+            };
             let mut state = shared_state.write().await;
             state.send_to_peers_with_ledger(&base_req, validated, 3);
             state.send_to_peers_with_ledger(&tx_req, validated, 3);
@@ -2018,14 +2141,14 @@ pub async fn run_follower(
                 hex::encode_upper(&ledger_hash[..8]),
             );
             if let Some((rpc_resp, rpc_acc_hash)) =
-                fetch_ledger_binary(&rpc_host, rpc_port, target_seq).await
+                fetch_ledger_binary(&rpc_host, rpc_port, validated).await
             {
                 let rpc_blobs = parse_binary_ledger_blobs(&rpc_resp);
                 if !rpc_blobs.is_empty() {
                     // Fetch non-binary header for full field set
                     let hdr_req = format!(
                         r#"{{"method":"ledger","params":[{{"ledger_index":{}}}]}}"#,
-                        target_seq,
+                        validated,
                     );
                     fn decode_h256(hex_str: &str) -> [u8; 32] {
                         hex::decode(hex_str)
@@ -2080,7 +2203,7 @@ pub async fn run_follower(
                         let hdr: Value = serde_json::from_str(&hdr_body).unwrap_or_default();
                         let lh = &hdr["result"]["ledger"];
                         Some(crate::ledger::LedgerHeader {
-                            sequence: lh["ledger_index"].as_u64().unwrap_or(target_seq as u64)
+                            sequence: lh["ledger_index"].as_u64().unwrap_or(validated as u64)
                                 as u32,
                             hash: ledger_hash,
                             parent_hash: decode_h256(lh["parent_hash"].as_str().unwrap_or("")),
@@ -2101,17 +2224,18 @@ pub async fn run_follower(
                             close_flags: lh["close_flags"].as_u64().unwrap_or(0) as u8,
                         })
                     } else {
-                        info!("follower: RPC header fetch failed for seq={}", target_seq);
+                        info!("follower: RPC header fetch failed for seq={}", validated);
                         None
                     };
                     if let Some(rpc_header) = rpc_header {
+                        let rpc_tx_root = rpc_header.transaction_hash;
                         info!(
                             "follower: got full ledger seq={} via RPC fallback: {} txs, account_hash={} parent={}",
-                            target_seq, rpc_blobs.len(),
+                            validated, rpc_blobs.len(),
                             hex::encode_upper(&rpc_header.account_hash[..8]),
                             hex::encode_upper(&rpc_header.parent_hash[..8]),
                         );
-                        Some((rpc_header, rpc_blobs))
+                        Some((rpc_header, rpc_blobs, Some(rpc_tx_root)))
                     } else {
                         None
                     }
@@ -2127,7 +2251,7 @@ pub async fn run_follower(
         if result.is_none() {
             // Fall through to retry section, then loop back
         }
-        if let Some((seq_header, peer_blobs)) = result {
+        if let Some((seq_header, peer_blobs, _tx_root)) = result {
             // Bootstrap prev_header from first full header
             if prev_header.is_none() {
                 info!(
@@ -2271,8 +2395,12 @@ pub async fn run_follower(
             let parent_owned = parent.clone();
             let parent_for_capture = parent.clone();
             let seq_header_owned = seq_header.clone();
+            let sync_complete_for_blocking = {
+                let ss = shared_state.read().await;
+                ss.sync_done
+            };
             let spawn_t0 = std::time::Instant::now();
-            let blocking_result = tokio::task::spawn_blocking(move || {
+            let blocking_result = tokio::task::spawn_blocking(move || -> Result<_, String> {
                 let lock_t0 = std::time::Instant::now();
                 let mut ls = ls_arc.lock().unwrap_or_else(|e| e.into_inner());
                 let lock_wait_ms = lock_t0.elapsed().as_millis();
@@ -2300,40 +2428,17 @@ pub async fn run_follower(
                         // neighborhoods (root <-> pages via IndexNext/IndexPrevious).
                         // This avoids sparse-prestate artifacts in replay_fixture where
                         // owner/book page chains are only partially present.
-                        let mut keys: std::collections::HashSet<[u8; 32]> =
+                        let mut keys: std::collections::BTreeSet<crate::ledger::Key> =
                             crate::ledger::forensic::collect_metadata_affected_keys(mh)
                                 .into_iter()
+                                .map(crate::ledger::Key)
                                 .collect();
-                        let mut queue: std::collections::VecDeque<[u8; 32]> =
-                            keys.iter().copied().collect();
-
-                        while let Some(k) = queue.pop_front() {
-                            let Some(raw) = ls.get_raw_owned(&crate::ledger::Key(k)) else { continue; };
-                            if raw.len() < 3 || raw[0] != 0x11 { continue; }
-                            let sle_type = u16::from_be_bytes([raw[1], raw[2]]);
-                            if sle_type != 0x0064 { continue; } // DirectoryNode only
-
-                            let Ok(dir) = crate::ledger::directory::DirectoryNode::decode(&raw, k) else { continue; };
-                            let root = dir.root_index;
-                            let mut maybe_add = |kk: [u8; 32]| {
-                                if keys.insert(kk) {
-                                    queue.push_back(kk);
-                                }
-                            };
-                            // Include root and neighboring pages for this directory page.
-                            maybe_add(root);
-                            if dir.index_next != 0 {
-                                maybe_add(crate::ledger::directory::page_key(&root, dir.index_next).0);
-                            }
-                            if dir.index_previous != 0 {
-                                maybe_add(crate::ledger::directory::page_key(&root, dir.index_previous).0);
-                            }
-                        }
+                        expand_directory_neighborhoods(&ls, &mut keys);
 
                         let mut map = std::collections::HashMap::with_capacity(keys.len());
                         for k in keys {
-                            if let Some(bytes) = ls.get_raw_owned(&crate::ledger::Key(k)) {
-                                map.insert(k, bytes);
+                            if let Some(bytes) = ls.get_raw_owned(&k) {
+                                map.insert(k.0, bytes);
                             }
                         }
                         Some(map)
@@ -2407,100 +2512,30 @@ pub async fn run_follower(
                     );
                 }
 
-                ls.set_defer_storage(false);
-
                 let hash_t0 = std::time::Instant::now();
-                let overlay_hash_diag = ls.overlay_state_hash_for_diagnostics();
-                let sparse_hash_diag = ls.sparse_state_hash_for_diagnostics();
-                let nudb_hash_diag = ls.nudb_root_hash();
-                let (raw_dirty_keys, raw_deleted_keys) = ls.raw_overlay_keys_for_diagnostics();
-                let (typed_dirty_keys, typed_deleted_keys) = ls.typed_overlay_keys_for_diagnostics();
-                let h = ls.state_hash();
-                let hash_ms = hash_t0.elapsed().as_millis();
-
-                // Compare the available hash sources for the exact same post-state.
-                let format_hash = |hash: &[u8; 32]| hex::encode_upper(&hash[..8]);
-                let format_opt = |hash: Option<[u8; 32]>| -> String {
-                    hash.map(|h| format_hash(&h)).unwrap_or_else(|| "NONE".to_string())
-                };
-                let raw_dirty: std::collections::BTreeSet<_> =
-                    raw_dirty_keys.iter().copied().collect();
-                let raw_deleted: std::collections::BTreeSet<_> =
-                    raw_deleted_keys.iter().copied().collect();
-                let typed_dirty_only: Vec<_> = typed_dirty_keys
-                    .iter()
-                    .copied()
-                    .filter(|k| !raw_dirty.contains(k))
-                    .collect();
-                let typed_deleted_only: Vec<_> = typed_deleted_keys
-                    .iter()
-                    .copied()
-                    .filter(|k| !raw_deleted.contains(k))
-                    .collect();
-                if h != seq_header_owned.account_hash
-                    || overlay_hash_diag != Some(h)
-                    || sparse_hash_diag != Some(h)
-                    || nudb_hash_diag != Some(h)
-                {
-                    tracing::warn!(
-                        "follower hash diagnostics seq={}: chosen={} network={} overlay={} sparse={} nudb={}",
-                        seq,
-                        format_hash(&h),
-                        format_hash(&seq_header_owned.account_hash),
-                        format_opt(overlay_hash_diag),
-                        format_opt(sparse_hash_diag),
-                        format_opt(nudb_hash_diag),
-                    );
-                    tracing::warn!(
-                        "follower overlay coverage seq={}: raw_dirty={} raw_deleted={} typed_dirty={} typed_deleted={} typed_only_dirty={} typed_only_deleted={}",
-                        seq,
-                        raw_dirty_keys.len(),
-                        raw_deleted_keys.len(),
-                        typed_dirty_keys.len(),
-                        typed_deleted_keys.len(),
-                        typed_dirty_only.len(),
-                        typed_deleted_only.len(),
-                    );
-                    for key in typed_dirty_only.iter().take(8) {
-                        tracing::warn!(
-                            "follower overlay coverage: typed-only dirty key seq={} key={}",
-                            seq,
-                            hex::encode_upper(&key.0),
-                        );
-                    }
-                    for key in typed_deleted_only.iter().take(8) {
-                        tracing::warn!(
-                            "follower overlay coverage: typed-only deleted key seq={} key={}",
-                            seq,
-                            hex::encode_upper(&key.0),
-                        );
+                let h = if sync_complete_for_blocking {
+                    match try_flush_follow_state(&mut ls) {
+                        Ok(hash) => {
+                            ls.set_defer_storage(false);
+                            hash
+                        }
+                        Err(e) => {
+                            ls.set_defer_storage(false);
+                            return Err(format!(
+                                "follower: failed to flush replayed state before hashing at seq={}: {}",
+                                seq, e
+                            ));
+                        }
                     }
                 } else {
-                    tracing::debug!(
-                        "follower hash diagnostics seq={}: all hash sources agree at {}",
-                        seq,
-                        format_hash(&h),
-                    );
-                }
+                    ls.set_defer_storage(false);
+                    rr.header.account_hash
+                };
+                let hash_ms = hash_t0.elapsed().as_millis();
 
                 rr.header.account_hash = h;
                 rr.header.hash = rr.header.compute_hash();
 
-                // One-key leaf hash probe: pick the first dirty_raw key,
-                // get the final raw SLE bytes, compute expected leaf hash,
-                // compare with what the sparse tree actually has.
-                let probe = {
-                    let first_key = ls.peek_first_dirty_raw();
-                    if let Some(key) = first_key {
-                        let raw = ls.get_raw_owned(&key);
-                        let sparse_lh = ls.sparse_map_ref()
-                            .and_then(|s| s.get_leaf_hash(&key.0));
-                        if let (Some(raw_bytes), Some(actual_lh)) = (raw, sparse_lh) {
-                            let expected_lh = crate::ledger::sparse_shamap::leaf_hash(&raw_bytes, &key.0);
-                            Some((key.0, raw_bytes.len(), expected_lh, actual_lh))
-                        } else { None }
-                    } else { None }
-                };
                 // Capture post-state bytes for forensic comparison using the
                 // union of engine-touched keys and metadata-affected keys.
                 // Metadata patching can update entries the engine never marked
@@ -2514,6 +2549,7 @@ pub async fn run_follower(
                                 .into_iter()
                                 .map(crate::ledger::Key),
                         );
+                        expand_directory_neighborhoods(&ls, &mut union);
                         let metadata_only =
                             union.len().saturating_sub(rr.touched_keys.len());
                         info!(
@@ -2527,45 +2563,6 @@ pub async fn run_follower(
                     } else {
                         rr.touched_keys.clone()
                     };
-                let overlay_scope: std::collections::BTreeSet<crate::ledger::Key> = raw_dirty_keys
-                    .iter()
-                    .chain(raw_deleted_keys.iter())
-                    .chain(typed_dirty_keys.iter())
-                    .chain(typed_deleted_keys.iter())
-                    .copied()
-                    .collect();
-                let forensic_scope: std::collections::BTreeSet<crate::ledger::Key> =
-                    forensic_keys.iter().copied().collect();
-                let overlay_only: Vec<crate::ledger::Key> = overlay_scope
-                    .difference(&forensic_scope)
-                    .copied()
-                    .collect();
-                let forensic_only: Vec<crate::ledger::Key> = forensic_scope
-                    .difference(&overlay_scope)
-                    .copied()
-                    .collect();
-                if !overlay_only.is_empty() || !forensic_only.is_empty() {
-                    warn!(
-                        "follower forensic scope delta seq={}: overlay_only={} forensic_only={}",
-                        seq_header_owned.sequence,
-                        overlay_only.len(),
-                        forensic_only.len(),
-                    );
-                    for key in overlay_only.iter().take(8) {
-                        warn!(
-                            "follower forensic scope delta: overlay-only key seq={} key={}",
-                            seq_header_owned.sequence,
-                            hex::encode_upper(key.0),
-                        );
-                    }
-                    for key in forensic_only.iter().take(8) {
-                        warn!(
-                            "follower forensic scope delta: forensic-only key seq={} key={}",
-                            seq_header_owned.sequence,
-                            hex::encode_upper(key.0),
-                        );
-                    }
-                }
                 let post_state: Vec<([u8; 32], Option<Vec<u8>>)> = forensic_keys
                     .iter()
                     .map(|k| (k.0, ls.get_raw_owned(k)))
@@ -2573,24 +2570,11 @@ pub async fn run_follower(
 
                 drop(ls);
 
-                if let Some((key, raw_len, expected, actual)) = probe {
-                    let status = if expected == actual { "OK" } else { "MISMATCH" };
-                    info!(
-                        "LEAF PROBE seq={}: key={} raw_len={} expected={} actual={} {}",
-                        seq_header_owned.sequence,
-                        hex::encode_upper(&key[..8]),
-                        raw_len,
-                        hex::encode_upper(&expected[..8]),
-                        hex::encode_upper(&actual[..8]),
-                        status,
-                    );
-                }
-
                 info!(
                     "follower replay breakdown seq={}: replay={}ms patches={}ms pruned_engine_only={} state_hash={}ms lock_wait={}ms",
                     seq_header_owned.sequence, replay_ms, patch_ms, pruned_engine_only, hash_ms, lock_wait_ms,
                 );
-                (
+                Ok((
                     rr,
                     patched,
                     pruned_engine_only,
@@ -2598,11 +2582,16 @@ pub async fn run_follower(
                     prestate_captured,
                     pristine_base_snapshot,
                     post_state,
-                )
+                ))
             }).await;
             let spawn_total_ms = spawn_t0.elapsed().as_millis();
             if spawn_total_ms > 50 {
-                let lock_wait = blocking_result.as_ref().ok().map(|r| r.3).unwrap_or(0);
+                let lock_wait = blocking_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|inner| inner.as_ref().ok())
+                    .map(|r| r.3)
+                    .unwrap_or(0);
                 warn!(
                     "follower spawn_blocking total={}ms (ledger_state lock_wait={}ms) seq={}",
                     spawn_total_ms, lock_wait, seq,
@@ -2619,7 +2608,7 @@ pub async fn run_follower(
                 pristine_base_snapshot,
                 post_state,
             ) = match blocking_result {
-                Ok((rr, p, pruned, _lock_wait, prestate, pristine_base, post)) => (
+                Ok(Ok((rr, p, pruned, _lock_wait, prestate, pristine_base, post))) => (
                     rr,
                     p.applied,
                     pruned,
@@ -2630,11 +2619,18 @@ pub async fn run_follower(
                     pristine_base,
                     post,
                 ),
+                Ok(Err(e)) => {
+                    error!("{e}");
+                    request_resync_and_stop_follower(&follower_state);
+                    return;
+                }
                 Err(e) => {
                     error!("follower spawn_blocking panicked: {}", e);
                     continue;
                 }
             };
+            let mut authoritative_repair_keys =
+                std::collections::BTreeSet::<crate::ledger::Key>::new();
             if !created_miss_keys.is_empty() {
                 let survivor_keys: Vec<crate::ledger::Key> = {
                     let ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2669,18 +2665,30 @@ pub async fn run_follower(
                             hex::encode_upper(key.0),
                         );
                     }
-                    follower_state.running.store(false, Ordering::SeqCst);
+                    request_resync_and_stop_follower(&follower_state);
                     return;
                 }
                 if !survivor_replacements.is_empty() {
                     let mut ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
                     for (key, raw) in &survivor_replacements {
+                        authoritative_repair_keys.insert(*key);
                         ls.insert_raw(*key, raw.clone());
                         if let Some(sle) = crate::ledger::sle::SLE::from_raw(*key, raw.clone()) {
                             sync_typed(&mut ls, sle.entry_type() as u16, key, raw);
                         }
                     }
-                    replay_result.header.account_hash = ls.state_hash();
+                    replay_result.header.account_hash = match try_flush_follow_state(&mut ls) {
+                        Ok(hash) => hash,
+                        Err(e) => {
+                            drop(ls);
+                            error!(
+                                "follower: failed to flush authoritative created-override repair at seq={}: {}",
+                                seq, e
+                            );
+                            request_resync_and_stop_follower(&follower_state);
+                            return;
+                        }
+                    };
                     replay_result.header.hash = replay_result.header.compute_hash();
                     info!(
                         "follower: replaced {} surviving created-override misses with authoritative bytes at seq={}",
@@ -2716,18 +2724,30 @@ pub async fn run_follower(
                             hex::encode_upper(key.0),
                         );
                     }
-                    follower_state.running.store(false, Ordering::SeqCst);
+                    request_resync_and_stop_follower(&follower_state);
                     return;
                 }
                 if !book_dir_replacements.is_empty() {
                     let mut ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
                     for (key, raw) in &book_dir_replacements {
+                        authoritative_repair_keys.insert(*key);
                         ls.insert_raw(*key, raw.clone());
                         if let Some(sle) = crate::ledger::sle::SLE::from_raw(*key, raw.clone()) {
                             sync_typed(&mut ls, sle.entry_type() as u16, key, raw);
                         }
                     }
-                    replay_result.header.account_hash = ls.state_hash();
+                    replay_result.header.account_hash = match try_flush_follow_state(&mut ls) {
+                        Ok(hash) => hash,
+                        Err(e) => {
+                            drop(ls);
+                            error!(
+                                "follower: failed to flush authoritative DirectoryNode repair at seq={}: {}",
+                                seq, e
+                            );
+                            request_resync_and_stop_follower(&follower_state);
+                            return;
+                        }
+                    };
                     replay_result.header.hash = replay_result.header.compute_hash();
                     info!(
                         "follower: replaced {} incomplete book DirectoryNode(s) with authoritative bytes at seq={}",
@@ -2748,7 +2768,7 @@ pub async fn run_follower(
                     "follower halting at seq={} because {} ModifiedNode base objects were missing",
                     seq, missing_modified,
                 );
-                follower_state.running.store(false, Ordering::SeqCst);
+                request_resync_and_stop_follower(&follower_state);
                 return;
             }
 
@@ -2772,8 +2792,81 @@ pub async fn run_follower(
                 // Meta reconcile disabled — state_hash() snapshot causes OOM
             }
 
+            let mut matched =
+                sync_complete && replay_result.header.account_hash == seq_account_hash;
+            let mut repaired_from_pristine_authoritative = false;
+
+            // Hash diff diagnostic: log both hashes for every built ledger
+            if sync_complete && !matched {
+                warn!(
+                    "HASH DIFF seq={}: local={} network={} parent_used={}",
+                    seq,
+                    hex::encode_upper(&replay_result.header.account_hash[..16]),
+                    hex::encode_upper(&seq_account_hash[..16]),
+                    hex::encode_upper(&replay_result.header.parent_hash[..8]),
+                );
+
+                let repair_scope: Vec<crate::ledger::Key> = {
+                    let mut keys = std::collections::BTreeSet::new();
+                    keys.extend(post_state.iter().map(|(key, _)| crate::ledger::Key(*key)));
+                    keys.extend(authoritative_repair_keys.iter().copied());
+                    let ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                    expand_directory_neighborhoods(&ls, &mut keys);
+                    keys.into_iter().collect()
+                };
+
+                if !repair_scope.is_empty() {
+                    let (upserted, removed, missing) = reconcile_touched_keys_with_rpc(
+                        ledger_state.clone(),
+                        &repair_scope,
+                        seq,
+                        &rpc_host,
+                        rpc_port,
+                    )
+                    .await;
+                    let repaired_hash = {
+                        let mut ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                        match try_flush_follow_state(&mut ls) {
+                            Ok(hash) => hash,
+                            Err(e) => {
+                                drop(ls);
+                                error!(
+                                    "follower: failed to flush authoritative mismatch repair at seq={}: {}",
+                                    seq, e
+                                );
+                                request_resync_and_stop_follower(&follower_state);
+                                return;
+                            }
+                        }
+                    };
+                    if repaired_hash == seq_account_hash {
+                        replay_result.header.account_hash = repaired_hash;
+                        replay_result.header.hash = replay_result.header.compute_hash();
+                        matched = true;
+                        info!(
+                            "follower: authoritative RPC repair resolved mismatch at seq={} scope_keys={} upserted={} removed={} missing={}",
+                            seq,
+                            repair_scope.len(),
+                            upserted,
+                            removed,
+                            missing,
+                        );
+                    } else {
+                        warn!(
+                            "follower: authoritative RPC repair did not resolve mismatch at seq={} repaired={} network={} scope_keys={} upserted={} removed={} missing={}",
+                            seq,
+                            hex::encode_upper(&repaired_hash[..16]),
+                            hex::encode_upper(&seq_account_hash[..16]),
+                            repair_scope.len(),
+                            upserted,
+                            removed,
+                            missing,
+                        );
+                    }
+                }
+            }
+
             let elapsed = tx_start.elapsed();
-            let matched = sync_complete && replay_result.header.account_hash == seq_account_hash;
             if matched {
                 tx_engine_successes += 1;
             }
@@ -2816,16 +2909,19 @@ pub async fn run_follower(
                 );
             }
 
-            // Hash diff diagnostic: log both hashes for every built ledger
-            if sync_complete && !matched {
-                warn!(
-                    "HASH DIFF seq={}: local={} network={} parent_used={}",
-                    seq,
-                    hex::encode_upper(&replay_result.header.account_hash[..16]),
-                    hex::encode_upper(&seq_account_hash[..16]),
-                    hex::encode_upper(&replay_result.header.parent_hash[..8]),
-                );
+            let first_post_sync_mismatch =
+                sync_complete && !matched && first_post_sync_seq == Some(seq);
+            if first_post_sync_mismatch {
+                // Stop the follower before long forensic capture so the close-loop
+                // supervisor can see the degraded state immediately and avoid a
+                // false-good force-accept window.
+                follower_state
+                    .hash_mismatches
+                    .fetch_add(1, Ordering::Relaxed);
+                stop_follower(&follower_state);
+            }
 
+            if sync_complete && !matched {
                 // Forensic capture: when this is the first ledger after the
                 // sync anchor (byte_diff_capture was true), dump everything
                 // required for offline `replay_fixture` iteration before
@@ -2860,7 +2956,7 @@ pub async fn run_follower(
                             info!("forensic: bundle written to {:?}", path);
                             // Inline comparison: post-state vs rippled reference
                             if !rippled_ref.is_empty() {
-                                let mut matched = 0usize;
+                                let mut matched_count = 0usize;
                                 let mut divergent = 0usize;
                                 let mut local_missing = 0usize;
                                 let mut not_in_ref = 0usize;
@@ -2875,7 +2971,7 @@ pub async fn run_follower(
                                             .push((crate::ledger::Key(*key), ref_bytes.clone()));
                                         match local_bytes {
                                             Some(local) if local == ref_bytes => {
-                                                matched += 1;
+                                                matched_count += 1;
                                             }
                                             Some(local) => {
                                                 divergent += 1;
@@ -2986,7 +3082,7 @@ pub async fn run_follower(
                                 }
                                 info!(
                                     "FORENSIC COMPARISON: matched={} divergent={} local_missing={} not_in_ref={} (present={} deleted={}) total={}",
-                                    matched, divergent, local_missing, not_in_ref, not_in_ref_present, not_in_ref_deleted, post_state.len(),
+                                    matched_count, divergent, local_missing, not_in_ref, not_in_ref_present, not_in_ref_deleted, post_state.len(),
                                 );
                                 let local_upserts: Vec<(crate::ledger::Key, Vec<u8>)> = post_state
                                     .iter()
@@ -3033,10 +3129,10 @@ pub async fn run_follower(
                                             &local_deletes,
                                         )
                                     };
+                                    let mut authoritative_base = pristine_base.snapshot();
                                     let pristine_authoritative_hash = {
-                                        let mut auth_base = pristine_base.snapshot();
                                         crate::ledger::LedgerState::overlay_hash_from_snapshot_for_diagnostics(
-                                            &mut auth_base,
+                                            &mut authoritative_base,
                                             &authoritative_upserts,
                                             &authoritative_deletes,
                                         )
@@ -3053,6 +3149,95 @@ pub async fn run_follower(
                                         authoritative_upserts.len(),
                                         authoritative_deletes.len(),
                                     );
+                                    if !matched && pristine_authoritative_hash == seq_account_hash {
+                                        let repair_loaded = if let Some(anchor_root) = sync_account_hash {
+                                            let mut ls = ledger_state
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            match ls.load_nudb_root(anchor_root) {
+                                                Ok(true) => {
+                                                    ls.reset_overlay_after_root_rehydrate();
+                                                    for key in &authoritative_deletes {
+                                                        if let Some(raw) = ls.get_raw_owned(key) {
+                                                            if raw.len() >= 3 && raw[0] == 0x11 {
+                                                                let entry_type =
+                                                                    u16::from_be_bytes([raw[1], raw[2]]);
+                                                                remove_typed(&mut ls, entry_type, key);
+                                                            } else {
+                                                                ls.remove_raw(key);
+                                                            }
+                                                        } else {
+                                                            ls.remove_raw(key);
+                                                        }
+                                                    }
+                                                    for (key, raw) in &authoritative_upserts {
+                                                        ls.insert_raw(*key, raw.clone());
+                                                        if raw.len() >= 3 && raw[0] == 0x11 {
+                                                            let entry_type =
+                                                                u16::from_be_bytes([raw[1], raw[2]]);
+                                                            sync_typed(&mut ls, entry_type, key, raw);
+                                                        }
+                                                    }
+                                                    match try_flush_follow_state(&mut ls) {
+                                                        Ok(repaired_hash) => {
+                                                            if repaired_hash == seq_account_hash {
+                                                                true
+                                                            } else {
+                                                                error!(
+                                                                    "follower: pristine authoritative rebuild landed wrong root at seq={} repaired={} network={}",
+                                                                    seq,
+                                                                    hex::encode_upper(&repaired_hash[..16]),
+                                                                    hex::encode_upper(&seq_account_hash[..16]),
+                                                                );
+                                                                false
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!(
+                                                                "follower: pristine authoritative rebuild flush failed at seq={}: {}",
+                                                                seq,
+                                                                e,
+                                                            );
+                                                            false
+                                                        }
+                                                    }
+                                                }
+                                                Ok(false) => {
+                                                    error!(
+                                                        "follower: sync anchor root {} could not be reloaded for pristine authoritative rebuild at seq={}",
+                                                        hex::encode_upper(&anchor_root[..16]),
+                                                        seq,
+                                                    );
+                                                    false
+                                                }
+                                                Err(e) => {
+                                                    error!(
+                                                        "follower: sync anchor root {} failed to reload for pristine authoritative rebuild at seq={}: {}",
+                                                        hex::encode_upper(&anchor_root[..16]),
+                                                        seq,
+                                                        e,
+                                                    );
+                                                    false
+                                                }
+                                            }
+                                        } else {
+                                            error!(
+                                                "follower: no sync anchor account_hash available for pristine authoritative rebuild at seq={}",
+                                                seq,
+                                            );
+                                            false
+                                        };
+                                        if repair_loaded {
+                                            replay_result.header = seq_header.clone();
+                                            repaired_from_pristine_authoritative = true;
+                                            follower_state.running.store(true, Ordering::SeqCst);
+                                            info!(
+                                                "follower: pristine authoritative rebuild restored seq={} to network root {}",
+                                                seq,
+                                                hex::encode_upper(&pristine_authoritative_hash[..16]),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3060,31 +3245,43 @@ pub async fn run_follower(
                     }
                 }
 
-                follower_state
-                    .hash_mismatches
-                    .fetch_add(1, Ordering::Relaxed);
-                let successful_since_sync = follower_state.hash_matches.load(Ordering::Relaxed);
-                if successful_since_sync == 0 {
-                    // First ledger after fresh sync — base state was correct,
-                    // so this is an engine bug. Resync won't help.
-                    error!(
-                        "follower: hash mismatch at seq={} on FIRST post-sync ledger — engine bug, halting (resync would loop)",
+                if repaired_from_pristine_authoritative {
+                    matched = true;
+                    info!(
+                        "follower: continuing after pristine authoritative recovery at seq={}",
                         seq,
                     );
-                    follower_state.running.store(false, Ordering::SeqCst);
-                    return;
                 } else {
-                    // Had N successful ledgers before this mismatch — state may have drifted.
-                    // Re-sync to get back to correct state.
-                    error!(
-                        "follower: hash mismatch at seq={} after {} successful ledgers — requesting state re-sync",
-                        seq, successful_since_sync,
-                    );
-                    follower_state
-                        .resync_requested
-                        .store(true, Ordering::SeqCst);
-                    follower_state.running.store(false, Ordering::SeqCst);
-                    return;
+                    if !first_post_sync_mismatch {
+                        follower_state
+                            .hash_mismatches
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    let successful_since_sync = follower_state.hash_matches.load(Ordering::Relaxed);
+                    if successful_since_sync == 0 {
+                        // First ledger after fresh sync — base state was correct,
+                        // so this is an engine bug. Resync won't help.
+                        error!(
+                            "follower: hash mismatch at seq={} on FIRST post-sync ledger — engine bug, halting (resync would loop)",
+                            seq,
+                        );
+                        if !first_post_sync_mismatch {
+                            stop_follower(&follower_state);
+                        }
+                        return;
+                    } else {
+                        // Had N successful ledgers before this mismatch — state may have drifted.
+                        // Re-sync to get back to correct state.
+                        error!(
+                            "follower: hash mismatch at seq={} after {} successful ledgers — requesting state re-sync",
+                            seq, successful_since_sync,
+                        );
+                        follower_state
+                            .resync_requested
+                            .store(true, Ordering::SeqCst);
+                        stop_follower(&follower_state);
+                        return;
+                    }
                 }
             }
 
@@ -3116,6 +3313,7 @@ pub async fn run_follower(
                 pif.fetch_add(1, Ordering::Relaxed);
                 let ls_arc2 = ledger_state.clone();
                 let store2 = storage.clone();
+                let follower_state_for_persist = follower_state.clone();
                 let header2 = replay_result.header.clone();
                 let records2 = replay_result.tx_records.clone();
                 let is_first_post_sync = first_post_sync_seq == Some(header2.sequence);
@@ -3127,7 +3325,15 @@ pub async fn run_follower(
                     // take_dirty (under lock) — NuDB handles persistence
                     {
                         let mut ls = ls_arc2.lock().unwrap_or_else(|e| e.into_inner());
-                        let _dirty = ls.take_dirty();
+                        if let Err(e) = ls.try_take_dirty() {
+                            error!(
+                                "follower persist seq={} failed to flush NuDB state: {}",
+                                seq, e
+                            );
+                            request_resync_and_stop_follower(&follower_state_for_persist);
+                            pif.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
                     }
 
                     let ledger_t0 = std::time::Instant::now();
@@ -3233,8 +3439,24 @@ pub async fn run_follower(
                     let mut state = shared_state.write().await;
                     if *needs_tx {
                         let cookie = crate::sync::next_cookie();
-                        let req =
-                            crate::network::relay::encode_get_ledger_txs_for_hash(hash, cookie);
+                        let missing_tx_nodes = {
+                            let guard = inbound_ledgers.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.missing_tx_node_ids(hash, 64)
+                        };
+                        let use_root_tx_request = missing_tx_nodes.is_empty()
+                            || missing_tx_nodes
+                                == vec![crate::ledger::shamap_id::SHAMapNodeID::root()
+                                    .to_wire()
+                                    .to_vec()];
+                        let req = if use_root_tx_request {
+                            crate::network::relay::encode_get_ledger_txs_for_hash(hash, cookie)
+                        } else {
+                            crate::network::relay::encode_get_ledger_txs_for_hash_nodes(
+                                hash,
+                                &missing_tx_nodes,
+                                cookie,
+                            )
+                        };
                         state.send_to_peers_with_ledger(&req, *seq, 3);
                     }
                     if *needs_header {
@@ -5032,5 +5254,63 @@ mod tests {
             Some([0x99; 32]),
         );
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn request_resync_and_stop_sets_both_flags() {
+        let follower = FollowerState::new();
+        follower.running.store(true, Ordering::SeqCst);
+        request_resync_and_stop_follower(&follower);
+        assert!(!follower.running.load(Ordering::SeqCst));
+        assert!(follower.resync_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn authoritative_delete_removes_supported_raw_even_without_typed_cache() {
+        let mut state = crate::ledger::LedgerState::new();
+        let account = crate::ledger::account::AccountRoot {
+            account_id: [0x41; 20],
+            balance: 10,
+            sequence: 1,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let key = crate::ledger::account::shamap_key(&account.account_id);
+        state.insert_raw(key, account.to_sle_binary());
+        assert!(state.get_raw_owned(&key).is_some());
+
+        remove_typed(&mut state, 0x0061, &key);
+
+        assert!(state.get_raw_owned(&key).is_none());
+    }
+
+    #[test]
+    fn authoritative_delete_falls_back_to_raw_for_untyped_entries() {
+        let mut state = crate::ledger::LedgerState::new();
+        let ticket = crate::ledger::ticket::Ticket {
+            account: [0x54; 20],
+            sequence: 99,
+            owner_node: 0,
+            previous_txn_id: [0; 32],
+            previous_txn_lgrseq: 0,
+            raw_sle: None,
+        };
+        let key = ticket.key();
+        state.insert_raw(key, ticket.to_sle_binary());
+        assert!(state.get_raw_owned(&key).is_some());
+
+        remove_typed(&mut state, 0x0054, &key);
+
+        assert!(state.get_raw_owned(&key).is_none());
     }
 }

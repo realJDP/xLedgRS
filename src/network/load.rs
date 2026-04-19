@@ -53,9 +53,8 @@ impl JobQueueSnapshot {
             fee = fee.saturating_add(queue_pressure / 2);
         }
         fee = fee.saturating_add((self.tracked_transactions.min(32) as u32) * (load_base / 32));
-        fee = fee.saturating_add(
-            (self.tracked_inbound_transactions.min(32) as u32) * (load_base / 64),
-        );
+        fee = fee
+            .saturating_add((self.tracked_inbound_transactions.min(32) as u32) * (load_base / 64));
         fee = fee.saturating_add((self.active_path_requests.min(8) as u32) * (load_base / 8));
         fee = fee.saturating_add((self.active_inbound_ledgers.min(8) as u32) * (load_base / 4));
         fee.max(load_base)
@@ -435,8 +434,10 @@ impl LoadManager {
             let balance_pressure = ((resource_balance / 1_000).clamp(0, 8)) as u32;
             fee = fee.saturating_add(balance_pressure * (self.snapshot.load_base / 8));
         }
-        fee = fee.saturating_add((resource_disconnects.min(8) as u32) * (self.snapshot.load_base / 8));
-        fee = fee.saturating_add((resource_warnings.min(16) as u32) * (self.snapshot.load_base / 32));
+        fee = fee
+            .saturating_add((resource_disconnects.min(8) as u32) * (self.snapshot.load_base / 8));
+        fee =
+            fee.saturating_add((resource_warnings.min(16) as u32) * (self.snapshot.load_base / 32));
         self.set_remote_fee(fee);
     }
 
@@ -601,9 +602,7 @@ mod tests {
     #[test]
     fn network_and_cluster_health_raise_remote_components() {
         let mut manager = LoadManager::default();
-        manager.refresh_network_health(
-            0, 5, 4, 1, 1, 1, 1, 2, 2, 2, 3, 2, 2500, 3500, 6000, 2, 4,
-        );
+        manager.refresh_network_health(0, 5, 4, 1, 1, 1, 1, 2, 2, 2, 3, 2, 2500, 3500, 6000, 2, 4);
         manager.refresh_cluster_health(3, 1, None);
         let snapshot = manager.snapshot();
         assert!(snapshot.remote_fee > LOAD_BASE);
@@ -707,15 +706,12 @@ mod tests {
     #[test]
     fn concentrated_sources_raise_remote_fee_more_than_diverse_sources() {
         let mut concentrated = LoadManager::default();
-        concentrated.refresh_network_health(
-            2, 6, 4, 0, 2, 1, 0, 1, 0, 1, 0, 0, 1_000, 0, 1_000, 0, 0,
-        );
+        concentrated
+            .refresh_network_health(2, 6, 4, 0, 2, 1, 0, 1, 0, 1, 0, 0, 1_000, 0, 1_000, 0, 0);
         let concentrated_fee = concentrated.snapshot().remote_fee;
 
         let mut diverse = LoadManager::default();
-        diverse.refresh_network_health(
-            2, 6, 4, 0, 2, 1, 0, 1, 0, 6, 0, 0, 1_000, 0, 1_000, 0, 0,
-        );
+        diverse.refresh_network_health(2, 6, 4, 0, 2, 1, 0, 1, 0, 6, 0, 0, 1_000, 0, 1_000, 0, 0);
         let diverse_fee = diverse.snapshot().remote_fee;
 
         assert!(concentrated_fee > diverse_fee);

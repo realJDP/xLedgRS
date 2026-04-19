@@ -62,6 +62,9 @@ pub(crate) fn stamp_touched_previous_fields(
         let Some(mut sle) = crate::ledger::sle::SLE::from_raw(*key, raw) else {
             continue;
         };
+        if !crate::ledger::should_thread_previous_txn_fields(state, sle.entry_type()) {
+            continue;
+        }
         sle.set_previous_txn_id(tx_id);
         sle.set_previous_txn_lgr_seq(ledger_seq);
         let updated_raw = sle.into_data();
@@ -974,6 +977,16 @@ pub fn replay_ledger(
     let txhash_ms = txhash_t0.elapsed().as_millis();
 
     update_skip_lists(state, prev.sequence, &prev.hash);
+    let short_skip_key = crate::ledger::keylet::skip().key;
+    if touched_seen.insert(short_skip_key) {
+        touched_keys.push(short_skip_key);
+    }
+    if (prev.sequence & 0xFF) == 0 && prev.sequence > 0 {
+        let long_skip_key = crate::ledger::keylet::skip_for_ledger(prev.sequence).key;
+        if touched_seen.insert(long_skip_key) {
+            touched_keys.push(long_skip_key);
+        }
+    }
 
     // Compute the new account-state root hash
     let acchash_t0 = std::time::Instant::now();
@@ -1053,19 +1066,11 @@ pub fn extract_tx_blobs_from_tx_tree(
             continue;
         }
 
-        // Detect inner nodes: 512/513 bytes or MIN\0 prefix
-        let is_inner = (data.len() == 512 || data.len() == 513)
-            || (data.len() >= 516
-                && data[0] == 0x4D
-                && data[1] == 0x49
-                && data[2] == 0x4E
-                && data[3] == 0x00);
-        if is_inner {
+        let wire_type = data[data.len() - 1];
+        if wire_type == 0x02 || wire_type == 0x03 {
             continue;
         }
 
-        // Check wire type — last byte
-        let wire_type = data[data.len() - 1];
         if wire_type != 0x04 {
             continue;
         } // only wireTypeTransactionWithMeta
@@ -1103,6 +1108,37 @@ pub fn extract_tx_blobs_from_tx_tree(
     }
 
     results
+}
+
+#[cfg(test)]
+mod tx_tree_extract_tests {
+    use super::extract_tx_blobs_from_tx_tree;
+
+    #[test]
+    fn extracts_transaction_leaf_even_when_node_is_513_bytes() {
+        let tx_blob = vec![0xAA; 192];
+        let meta_blob = vec![0xBB; 285];
+        let tx_id = [0xCC; 32];
+
+        let mut nodedata = Vec::new();
+        crate::transaction::serialize::encode_length(tx_blob.len(), &mut nodedata);
+        nodedata.extend_from_slice(&tx_blob);
+        crate::transaction::serialize::encode_length(meta_blob.len(), &mut nodedata);
+        nodedata.extend_from_slice(&meta_blob);
+        nodedata.extend_from_slice(&tx_id);
+        nodedata.push(0x04);
+
+        assert_eq!(nodedata.len(), 513);
+
+        let nodes = vec![crate::proto::TmLedgerNode {
+            nodedata,
+            nodeid: Some(vec![0u8; 33]),
+        }];
+        let blobs = extract_tx_blobs_from_tx_tree(&nodes);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].0.len(), tx_blob.len());
+        assert_eq!(blobs[0].1.len(), meta_blob.len());
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

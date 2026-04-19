@@ -343,16 +343,29 @@ impl Node {
             })
             .collect();
 
-        if recent.is_empty() {
-            return self.select_sync_peers(state, seq, count);
-        }
-
         recent.sort_by(|a, b| {
             a.1.cmp(&b.1)
                 .then_with(|| b.2.cmp(&a.2))
                 .then_with(|| a.3.cmp(&b.3))
         });
-        recent.truncate(count.min(recent.len()));
-        recent.into_iter().map(|(pid, _, _, _)| pid).collect()
+        let mut selected: Vec<PeerId> = recent
+            .into_iter()
+            .take(count)
+            .map(|(pid, _, _, _)| pid)
+            .collect();
+
+        if selected.len() < count {
+            for pid in self.select_sync_peers(state, seq, count) {
+                if selected.contains(&pid) {
+                    continue;
+                }
+                selected.push(pid);
+                if selected.len() >= count {
+                    break;
+                }
+            }
+        }
+
+        selected
     }
 }

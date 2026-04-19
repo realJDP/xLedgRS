@@ -159,7 +159,8 @@ impl PublisherState {
         }
 
         if let Some(current_sequence) = self.current.as_ref().map(|list| list.sequence) {
-            self.remaining.retain(|sequence, _| *sequence > current_sequence);
+            self.remaining
+                .retain(|sequence, _| *sequence > current_sequence);
         }
     }
 }
@@ -195,16 +196,24 @@ impl ValidatorListManager {
         let mut stale = false;
 
         {
-            let state = self.publisher_lists.entry(publisher_key.clone()).or_default();
+            let state = self
+                .publisher_lists
+                .entry(publisher_key.clone())
+                .or_default();
             if state.has_sequence(sequence) {
                 same_sequence = true;
-            } else if state.max_sequence().is_some_and(|current| current > sequence) {
+            } else if state
+                .max_sequence()
+                .is_some_and(|current| current > sequence)
+            {
                 stale = true;
             } else if list.effective.is_some_and(|effective| effective > now) {
                 state.remaining.insert(sequence, list);
             } else {
                 state.current = Some(list);
-                state.remaining.retain(|future_sequence, _| *future_sequence > sequence);
+                state
+                    .remaining
+                    .retain(|future_sequence, _| *future_sequence > sequence);
             }
         }
 
@@ -241,7 +250,10 @@ impl ValidatorListManager {
                     publisher_key: publisher_key.clone(),
                     current: view.current.as_ref().map(snapshot_entry),
                     remaining: view.remaining.values().map(snapshot_entry).collect(),
-                    available: view.current.as_ref().is_some_and(|list| list.is_active_at(now)),
+                    available: view
+                        .current
+                        .as_ref()
+                        .is_some_and(|list| list.is_active_at(now)),
                 }
             })
             .collect();
@@ -314,7 +326,9 @@ impl ValidatorListManager {
                 .filter(|state| {
                     let mut view = (*state).clone();
                     view.normalize(now);
-                    view.current.as_ref().is_some_and(|list| list.is_active_at(now))
+                    view.current
+                        .as_ref()
+                        .is_some_and(|list| list.is_active_at(now))
                 })
                 .count(),
         }
@@ -323,7 +337,8 @@ impl ValidatorListManager {
     pub fn manifest_for_public_key(&self, public_key: &str) -> Option<CachedManifestInfo> {
         let requested = public_key.to_ascii_uppercase();
         self.publisher_lists.values().find_map(|state| {
-            state.current
+            state
+                .current
                 .iter()
                 .chain(state.remaining.values())
                 .find_map(|list| {
@@ -393,6 +408,13 @@ fn parse_time_field(value: Option<&serde_json::Value>, field: &str) -> anyhow::R
     Err(anyhow::anyhow!("invalid '{}' timestamp", field))
 }
 
+fn parse_xrpl_time_field(
+    value: Option<&serde_json::Value>,
+    field: &str,
+) -> anyhow::Result<Option<u64>> {
+    Ok(parse_time_field(value, field)?.map(|ts| ts.saturating_add(XRPL_EPOCH_OFFSET)))
+}
+
 fn parse_refresh_interval_secs(value: Option<&serde_json::Value>) -> anyhow::Result<Option<u64>> {
     let Some(value) = value else {
         return Ok(None);
@@ -415,11 +437,11 @@ fn parse_refresh_interval_secs(value: Option<&serde_json::Value>) -> anyhow::Res
 }
 
 fn parse_expiration_field(blob_json: &serde_json::Value) -> anyhow::Result<Option<u64>> {
-    if let Some(expiration) = parse_time_field(blob_json.get("expiration"), "expiration")? {
+    if let Some(expiration) = parse_xrpl_time_field(blob_json.get("expiration"), "expiration")? {
         return Ok(Some(expiration));
     }
-    if let Some(valid_until) = parse_time_field(blob_json.get("validUntil"), "validUntil")? {
-        return Ok(Some(valid_until.saturating_add(XRPL_EPOCH_OFFSET)));
+    if let Some(valid_until) = parse_xrpl_time_field(blob_json.get("validUntil"), "validUntil")? {
+        return Ok(Some(valid_until));
     }
     Ok(None)
 }
@@ -455,29 +477,16 @@ async fn fetch_url(url: &str) -> anyhow::Result<String> {
         _ => return Err(anyhow::anyhow!("unsupported scheme: {}", scheme)),
     };
 
-    // Extract the response body after HTTP headers.
-    let body_start = response
-        .find("\r\n\r\n")
-        .ok_or_else(|| anyhow::anyhow!("no HTTP body separator"))?;
-    let body = &response[body_start + 4..];
-
-    // Handle chunked transfer encoding.
-    if response.contains("Transfer-Encoding: chunked") {
-        Ok(decode_chunked(body))
-    } else {
-        Ok(body.to_string())
-    }
+    extract_http_body(&response)
 }
 
-async fn fetch_http(host: &str, port: u16, request: &str) -> anyhow::Result<String> {
+async fn fetch_http(host: &str, port: u16, request: &str) -> anyhow::Result<Vec<u8>> {
     let mut stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
     stream.write_all(request.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    Ok(String::from_utf8_lossy(&buf).to_string())
+    read_http_response(&mut stream).await
 }
 
-async fn fetch_https(host: &str, port: u16, request: &str) -> anyhow::Result<String> {
+async fn fetch_https(host: &str, port: u16, request: &str) -> anyhow::Result<Vec<u8>> {
     use rustls::ClientConfig;
     use rustls_pki_types::ServerName;
     use std::sync::Arc as StdArc;
@@ -498,12 +507,145 @@ async fn fetch_https(host: &str, port: u16, request: &str) -> anyhow::Result<Str
 
     tls.write_all(request.as_bytes()).await?;
     tls.flush().await?;
-    // Signal end of writing so the server can finish the request.
-    tls.shutdown().await.ok();
 
+    read_http_response(&mut tls).await
+}
+
+async fn read_http_response<R>(reader: &mut R) -> anyhow::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buf = Vec::new();
-    tls.read_to_end(&mut buf).await?;
-    Ok(String::from_utf8_lossy(&buf).to_string())
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => {
+                if is_complete_http_response(&buf) {
+                    return Ok(buf);
+                }
+                return Err(anyhow::anyhow!(
+                    "unexpected EOF before complete HTTP response"
+                ));
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if is_complete_http_response(&buf) {
+                    return Ok(buf);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                if is_complete_http_response(&buf) {
+                    return Ok(buf);
+                }
+                return Err(err.into());
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn extract_http_body(response: &[u8]) -> anyhow::Result<String> {
+    let header_end =
+        header_end_offset(response).ok_or_else(|| anyhow::anyhow!("no HTTP body separator"))?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| anyhow::anyhow!("HTTP headers are not valid UTF-8"))?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP status line"))?;
+    if !(200..300).contains(&status) {
+        return Err(anyhow::anyhow!("HTTP status {}", status));
+    }
+
+    let body = &response[header_end..];
+    if is_chunked_headers(headers) {
+        Ok(decode_chunked(&String::from_utf8_lossy(body)))
+    } else if let Some(content_length) = content_length(headers) {
+        if body.len() < content_length {
+            return Err(anyhow::anyhow!(
+                "HTTP body shorter than Content-Length ({}/{})",
+                body.len(),
+                content_length
+            ));
+        }
+        Ok(String::from_utf8_lossy(&body[..content_length]).to_string())
+    } else {
+        Ok(String::from_utf8_lossy(body).to_string())
+    }
+}
+
+fn is_complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = header_end_offset(response) else {
+        return false;
+    };
+    let Ok(headers) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let body = &response[header_end..];
+    if is_chunked_headers(headers) {
+        return is_complete_chunked_body(body);
+    }
+    if let Some(content_length) = content_length(headers) {
+        return body.len() >= content_length;
+    }
+    false
+}
+
+fn header_end_offset(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("content-length") {
+            return None;
+        }
+        value.trim().parse::<usize>().ok()
+    })
+}
+
+fn is_chunked_headers(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
+fn is_complete_chunked_body(mut body: &[u8]) -> bool {
+    loop {
+        let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") else {
+            return false;
+        };
+        let Ok(size_line) = std::str::from_utf8(&body[..line_end]) else {
+            return false;
+        };
+        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+            return false;
+        };
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return body.starts_with(b"\r\n");
+        }
+        if body.len() < size + 2 {
+            return false;
+        }
+        if &body[size..size + 2] != b"\r\n" {
+            return false;
+        }
+        body = &body[size + 2..];
+    }
 }
 
 fn decode_chunked(data: &str) -> String {
@@ -616,7 +758,7 @@ pub fn parse_and_verify(
     // Parse the blob JSON to extract validators.
     let blob_json: serde_json::Value = serde_json::from_slice(&blob_bytes)?;
     let sequence = blob_json["sequence"].as_u64().unwrap_or(0);
-    let effective = match parse_time_field(blob_json.get("effective"), "effective")? {
+    let effective = match parse_xrpl_time_field(blob_json.get("effective"), "effective")? {
         Some(ts) => Some(ts),
         None => parse_time_field(blob_json.get("effective_time"), "effective_time")?,
     };
@@ -723,7 +865,7 @@ pub fn verify_peer_validator_list(
     // Parse the blob JSON.
     let blob_json: serde_json::Value = serde_json::from_slice(&blob_bytes)?;
     let sequence = blob_json["sequence"].as_u64().unwrap_or(0);
-    let effective = match parse_time_field(blob_json.get("effective"), "effective")? {
+    let effective = match parse_xrpl_time_field(blob_json.get("effective"), "effective")? {
         Some(ts) => Some(ts),
         None => parse_time_field(blob_json.get("effective_time"), "effective_time")?,
     };
@@ -865,7 +1007,11 @@ pub async fn run_validator_list_fetch(
                             }
                             ValidatorListApplyStatus::Expired => {
                                 tracing::debug!("validator list update ignored (expired)");
-                                ("invalid".to_string(), Some("publisher list expired".to_string()), site_refresh)
+                                (
+                                    "invalid".to_string(),
+                                    Some("publisher list expired".to_string()),
+                                    site_refresh,
+                                )
                             }
                         }
                     }
@@ -921,6 +1067,14 @@ mod tests {
     use base64::Engine as _;
 
     use super::*;
+    use crate::crypto::keys::Ed25519KeyPair;
+
+    fn ed_pubkey_bytes(kp: &Ed25519KeyPair) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(0xED);
+        out.extend_from_slice(&kp.public_key_bytes());
+        out
+    }
 
     fn signed_list_response(tamper_manifest: bool) -> (String, Vec<String>) {
         let master = crate::crypto::keys::Secp256k1KeyPair::generate();
@@ -999,6 +1153,89 @@ mod tests {
         assert_eq!(parsed.sequence, 9);
         assert_eq!(parsed.expiration, Some(12_345 + XRPL_EPOCH_OFFSET));
         assert_eq!(parsed.refresh_interval, Some(7 * 60));
+    }
+
+    #[test]
+    fn test_parse_and_verify_converts_xrpl_epoch_effective_and_expiration() {
+        let master = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let signing = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let manifest = crate::consensus::manifest::Manifest::new_signed(1, &master, &signing);
+
+        let blob_json = serde_json::json!({
+            "sequence": 10,
+            "effective": 22_222,
+            "expiration": 33_333,
+            "validators": [
+                { "validation_public_key": "ED5566778899" }
+            ]
+        });
+        let blob_bytes = serde_json::to_vec(&blob_json).unwrap();
+        let response = serde_json::json!({
+            "version": 1,
+            "manifest": base64::engine::general_purpose::STANDARD.encode(manifest.to_bytes()),
+            "blob": base64::engine::general_purpose::STANDARD.encode(&blob_bytes),
+            "signature": hex::encode_upper(signing.sign(&blob_bytes)),
+        })
+        .to_string();
+        let publisher_keys = vec![hex::encode_upper(master.public_key_bytes())];
+
+        let parsed = parse_and_verify(&response, &publisher_keys).unwrap();
+        assert_eq!(parsed.sequence, 10);
+        assert_eq!(parsed.effective, Some(22_222 + XRPL_EPOCH_OFFSET));
+        assert_eq!(parsed.expiration, Some(33_333 + XRPL_EPOCH_OFFSET));
+    }
+
+    #[test]
+    fn test_parse_and_verify_accepts_ed25519_publisher_manifest() {
+        let master = Ed25519KeyPair::from_seed_entropy(&[3u8; 16]);
+        let signing = Ed25519KeyPair::from_seed_entropy(&[4u8; 16]);
+        let master_pub = ed_pubkey_bytes(&master);
+        let signing_pub = ed_pubkey_bytes(&signing);
+        let manifest_bytes = crate::consensus::manifest::Manifest {
+            master_pubkey: master_pub.clone(),
+            signing_pubkey: signing_pub.clone(),
+            sequence: 1,
+            master_sig: master.sign(&crate::consensus::manifest::Manifest::signing_bytes(
+                &master_pub,
+                &signing_pub,
+                1,
+                None,
+                None,
+            )),
+            signing_sig: signing.sign(&crate::consensus::manifest::Manifest::signing_bytes(
+                &master_pub,
+                &signing_pub,
+                1,
+                None,
+                None,
+            )),
+            domain: None,
+            version: None,
+        }
+        .to_bytes();
+
+        let blob_json = serde_json::json!({
+            "sequence": 11,
+            "validators": [
+                { "validation_public_key": "ED998877665544332211" }
+            ]
+        });
+        let blob_bytes = serde_json::to_vec(&blob_json).unwrap();
+        let response = serde_json::json!({
+            "version": 1,
+            "manifest": base64::engine::general_purpose::STANDARD.encode(manifest_bytes),
+            "blob": base64::engine::general_purpose::STANDARD.encode(&blob_bytes),
+            "signature": hex::encode_upper(signing.sign(&blob_bytes)),
+        })
+        .to_string();
+        let publisher_keys = vec![hex::encode_upper(master_pub)];
+
+        let parsed = parse_and_verify(&response, &publisher_keys).unwrap();
+        assert_eq!(parsed.sequence, 11);
+        assert_eq!(
+            parsed.publisher_key,
+            hex::encode_upper(ed_pubkey_bytes(&master))
+        );
     }
 
     #[test]
@@ -1089,7 +1326,9 @@ mod tests {
             expiration: Some(400),
             refresh_interval: None,
         };
-        manager.apply(current, 100).expect("current list should apply");
+        manager
+            .apply(current, 100)
+            .expect("current list should apply");
 
         let future = ValidatorList {
             sequence: 6,
@@ -1100,12 +1339,17 @@ mod tests {
             expiration: Some(500),
             refresh_interval: None,
         };
-        manager.apply(future, 100).expect("future list should stage");
+        manager
+            .apply(future, 100)
+            .expect("future list should stage");
 
         let before = manager.snapshot(150);
         assert_eq!(before.publisher_lists.len(), 1);
         assert_eq!(
-            before.publisher_lists[0].current.as_ref().map(|list| list.sequence),
+            before.publisher_lists[0]
+                .current
+                .as_ref()
+                .map(|list| list.sequence),
             Some(5)
         );
         assert_eq!(before.publisher_lists[0].remaining.len(), 1);
@@ -1114,9 +1358,40 @@ mod tests {
         let after = manager.snapshot(250);
         assert_eq!(after.publisher_lists.len(), 1);
         assert_eq!(
-            after.publisher_lists[0].current.as_ref().map(|list| list.sequence),
+            after.publisher_lists[0]
+                .current
+                .as_ref()
+                .map(|list| list.sequence),
             Some(6)
         );
         assert!(after.publisher_lists[0].remaining.is_empty());
+    }
+
+    #[test]
+    fn test_complete_http_response_with_content_length() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
+        assert!(is_complete_http_response(response));
+        assert_eq!(extract_http_body(response).unwrap(), "{\"status\":\"ok\"}");
+    }
+
+    #[test]
+    fn test_incomplete_http_response_with_content_length() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"status\":\"ok\"}";
+        assert!(!is_complete_http_response(response));
+        assert!(extract_http_body(response).is_err());
+    }
+
+    #[test]
+    fn test_complete_chunked_http_response() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert!(is_complete_http_response(response));
+        assert_eq!(extract_http_body(response).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_extract_http_body_rejects_non_success_status() {
+        let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+        assert!(extract_http_body(response).is_err());
     }
 }

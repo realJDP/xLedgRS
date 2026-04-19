@@ -17,6 +17,28 @@ pub(super) struct FetchInfoSyncSnapshot {
     tail_stuck_retries: u32,
 }
 
+impl FetchInfoSyncSnapshot {
+    pub(super) fn state_nodes(&self) -> usize {
+        self.state_nodes
+    }
+}
+
+fn snapshot_validation_quorum(
+    manager: Option<&std::sync::Arc<std::sync::Mutex<crate::validator_list::ValidatorListManager>>>,
+    fallback: u32,
+    now_unix: u64,
+) -> u32 {
+    manager
+        .map(|manager| {
+            manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot(now_unix)
+                .validation_quorum
+        })
+        .unwrap_or(fallback)
+}
+
 impl Node {
     pub(super) fn snapshot_sync_fetch(&self) -> Option<FetchInfoSyncSnapshot> {
         let mut guard = self.lock_sync();
@@ -381,6 +403,7 @@ impl Node {
     pub(super) fn build_rpc_snapshot(
         state: &SharedState,
         object_count: usize,
+        leaf_count: usize,
         node_key: &Secp256k1KeyPair,
         validator_key: Option<&Secp256k1KeyPair>,
     ) -> crate::rpc::RpcSnapshot {
@@ -406,11 +429,18 @@ impl Node {
             .unwrap_or(0);
         let ledger_unix = state.ctx.ledger_header.close_time as u64 + XRPL_EPOCH_OFFSET;
         let age = now_unix.saturating_sub(ledger_unix);
+        let follower_healthy = Self::follower_healthy_for_status(state);
         let server_state = crate::network::ops::snapshot_server_state_label(
             state.sync_done,
+            follower_healthy,
             age,
             state.peer_txs.len(),
         );
+        let fallback_quorum = state
+            .current_round
+            .as_ref()
+            .map(|r| r.quorum())
+            .unwrap_or(0);
 
         crate::rpc::RpcSnapshot {
             ledger_seq: state.ctx.ledger_seq,
@@ -419,6 +449,7 @@ impl Node {
             fees: state.ctx.fees,
             peer_count: state.peer_txs.len(),
             object_count,
+            leaf_count,
             build_version: state.ctx.build_version,
             network_id: state.ctx.network_id,
             standalone_mode: state.ctx.standalone_mode,
@@ -431,20 +462,37 @@ impl Node {
                 .unwrap_or_else(|e| e.into_inner())
                 .complete_ledgers(),
             sync_done: state.sync_done,
-            validation_quorum: state
-                .current_round
-                .as_ref()
-                .map(|r| r.quorum())
-                .unwrap_or(0),
+            follower_healthy,
+            validation_quorum: snapshot_validation_quorum(
+                state.ctx.validator_list_manager.as_ref(),
+                fallback_quorum,
+                now_unix,
+            ),
             load_snapshot,
             state_accounting_snapshot: Some(
-                state
-                    .services
-                    .state_accounting
-                    .snapshot(server_state, now),
+                state.services.state_accounting.snapshot(server_state, now),
             ),
             pubkey_node,
             validator_key: validator_key_b58,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_validation_quorum;
+
+    #[test]
+    fn snapshot_validation_quorum_prefers_validator_list_manager() {
+        let manager = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::validator_list::ValidatorListManager::new(vec![vec![1u8; 33], vec![2u8; 33]], 1),
+        ));
+
+        assert_eq!(snapshot_validation_quorum(Some(&manager), 0, 1_000), 2);
+    }
+
+    #[test]
+    fn snapshot_validation_quorum_falls_back_when_manager_missing() {
+        assert_eq!(snapshot_validation_quorum(None, 7, 1_000), 7);
     }
 }

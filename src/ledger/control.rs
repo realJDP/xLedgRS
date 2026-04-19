@@ -28,9 +28,7 @@ impl LedgerAcceptService {
     }
 
     pub fn complete(&self, ledger_current_index: u32) {
-        let waiters = std::mem::take(
-            &mut *self.waiters.lock().unwrap_or_else(|e| e.into_inner()),
-        );
+        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap_or_else(|e| e.into_inner()));
         for waiter in waiters {
             let _ = waiter.send(ledger_current_index);
         }
@@ -285,7 +283,10 @@ mod tests {
         let rx = service.request();
         assert!(service.take_requested());
         service.complete(42);
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), 42);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            42
+        );
     }
 
     #[test]

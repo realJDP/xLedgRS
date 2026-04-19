@@ -1278,7 +1278,10 @@ fn append_load_fields(
     }
 }
 
-fn append_open_ledger_fields(dest: &mut Value, open: &crate::ledger::open_ledger::OpenLedgerSnapshot) {
+fn append_open_ledger_fields(
+    dest: &mut Value,
+    open: &crate::ledger::open_ledger::OpenLedgerSnapshot,
+) {
     dest["open_ledger_current_index"] = json!(open.ledger_current_index);
     dest["open_ledger_parent_ledger_index"] = json!(open.parent_ledger_index);
     dest["open_ledger_queued_transactions"] = json!(open.queued_transactions);
@@ -1366,8 +1369,12 @@ pub fn server_info_snapshot(
         let hours = (unix_ts / 3600) % 24;
         format!("{:02}:{:02}:{:02} UTC", hours, mins, secs)
     };
-    let server_state =
-        crate::network::ops::snapshot_server_state_label(snap.sync_done, age, snap.peer_count);
+    let server_state = crate::network::ops::snapshot_server_state_label(
+        snap.sync_done,
+        snap.follower_healthy,
+        age,
+        snap.peer_count,
+    );
     let state_accounting = snap.state_accounting_snapshot.clone().unwrap_or_else(|| {
         crate::network::ops::synthetic_state_accounting_snapshot(
             snap.start_time,
@@ -1400,6 +1407,7 @@ pub fn server_info_snapshot(
             "complete_ledgers":  snap.complete_ledgers,
             "memory_mb":         snap.memory_mb,
             "objects_stored":    snap.object_count,
+            "leaf_count":        snap.leaf_count,
         }
     });
     append_load_fields(&mut info["info"], &snap.load_snapshot, true, false);
@@ -1417,6 +1425,8 @@ pub fn server_info_snapshot(
         use std::sync::atomic::Ordering;
         info["info"]["follower"] = json!({
             "running":          fs.running.load(Ordering::Relaxed),
+            "resync_requested": fs.resync_requested.load(Ordering::Relaxed),
+            "degraded":         !fs.running.load(Ordering::Relaxed) || fs.resync_requested.load(Ordering::Relaxed),
             "current_seq":      fs.current_seq.load(Ordering::Relaxed),
             "ledgers_applied":  fs.ledgers_applied.load(Ordering::Relaxed),
             "txs_applied":      fs.txs_applied.load(Ordering::Relaxed),
@@ -1448,8 +1458,12 @@ pub fn server_state_snapshot(snap: &crate::rpc::RpcSnapshot) -> Result<Value, Rp
         .unwrap_or(0);
     let ledger_unix = snap.ledger_header.close_time as u64 + XRPL_EPOCH_OFFSET;
     let age = now_unix.saturating_sub(ledger_unix);
-    let server_state =
-        crate::network::ops::snapshot_server_state_label(snap.sync_done, age, snap.peer_count);
+    let server_state = crate::network::ops::snapshot_server_state_label(
+        snap.sync_done,
+        snap.follower_healthy,
+        age,
+        snap.peer_count,
+    );
     let state_accounting = snap.state_accounting_snapshot.clone().unwrap_or_else(|| {
         crate::network::ops::synthetic_state_accounting_snapshot(
             snap.start_time,
@@ -1616,6 +1630,8 @@ pub fn server_info(ctx: &NodeContext) -> Result<Value, RpcError> {
         use std::sync::atomic::Ordering;
         info["info"]["follower"] = json!({
             "running":          fs.running.load(Ordering::Relaxed),
+            "resync_requested": fs.resync_requested.load(Ordering::Relaxed),
+            "degraded":         !fs.running.load(Ordering::Relaxed) || fs.resync_requested.load(Ordering::Relaxed),
             "current_seq":      fs.current_seq.load(Ordering::Relaxed),
             "ledgers_applied":  fs.ledgers_applied.load(Ordering::Relaxed),
             "txs_applied":      fs.txs_applied.load(Ordering::Relaxed),
@@ -1733,10 +1749,7 @@ pub fn server_state(ctx: &NodeContext) -> Result<Value, RpcError> {
         false,
         ctx.admin_rpc_enabled,
     );
-    append_state_accounting_fields(
-        &mut state["state"],
-        &state_accounting,
-    );
+    append_state_accounting_fields(&mut state["state"], &state_accounting);
     if context_needs_network_ledger(ctx) {
         state["state"]["network_ledger"] = json!("waiting");
     }
@@ -2843,7 +2856,10 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 "node_store_fetch_errors".into(),
                 json!(snapshot.node_store_fetch_errors),
             );
-            network_ops.insert("node_store_flush_ops".into(), json!(snapshot.node_store_flush_ops));
+            network_ops.insert(
+                "node_store_flush_ops".into(),
+                json!(snapshot.node_store_flush_ops),
+            );
             network_ops.insert(
                 "node_store_last_flush_unix".into(),
                 json!(snapshot.node_store_last_flush_unix),
@@ -2852,7 +2868,10 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 "node_store_last_flush_duration_ms".into(),
                 json!(snapshot.node_store_last_flush_duration_ms),
             );
-            network_ops.insert("fetch_pack_entries".into(), json!(snapshot.fetch_pack_entries));
+            network_ops.insert(
+                "fetch_pack_entries".into(),
+                json!(snapshot.fetch_pack_entries),
+            );
             network_ops.insert(
                 "fetch_pack_backend_fill_total".into(),
                 json!(snapshot.fetch_pack_backend_fill_total),
@@ -2869,7 +2888,10 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 "fetch_pack_persist_errors_total".into(),
                 json!(snapshot.fetch_pack_persist_errors_total),
             );
-            network_ops.insert("fetch_pack_flush_ops".into(), json!(snapshot.fetch_pack_flush_ops));
+            network_ops.insert(
+                "fetch_pack_flush_ops".into(),
+                json!(snapshot.fetch_pack_flush_ops),
+            );
             network_ops.insert(
                 "fetch_pack_last_flush_unix".into(),
                 json!(snapshot.fetch_pack_last_flush_unix),
@@ -3065,7 +3087,10 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
             server.insert("warned_peers".into(), json!(ops.warned_peers));
             server.insert("resource_tracked".into(), json!(ops.resource_tracked));
             server.insert("resource_ip_balance".into(), json!(ops.resource_ip_balance));
-            server.insert("resource_peer_balance".into(), json!(ops.resource_peer_balance));
+            server.insert(
+                "resource_peer_balance".into(),
+                json!(ops.resource_peer_balance),
+            );
             server.insert("resource_balance".into(), json!(ops.resource_balance));
             server.insert(
                 "resource_warning_events".into(),
@@ -3120,8 +3145,14 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 "failed_inbound_ledgers".into(),
                 json!(ops.failed_inbound_ledgers),
             );
-            server.insert("node_store_fetch_errors".into(), json!(ops.node_store_fetch_errors));
-            server.insert("node_store_flush_ops".into(), json!(ops.node_store_flush_ops));
+            server.insert(
+                "node_store_fetch_errors".into(),
+                json!(ops.node_store_fetch_errors),
+            );
+            server.insert(
+                "node_store_flush_ops".into(),
+                json!(ops.node_store_flush_ops),
+            );
             server.insert(
                 "node_store_last_flush_unix".into(),
                 json!(ops.node_store_last_flush_unix),
@@ -3135,7 +3166,10 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 "fetch_pack_backend_fill_total".into(),
                 json!(ops.fetch_pack_backend_fill_total),
             );
-            server.insert("fetch_pack_reused_total".into(), json!(ops.fetch_pack_reused_total));
+            server.insert(
+                "fetch_pack_reused_total".into(),
+                json!(ops.fetch_pack_reused_total),
+            );
             server.insert(
                 "fetch_pack_persisted_total".into(),
                 json!(ops.fetch_pack_persisted_total),
@@ -3144,7 +3178,10 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 "fetch_pack_persist_errors_total".into(),
                 json!(ops.fetch_pack_persist_errors_total),
             );
-            server.insert("fetch_pack_flush_ops".into(), json!(ops.fetch_pack_flush_ops));
+            server.insert(
+                "fetch_pack_flush_ops".into(),
+                json!(ops.fetch_pack_flush_ops),
+            );
             server.insert(
                 "fetch_pack_last_flush_unix".into(),
                 json!(ops.fetch_pack_last_flush_unix),
@@ -3154,9 +3191,18 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 json!(ops.fetch_pack_last_flush_duration_ms),
             );
             server.insert("queued_transactions".into(), json!(ops.queued_transactions));
-            server.insert("tracked_transactions".into(), json!(ops.tracked_transactions));
-            server.insert("submitted_transactions".into(), json!(ops.submitted_transactions));
-            server.insert("active_path_requests".into(), json!(ops.active_path_requests));
+            server.insert(
+                "tracked_transactions".into(),
+                json!(ops.tracked_transactions),
+            );
+            server.insert(
+                "submitted_transactions".into(),
+                json!(ops.submitted_transactions),
+            );
+            server.insert(
+                "active_path_requests".into(),
+                json!(ops.active_path_requests),
+            );
             server.insert(
                 "tracked_inbound_transactions".into(),
                 json!(ops.tracked_inbound_transactions),
@@ -3345,7 +3391,10 @@ pub fn validators(ctx: &NodeContext) -> Result<Value, RpcError> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let snapshot = manager.lock().unwrap_or_else(|e| e.into_inner()).snapshot(now);
+    let snapshot = manager
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .snapshot(now);
 
     let local_static_keys: Vec<String> = snapshot
         .static_validators
@@ -3401,24 +3450,20 @@ pub fn validators(ctx: &NodeContext) -> Result<Value, RpcError> {
             if let Some(current) = list.current.as_ref() {
                 entry.insert(
                     "expiration".to_string(),
-                    json!(
-                        current
-                            .expiration
-                            .map(human_time_string)
-                            .unwrap_or_else(|| "never".to_string())
-                    ),
+                    json!(current
+                        .expiration
+                        .map(human_time_string)
+                        .unwrap_or_else(|| "never".to_string())),
                 );
                 entry.insert("seq".to_string(), json!(current.sequence));
                 entry.insert("version".to_string(), json!(1));
                 entry.insert(
                     "list".to_string(),
-                    json!(
-                        current
-                            .validators
-                            .iter()
-                            .map(|key| encode_validator_hex_or_display(key))
-                            .collect::<Vec<_>>()
-                    ),
+                    json!(current
+                        .validators
+                        .iter()
+                        .map(|key| encode_validator_hex_or_display(key))
+                        .collect::<Vec<_>>()),
                 );
                 if let Some(effective) = current.effective {
                     entry.insert("effective".to_string(), json!(human_time_string(effective)));
@@ -3437,22 +3482,18 @@ pub fn validators(ctx: &NodeContext) -> Result<Value, RpcError> {
                                 pending.insert("version".to_string(), json!(1));
                                 pending.insert(
                                     "expiration".to_string(),
-                                    json!(
-                                        remaining
-                                            .expiration
-                                            .map(human_time_string)
-                                            .unwrap_or_else(|| "never".to_string())
-                                    ),
+                                    json!(remaining
+                                        .expiration
+                                        .map(human_time_string)
+                                        .unwrap_or_else(|| "never".to_string())),
                                 );
                                 pending.insert(
                                     "list".to_string(),
-                                    json!(
-                                        remaining
-                                            .validators
-                                            .iter()
-                                            .map(|key| encode_validator_hex_or_display(key))
-                                            .collect::<Vec<_>>()
-                                    ),
+                                    json!(remaining
+                                        .validators
+                                        .iter()
+                                        .map(|key| encode_validator_hex_or_display(key))
+                                        .collect::<Vec<_>>()),
                                 );
                                 if let Some(effective) = remaining.effective {
                                     pending.insert(
@@ -3717,9 +3758,9 @@ pub fn ledger_accept(ctx: &NodeContext) -> Result<Value, RpcError> {
 
     if let Some(service) = ctx.ledger_accept_service.as_ref() {
         let receiver = service.request();
-        let ledger_current_index = receiver.recv_timeout(std::time::Duration::from_secs(15)).map_err(
-            |_| RpcError::internal("ledger accept timed out waiting for local close"),
-        )?;
+        let ledger_current_index = receiver
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| RpcError::internal("ledger accept timed out waiting for local close"))?;
         return Ok(json!({
             "ledger_current_index": ledger_current_index,
         }));
@@ -4369,31 +4410,30 @@ pub fn fee(ctx: &NodeContext) -> Result<Value, RpcError> {
         txns_expected,
         escalation_multiplier,
         max_queue_size,
-    ) =
-        if let Some(snapshot) = ctx.open_ledger_snapshot.as_ref() {
-            (
-                snapshot.ledger_current_index,
-                snapshot.queued_transactions,
-                snapshot.open_fee_level,
-                FeeMetrics::fee_level_to_drops(snapshot.escalation_multiplier, base),
-                snapshot.txns_expected,
-                snapshot.escalation_multiplier,
-                snapshot.max_queue_size,
-            )
-        } else {
-            let pool = ctx.tx_pool.read().unwrap_or_else(|e| e.into_inner());
-            let pool_size = pool.len();
-            let metrics = &pool.metrics;
-            (
-                ctx.ledger_seq,
-                pool_size,
-                metrics.escalated_fee_level(pool_size as u64 + 1),
-                FeeMetrics::fee_level_to_drops(metrics.escalation_multiplier, base),
-                metrics.txns_expected,
-                metrics.escalation_multiplier,
-                metrics.max_queue_size(),
-            )
-        };
+    ) = if let Some(snapshot) = ctx.open_ledger_snapshot.as_ref() {
+        (
+            snapshot.ledger_current_index,
+            snapshot.queued_transactions,
+            snapshot.open_fee_level,
+            FeeMetrics::fee_level_to_drops(snapshot.escalation_multiplier, base),
+            snapshot.txns_expected,
+            snapshot.escalation_multiplier,
+            snapshot.max_queue_size,
+        )
+    } else {
+        let pool = ctx.tx_pool.read().unwrap_or_else(|e| e.into_inner());
+        let pool_size = pool.len();
+        let metrics = &pool.metrics;
+        (
+            ctx.ledger_seq,
+            pool_size,
+            metrics.escalated_fee_level(pool_size as u64 + 1),
+            FeeMetrics::fee_level_to_drops(metrics.escalation_multiplier, base),
+            metrics.txns_expected,
+            metrics.escalation_multiplier,
+            metrics.max_queue_size(),
+        )
+    };
     let open_fee = FeeMetrics::fee_level_to_drops(open_level, base);
 
     Ok(json!({
@@ -4736,10 +4776,11 @@ pub fn path_find(params: &Value, request_id: &Value, ctx: &NodeContext) -> Resul
     match subcommand {
         "create" => {
             let result = path_find_update_result(params, ctx)?;
-            manager
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .upsert(client_id, params.clone(), &result);
+            manager.lock().unwrap_or_else(|e| e.into_inner()).upsert(
+                client_id,
+                params.clone(),
+                &result,
+            );
             Ok(result)
         }
         "status" => {
@@ -8680,10 +8721,7 @@ mod tests {
             resp.result["state"]["state_accounting"]["disconnected"]["duration_us"].is_string()
         );
         assert!(resp.result["state"]["server_state_duration_us"].is_string());
-        assert_eq!(
-            resp.result["state"]["open_ledger_revision"],
-            json!(11)
-        );
+        assert_eq!(resp.result["state"]["open_ledger_revision"], json!(11));
         assert_eq!(
             resp.result["state"]["open_ledger_last_accept_unix"],
             json!(92)
@@ -8722,10 +8760,7 @@ mod tests {
     fn test_server_info_uses_validator_list_quorum() {
         let mut c = ctx();
         c.validator_list_manager = Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::validator_list::ValidatorListManager::new(
-                vec![vec![1u8; 33], vec![2u8; 33]],
-                1,
-            ),
+            crate::validator_list::ValidatorListManager::new(vec![vec![1u8; 33], vec![2u8; 33]], 1),
         )));
         let resp = dispatch(req("server_info", json!({})), &mut c);
         assert_eq!(resp.result["status"], "success");
@@ -8736,10 +8771,7 @@ mod tests {
     fn test_server_state_uses_validator_list_quorum() {
         let mut c = ctx();
         c.validator_list_manager = Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::validator_list::ValidatorListManager::new(
-                vec![vec![1u8; 33], vec![2u8; 33]],
-                1,
-            ),
+            crate::validator_list::ValidatorListManager::new(vec![vec![1u8; 33], vec![2u8; 33]], 1),
         )));
         let resp = dispatch(req("server_state", json!({})), &mut c);
         assert_eq!(resp.result["status"], "success");
@@ -9000,7 +9032,10 @@ mod tests {
             .insert_ledger(header.clone(), vec![]);
 
         let resp = dispatch(
-            req("can_delete", json!({"can_delete": hex::encode_upper(header.hash)})),
+            req(
+                "can_delete",
+                json!({"can_delete": hex::encode_upper(header.hash)}),
+            ),
             &mut c,
         );
         assert_eq!(resp.result["status"], "success");
@@ -9110,7 +9145,10 @@ mod tests {
         );
         assert_eq!(resp.result["validator_sites"][0]["refresh_interval_min"], 7);
         assert!(resp.result["validator_sites"][0]["last_refresh_time"].is_string());
-        assert_eq!(resp.result["validator_sites"][0]["last_refresh_message"], "ok");
+        assert_eq!(
+            resp.result["validator_sites"][0]["last_refresh_message"],
+            "ok"
+        );
         assert!(resp.result["validator_sites"][0]["next_refresh_time"].is_string());
     }
 
@@ -9265,7 +9303,10 @@ mod tests {
         ];
         let load_resp = dispatch(req("print", json!({"params": ["load"]})), &mut c);
         assert_eq!(load_resp.result["status"], "success");
-        assert_eq!(load_resp.result["load"]["load_queue_overloaded"], json!(true));
+        assert_eq!(
+            load_resp.result["load"]["load_queue_overloaded"],
+            json!(true)
+        );
         assert_eq!(load_resp.result["load"]["load_queue_depth"], json!(17));
         assert_eq!(load_resp.result["load"]["queued_transactions"], json!(12));
         assert_eq!(
@@ -9338,7 +9379,10 @@ mod tests {
         assert_eq!(peerfinder.result["peerfinder"]["total_known"], json!(3));
         assert_eq!(peerfinder.result["peerfinder"]["backed_off"], json!(1));
         assert_eq!(peerfinder.result["peerfinder"]["ready"], json!(2));
-        assert_eq!(peerfinder.result["peerfinder"]["distinct_sources"], json!(2));
+        assert_eq!(
+            peerfinder.result["peerfinder"]["distinct_sources"],
+            json!(2)
+        );
 
         let cluster = dispatch(req("print", json!({"params": ["cluster"]})), &mut c);
         assert_eq!(cluster.result["status"], "success");
@@ -9406,8 +9450,14 @@ mod tests {
         let node_store = dispatch(req("print", json!({"params": ["node_store"]})), &mut c);
         assert_eq!(node_store.result["status"], "success");
         assert_eq!(node_store.result["node_store"]["fetch_errors"], json!(1));
-        assert_eq!(node_store.result["node_store"]["batch_store_nodes"], json!(19));
-        assert_eq!(node_store.result["node_store"]["last_flush_unix"], json!(88));
+        assert_eq!(
+            node_store.result["node_store"]["batch_store_nodes"],
+            json!(19)
+        );
+        assert_eq!(
+            node_store.result["node_store"]["last_flush_unix"],
+            json!(88)
+        );
         assert_eq!(
             node_store.result["node_store"]["last_flush_duration_ms"],
             json!(9)
@@ -9452,7 +9502,10 @@ mod tests {
         assert_eq!(fetch_pack.result["fetch_pack"]["reused_total"], json!(3));
         assert_eq!(fetch_pack.result["fetch_pack"]["persisted_total"], json!(4));
         assert_eq!(fetch_pack.result["fetch_pack"]["flush_ops"], json!(2));
-        assert_eq!(fetch_pack.result["fetch_pack"]["last_flush_unix"], json!(77));
+        assert_eq!(
+            fetch_pack.result["fetch_pack"]["last_flush_unix"],
+            json!(77)
+        );
         assert_eq!(
             fetch_pack.result["fetch_pack"]["last_flush_duration_ms"],
             json!(12)
@@ -9611,11 +9664,26 @@ mod tests {
         let inbound_ledgers =
             dispatch(req("print", json!({"params": ["inbound_ledgers"]})), &mut c);
         assert_eq!(inbound_ledgers.result["status"], "success");
-        assert_eq!(inbound_ledgers.result["inbound_ledgers"]["active"], json!(2));
-        assert_eq!(inbound_ledgers.result["inbound_ledgers"]["complete"], json!(1));
-        assert_eq!(inbound_ledgers.result["inbound_ledgers"]["retry_ready"], json!(1));
-        assert_eq!(inbound_ledgers.result["inbound_ledgers"]["fetch_rate"], json!(1));
-        assert_eq!(inbound_ledgers.result["inbound_ledgers"]["fetch_pack_hits"], json!(2));
+        assert_eq!(
+            inbound_ledgers.result["inbound_ledgers"]["active"],
+            json!(2)
+        );
+        assert_eq!(
+            inbound_ledgers.result["inbound_ledgers"]["complete"],
+            json!(1)
+        );
+        assert_eq!(
+            inbound_ledgers.result["inbound_ledgers"]["retry_ready"],
+            json!(1)
+        );
+        assert_eq!(
+            inbound_ledgers.result["inbound_ledgers"]["fetch_rate"],
+            json!(1)
+        );
+        assert_eq!(
+            inbound_ledgers.result["inbound_ledgers"]["fetch_pack_hits"],
+            json!(2)
+        );
         assert_eq!(
             inbound_ledgers.result["inbound_ledgers"]["recent_failures"],
             json!(5)
@@ -9782,8 +9850,14 @@ mod tests {
             open_ledger.result["open_ledger"]["ledger_current_index"],
             json!(10)
         );
-        assert_eq!(open_ledger.result["open_ledger"]["parent_ledger_index"], json!(9));
-        assert_eq!(open_ledger.result["open_ledger"]["max_queue_size"], json!(2000));
+        assert_eq!(
+            open_ledger.result["open_ledger"]["parent_ledger_index"],
+            json!(9)
+        );
+        assert_eq!(
+            open_ledger.result["open_ledger"]["max_queue_size"],
+            json!(2000)
+        );
         assert_eq!(
             open_ledger.result["open_ledger"]["open_fee_level"],
             json!(crate::ledger::pool::BASE_LEVEL)
@@ -9791,9 +9865,18 @@ mod tests {
         assert_eq!(open_ledger.result["open_ledger"]["revision"], json!(7));
         assert_eq!(open_ledger.result["open_ledger"]["modify_count"], json!(4));
         assert_eq!(open_ledger.result["open_ledger"]["accept_count"], json!(2));
-        assert_eq!(open_ledger.result["open_ledger"]["last_modified_unix"], json!(100));
-        assert_eq!(open_ledger.result["open_ledger"]["last_accept_unix"], json!(101));
-        assert_eq!(open_ledger.result["open_ledger"]["has_open_view"], json!(true));
+        assert_eq!(
+            open_ledger.result["open_ledger"]["last_modified_unix"],
+            json!(100)
+        );
+        assert_eq!(
+            open_ledger.result["open_ledger"]["last_accept_unix"],
+            json!(101)
+        );
+        assert_eq!(
+            open_ledger.result["open_ledger"]["has_open_view"],
+            json!(true)
+        );
         assert_eq!(
             open_ledger.result["open_ledger"]["open_view_base_ledger_index"],
             json!(9)
@@ -9920,10 +10003,7 @@ mod tests {
                 crate::crypto::base58::PREFIX_NODE_PUBLIC,
                 &hex::decode(&publisher_key).unwrap()
             )],
-            crate::crypto::base58::encode(
-                crate::crypto::base58::PREFIX_NODE_PUBLIC,
-                &[0xAAu8; 33]
-            )
+            crate::crypto::base58::encode(crate::crypto::base58::PREFIX_NODE_PUBLIC, &[0xAAu8; 33])
         );
         assert!(
             resp.result["trusted_validator_keys"]
@@ -10376,7 +10456,10 @@ mod tests {
         assert_eq!(resp.result["status"], "success");
         assert_eq!(resp.result["ledger_current_index"], json!(1001));
         assert_eq!(resp.result["current_ledger_size"], "12");
-        assert_eq!(resp.result["levels"]["open_ledger_level"], json!((crate::ledger::pool::BASE_LEVEL * 2).to_string()));
+        assert_eq!(
+            resp.result["levels"]["open_ledger_level"],
+            json!((crate::ledger::pool::BASE_LEVEL * 2).to_string())
+        );
         assert_eq!(resp.result["drops"]["open_ledger_fee"], json!("20"));
     }
 
@@ -13399,7 +13482,9 @@ mod tests {
     fn test_ledger_accept_requires_close_loop_service() {
         let mut c = ctx();
         c.standalone_mode = true;
-        c.force_ledger_accept = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        c.force_ledger_accept = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
 
         let resp = dispatch(req("ledger_accept", json!({})), &mut c);
         assert_eq!(resp.result["status"], "error");
@@ -13577,11 +13662,7 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if !c.storage
-                .as_ref()
-                .unwrap()
-                .has_full_ledger_range(1, 2)
-            {
+            if !c.storage.as_ref().unwrap().has_full_ledger_range(1, 2) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

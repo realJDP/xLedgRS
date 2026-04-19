@@ -113,8 +113,7 @@ mod tests {
 
     #[test]
     fn parse_forwarded_for_takes_first_forwarded_ip() {
-        let header =
-            b"POST / HTTP/1.1\r\nX-Forwarded-For: 198.51.100.10, 203.0.113.7\r\n\r\n";
+        let header = b"POST / HTTP/1.1\r\nX-Forwarded-For: 198.51.100.10, 203.0.113.7\r\n\r\n";
         assert_eq!(
             super::parse_forwarded_for(header),
             Some("198.51.100.10".to_string())

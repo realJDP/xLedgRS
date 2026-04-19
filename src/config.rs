@@ -64,6 +64,11 @@ pub struct ConfigFile {
     /// When present, the node signs validations and proposals with this key
     /// instead of the random node identity key.
     pub validation_seed: Option<String>,
+    /// Hex-encoded secp256k1 validator signing secret key.
+    pub validation_secret_key: Option<String>,
+    /// Base64-encoded rippled validator token. When present, xLedgRS derives
+    /// the validator signing key from the token payload.
+    pub validator_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +115,10 @@ struct TomlConfigFile {
     node: TomlNodeConfig,
     /// `validation_seed = "sEdV19BLfe..."` in TOML.
     validation_seed: Option<String>,
+    /// `validation_secret_key = "...."` in TOML.
+    validation_secret_key: Option<String>,
+    /// `validator_token = "...."` in TOML.
+    validator_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +231,8 @@ impl ConfigFile {
             },
             runtime,
             validation_seed: toml_cfg.validation_seed,
+            validation_secret_key: toml_cfg.validation_secret_key,
+            validator_token: toml_cfg.validator_token,
         }
     }
 
@@ -339,6 +350,18 @@ impl ConfigFile {
             .get("validation_seed")
             .and_then(first_scalar)
             .map(|s| s.to_string());
+        let validation_secret_key = sections
+            .get("validation_secret_key")
+            .and_then(first_scalar)
+            .map(|s| s.to_string());
+        let validator_token = sections.get("validator_token").and_then(|section| {
+            let token = section.items.join("").trim().to_string();
+            if token.is_empty() {
+                None
+            } else {
+                Some(token)
+            }
+        });
 
         Ok(Self {
             validators,
@@ -346,6 +369,8 @@ impl ConfigFile {
             amendments,
             runtime,
             validation_seed,
+            validation_secret_key,
+            validator_token,
         })
     }
 }
@@ -538,6 +563,8 @@ fn load_validators_file(path: &Path) -> Result<ConfigFile> {
         amendments: AmendmentConfig::default(),
         runtime: RuntimeConfig::default(),
         validation_seed: None,
+        validation_secret_key: None,
+        validator_token: None,
     })
 }
 

@@ -267,9 +267,12 @@ impl SyncCoordinator {
         request_cookie: Option<u32>,
         imported_count: usize,
     ) -> ObjectResponseHandling {
-        let accepted = self
-            .peer
-            .accept_object_response(ledger_hash, request_cookie);
+        let accepted = self.peer.accept_object_response(ledger_hash, request_cookie)
+            || self.peer.accept_useful_stale_object_response(
+                ledger_hash,
+                request_cookie,
+                imported_count,
+            );
         if !accepted {
             return ObjectResponseHandling {
                 accepted: false,
@@ -357,7 +360,7 @@ impl SyncCoordinator {
     /// Find missing nodes in the SHAMap.
     pub fn get_missing(
         &mut self,
-    max: usize,
+        max: usize,
     ) -> Vec<(crate::ledger::shamap_id::SHAMapNodeID, [u8; 32])> {
         self.get_missing_report(max).missing
     }
@@ -530,7 +533,10 @@ impl SyncCoordinator {
     /// Count of missing nodes (diagnostics).
     pub fn pending_count(&mut self) -> usize {
         let report = self.get_missing_report(256);
-        report.missing.len().saturating_add(report.backend_fetch_errors)
+        report
+            .missing
+            .len()
+            .saturating_add(report.backend_fetch_errors)
     }
 
     /// Restart for a new ledger.
@@ -824,7 +830,9 @@ mod tests {
         let mut coordinator = SyncCoordinator::new(10, [0x11; 32], [0x22; 32], None, header);
         let cookie = crate::sync::next_cookie() as u32;
         coordinator.peer.outstanding_object_queries.insert(cookie);
-        coordinator.pending_object_cookies.insert(cookie, vec![[0; 33]]);
+        coordinator
+            .pending_object_cookies
+            .insert(cookie, vec![[0; 33]]);
 
         let outcome = coordinator.handle_object_response(&[0x11; 32], Some(cookie), 1);
         assert!(outcome.accepted);
@@ -843,6 +851,48 @@ mod tests {
         assert!(!outcome.accepted);
         assert_eq!(outcome.sync_seq, 0);
         assert!(outcome.followup_reqs.is_empty());
+    }
+
+    #[test]
+    fn handle_object_response_accepts_useful_stale_cookie_for_same_ledger() {
+        let header = crate::ledger::LedgerHeader::default();
+        let mut coordinator = SyncCoordinator::new(10, [0x11; 32], [0x22; 32], None, header);
+        coordinator.shamap.root.set_child_hash(0, [0xAA; 32]);
+        let request = coordinator
+            .build_timeout_object_request()
+            .expect("missing child hash should produce a GetObjects request");
+        let pb = crate::proto::TmGetObjectByHash::decode(request.payload.as_slice())
+            .expect("GetObjects request should decode");
+        let cookie = pb.seq.expect("request should include a cookie") as u32;
+
+        coordinator.peer.outstanding_object_queries.clear();
+
+        let outcome = coordinator.handle_object_response(&[0x11; 32], Some(cookie), 2);
+        assert!(outcome.accepted);
+        assert_eq!(outcome.sync_seq, 10);
+        assert!(!coordinator.pending_object_cookies.contains_key(&cookie));
+        assert!(coordinator.peer.responded_object_queries.contains(&cookie));
+    }
+
+    #[test]
+    fn handle_object_response_rejects_non_useful_stale_cookie() {
+        let header = crate::ledger::LedgerHeader::default();
+        let mut coordinator = SyncCoordinator::new(10, [0x11; 32], [0x22; 32], None, header);
+        coordinator.shamap.root.set_child_hash(0, [0xAA; 32]);
+        let request = coordinator
+            .build_timeout_object_request()
+            .expect("missing child hash should produce a GetObjects request");
+        let pb = crate::proto::TmGetObjectByHash::decode(request.payload.as_slice())
+            .expect("GetObjects request should decode");
+        let cookie = pb.seq.expect("request should include a cookie") as u32;
+
+        coordinator.peer.outstanding_object_queries.clear();
+
+        let outcome = coordinator.handle_object_response(&[0x11; 32], Some(cookie), 0);
+        assert!(!outcome.accepted);
+        assert_eq!(outcome.sync_seq, 0);
+        assert!(coordinator.pending_object_cookies.contains_key(&cookie));
+        assert!(!coordinator.peer.responded_object_queries.contains(&cookie));
     }
 
     #[test]
@@ -896,7 +946,10 @@ mod tests {
         coordinator.peer.last_new_nodes -= std::time::Duration::from_secs(11);
         coordinator.peer.outstanding_cookies.insert(cookie);
         coordinator.peer.outstanding_object_queries.insert(cookie);
-        coordinator.peer.responded_cookies.insert(cookie.wrapping_add(1));
+        coordinator
+            .peer
+            .responded_cookies
+            .insert(cookie.wrapping_add(1));
         coordinator.peer.responded_object_queries.insert(cookie);
         coordinator
             .pending_object_nodeids
@@ -955,7 +1008,9 @@ mod tests {
         coordinator.peer.tail_stuck_retries = 2;
         coordinator.peer.outstanding_cookies.insert(cookie);
         coordinator.peer.outstanding_object_queries.insert(cookie);
-        coordinator.pending_object_nodeids.insert([0xAA; 32], [0xBB; 33]);
+        coordinator
+            .pending_object_nodeids
+            .insert([0xAA; 32], [0xBB; 33]);
         coordinator
             .pending_object_cookies
             .insert(cookie, vec![[0xBB; 33]]);

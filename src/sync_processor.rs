@@ -38,10 +38,9 @@ pub fn process_sync_batch_blocking(
 
         let is_object_response = ld.error == Some(1);
         let accepted = if is_object_response {
-            let accepted = syncer.peer.accept_object_response(
-                &ld.ledger_hash,
-                ld.request_cookie.map(|c| c as u32),
-            );
+            let accepted = syncer
+                .peer
+                .accept_object_response(&ld.ledger_hash, ld.request_cookie.map(|c| c as u32));
             if accepted {
                 if let Some(seq) = ld.request_cookie {
                     syncer.pending_object_cookies.remove(&(seq as u32));
@@ -49,12 +48,14 @@ pub fn process_sync_batch_blocking(
             }
             accepted
         } else {
-            syncer.peer.accept_response(&ld.ledger_hash, ld.request_cookie)
+            syncer
+                .peer
+                .accept_response(&ld.ledger_hash, ld.request_cookie)
         };
         if !accepted {
             if missing_before <= 5 {
-                let hash_match = ld.ledger_hash.len() >= 8
-                    && ld.ledger_hash[..8] == syncer.ledger_hash()[..8];
+                let hash_match =
+                    ld.ledger_hash.len() >= 8 && ld.ledger_hash[..8] == syncer.ledger_hash()[..8];
                 tracing::info!(
                     "RESPONSE DROPPED: peer={:?} is_obj={} cookie={:?} hash_match={} nodes={} our_hash={}",
                     peer_id,

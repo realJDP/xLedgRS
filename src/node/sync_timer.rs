@@ -194,7 +194,9 @@ impl Node {
                     let state = self.state.read().await;
                     let have_validated_target =
                         state.ctx.ledger_seq > 1 && state.ctx.ledger_header.hash != [0u8; 32];
+                    let anchor_pending = state.pending_sync_anchor.is_some();
                     if !state.sync_done
+                        && !anchor_pending
                         && state.peer_count() >= 1
                         && self.storage.is_some()
                         && have_validated_target
@@ -209,26 +211,37 @@ impl Node {
                         if now_secs >= prev + 15 {
                             LAST_KICKSTART.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                             let cookie = crate::sync::next_cookie();
-                            let latest_hash = state
-                                .validated_hashes
-                                .get(&state.ctx.ledger_seq)
-                                .copied()
-                                .unwrap_or(state.ctx.ledger_header.hash);
+                            let trusted_hash =
+                                state.validated_hashes.get(&state.ctx.ledger_seq).copied();
+                            let peer_ranges: Vec<(u32, u32)> =
+                                state.peer_ledger_range.values().copied().collect();
+                            let reachable_seq_only_target = if trusted_hash.is_none() {
+                                crate::sync_bootstrap::choose_reachable_seq_only_target(
+                                    state.ctx.ledger_seq,
+                                    &peer_ranges,
+                                )
+                            } else {
+                                None
+                            };
                             let (target_seq, target_hash, reason) =
                                 crate::sync_bootstrap::choose_sync_kickstart_target(
                                     inactive_target,
                                     state.ctx.ledger_seq,
-                                    latest_hash,
+                                    trusted_hash,
+                                    reachable_seq_only_target,
                                 );
                             let max_peers = if inactive_target.is_some() {
                                 usize::MAX
                             } else {
                                 3
                             };
-                            let get_msg = crate::network::relay::encode_get_ledger_base(
-                                &target_hash,
-                                cookie,
-                            );
+                            let get_msg = if let Some(target_hash) = target_hash {
+                                crate::network::relay::encode_get_ledger_base(&target_hash, cookie)
+                            } else {
+                                crate::network::relay::encode_get_ledger_base_by_seq(
+                                    target_seq, cookie,
+                                )
+                            };
                             let mut sent = 0;
                             for (pid, ps) in &state.peers {
                                 if !ps.is_open() {
@@ -243,11 +256,18 @@ impl Node {
                                 }
                             }
                             if sent > 0 {
-                                info!(
-                                    "sync timer: {reason}, sent liBASE kickstart for ledger {} ({}) to {sent} peers",
-                                    target_seq,
-                                    hex::encode_upper(&target_hash[..8]),
-                                );
+                                if let Some(target_hash) = target_hash {
+                                    info!(
+                                        "sync timer: {reason}, sent liBASE kickstart for ledger {} ({}) to {sent} peers",
+                                        target_seq,
+                                        hex::encode_upper(&target_hash[..8]),
+                                    );
+                                } else {
+                                    info!(
+                                        "sync timer: {reason}, sent liBASE-by-sequence kickstart for ledger {} to {sent} peers",
+                                        target_seq,
+                                    );
+                                }
                             }
                         }
                     }

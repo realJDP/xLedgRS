@@ -318,20 +318,37 @@ pub fn run_tx(
     let old_result = apply_tx(state, tx, ctx);
 
     // Convert old ApplyResult to TxResult
-    let ter = match &old_result {
+    let local_ter = match &old_result {
         ApplyResult::Success => ter::TES_SUCCESS,
         ApplyResult::ClaimedCost(code_str) => {
             ter::token_to_code(code_str).unwrap_or(ter::TEC_CLAIM)
         }
     };
+    let ter = if flags.contains(ApplyFlags::VALIDATED_REPLAY) {
+        if let Some(validated) = ctx.validated_result {
+            if validated != local_ter {
+                tracing::warn!(
+                    "validated replay TER override: tx_type={} seq={} local={} authoritative={}",
+                    tx.tx_type,
+                    sequence_proxy(tx),
+                    local_ter,
+                    validated,
+                );
+            }
+            validated
+        } else {
+            local_ter
+        }
+    } else {
+        local_ter
+    };
 
-    // ── Handle special tec codes that need reset ────────────────────────
-    // rippled resets on: tecOVERSIZE, tecKILLED, tecINCOMPLETE, tecEXPIRED,
-    // and any tec when isTecClaimHardFail (i.e. final pass, no tapRETRY).
-    let needs_reset = ter == ter::TEC_OVERSIZE
-        || ter == ter::TEC_KILLED
-        || ter == ter::TEC_INCOMPLETE
-        || ter == ter::TEC_EXPIRED;
+    // ── Handle tec hard-fail reset ──────────────────────────────────────
+    // XRPL tec results claim the fee and consume the sequence, but they do
+    // not keep transaction-specific side effects. That means a final tec
+    // result must always collapse to a fee-only reset unless FAIL_HARD is in
+    // force. Letting full mutations survive here is what poisons replay.
+    let needs_reset = ter.is_tec_claim_hard_fail(flags) && !flags.contains(ApplyFlags::FAIL_HARD);
 
     if needs_reset {
         // Discard all tx effects, then re-apply fee+sequence only
@@ -828,7 +845,7 @@ pub fn apply_tx(state: &mut LedgerState, tx: &ParsedTx, ctx: &TxContext) -> Appl
     // local amendment set.
     // During replay of validated ledgers, the network already accepted these txs.
     // Blocking them would cause hash divergence. The gate is informational only
-            // until ledgers are computed independently in validator mode.
+    // until ledgers are computed independently in validator mode.
     if let Some(hash) = required_amendment(tx.tx_type) {
         if !state.is_amendment_active(hash) {
             tracing::debug!(
@@ -2889,6 +2906,83 @@ mod tests {
                          // but it should NOT fail with temINVALID)
         let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
         assert_ne!(result.ter, ter::TEM_INVALID);
+    }
+
+    #[test]
+    fn run_tx_validated_replay_tec_offer_resets_to_fee_only() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_genesis(50_000_000);
+        let usd = Amount::Iou {
+            value: IouValue::from_f64(10.0),
+            currency: Currency::from_code("USD").unwrap(),
+            issuer: dest_id(),
+        };
+        let tx = sign_offer_create(1, usd, Amount::Xrp(100_000_000));
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::VALIDATED_REPLAY);
+        assert_eq!(result.ter, ter::TEC_UNFUNDED_OFFER);
+        assert!(result.applied, "validated tec replay must claim fee only");
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 50_000_000 - 12);
+        assert_eq!(sender.sequence, 2);
+        assert_eq!(sender.owner_count, 0);
+        assert_eq!(state.offers_by_account(&genesis_id()).len(), 0);
+    }
+
+    #[test]
+    fn run_tx_validated_replay_authoritative_tec_overrides_local_success() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_genesis(50_000_000);
+        let usd = Amount::Iou {
+            value: IouValue::from_f64(10.0),
+            currency: Currency::from_code("USD").unwrap(),
+            issuer: dest_id(),
+        };
+        let tx = sign_offer_create(1, usd, Amount::Xrp(500_000));
+        let ctx = TxContext {
+            validated_result: Some(ter::TEC_KILLED),
+            ..ctx(0)
+        };
+
+        let result = run_tx(&mut state, &tx, &ctx, ApplyFlags::VALIDATED_REPLAY);
+        assert_eq!(result.ter, ter::TEC_KILLED);
+        assert!(result.applied, "validated tec replay must claim fee only");
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 50_000_000 - 12);
+        assert_eq!(sender.sequence, 2);
+        assert_eq!(sender.owner_count, 0);
+        assert_eq!(state.offers_by_account(&genesis_id()).len(), 0);
+    }
+
+    #[test]
+    fn run_tx_nftoken_create_offer_missing_destination_claims_fee_only() {
+        let mut state = state_with_genesis(50_000_000);
+        let tx = ParsedTx {
+            tx_type: 27,
+            flags: 1,
+            sequence: 1,
+            fee: 12,
+            account: genesis_id(),
+            destination: Some(dest_id()),
+            amount: Some(Amount::Xrp(1_000)),
+            nftoken_id: Some([0xAB; 32]),
+            signing_pubkey: vec![0x02; 33],
+            ..ParsedTx::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEC_NO_DST);
+        assert!(result.applied, "tecNO_DST must still claim fee only");
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 50_000_000 - 12);
+        assert_eq!(sender.sequence, 2);
+        assert_eq!(sender.owner_count, 0);
+        assert!(state.iter_nft_offers().next().is_none());
     }
 
     fn ticket_create_tx(seq: u32, count: u32) -> ParsedTx {

@@ -1,13 +1,42 @@
 pub fn choose_sync_kickstart_target(
     inactive_target: Option<(u32, [u8; 32])>,
     latest_seq: u32,
-    latest_hash: [u8; 32],
-) -> (u32, [u8; 32], &'static str) {
+    latest_trusted_hash: Option<[u8; 32]>,
+    reachable_seq_only_target: Option<u32>,
+) -> (u32, Option<[u8; 32]>, &'static str) {
     if let Some((seq, hash)) = inactive_target {
-        (seq, hash, "fixed-target reacquire")
+        (seq, Some(hash), "fixed-target reacquire")
+    } else if let Some(hash) = latest_trusted_hash {
+        (latest_seq, Some(hash), "no syncer yet")
+    } else if let Some(seq) = reachable_seq_only_target {
+        (
+            seq,
+            None,
+            "no syncer yet (seq-only; using reachable peer latest)",
+        )
     } else {
-        (latest_seq, latest_hash, "no syncer yet")
+        (
+            latest_seq,
+            None,
+            "no syncer yet (seq-only; trusted hash unavailable)",
+        )
     }
+}
+
+pub fn choose_reachable_seq_only_target(
+    latest_seq: u32,
+    peer_ranges: &[(u32, u32)],
+) -> Option<u32> {
+    if peer_ranges.is_empty() {
+        return None;
+    }
+    if peer_ranges
+        .iter()
+        .any(|(first, last)| latest_seq >= *first && latest_seq <= *last)
+    {
+        return None;
+    }
+    peer_ranges.iter().map(|(_, last)| *last).max()
 }
 
 pub fn should_start_sync_from_header(
@@ -33,6 +62,13 @@ pub fn should_resume_from_sync_anchor(
         && has_sync_account_hash
         && (has_sync_ledger_hash || has_sync_ledger_header)
         && rehydrated_root
+}
+
+pub fn should_prefer_history_latest(
+    has_completed_sync: bool,
+    has_verified_resume_header: bool,
+) -> bool {
+    has_completed_sync && !has_verified_resume_header
 }
 
 fn root_missing_from_wire(
@@ -84,7 +120,10 @@ pub fn build_root_bootstrap_requests(
         for (_, hash) in chunk {
             syncer.peer.recent_nodes.insert(*hash);
         }
-        let node_ids: Vec<Vec<u8>> = chunk.iter().map(|(nid, _)| nid.to_wire().to_vec()).collect();
+        let node_ids: Vec<Vec<u8>> = chunk
+            .iter()
+            .map(|(nid, _)| nid.to_wire().to_vec())
+            .collect();
         reqs.push(crate::network::relay::encode_get_ledger_state(
             syncer.ledger_hash(),
             &node_ids,

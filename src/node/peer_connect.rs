@@ -30,12 +30,10 @@ impl Node {
             .unwrap_or_default()
             .as_secs();
         if !is_503 {
-            let _ = s.services.resource_manager.charge_addr(
-                addr,
-                4_000,
-                "handshake_failed",
-                now,
-            );
+            let _ = s
+                .services
+                .resource_manager
+                .charge_addr(addr, 4_000, "handshake_failed", now);
         }
         s.peers.remove(&id);
         s.peer_txs.remove(&id);
@@ -50,10 +48,8 @@ impl Node {
                     .on_failure(&slot, "handshake_failed", now_unix);
             }
         }
-        s.peer_cooldowns.insert(
-            addr,
-            now + std::time::Duration::from_secs(cooldown),
-        );
+        s.peer_cooldowns
+            .insert(addr, now + std::time::Duration::from_secs(cooldown));
         if is_503 {
             self.learn_redirect_peers(&mut s, addr, err_str);
         } else {
@@ -98,10 +94,11 @@ impl Node {
                         .note_redirect(redirect_from, addr, now_unix);
                     redirected = true;
                 } else {
-                    state
-                        .services
-                        .peerfinder
-                        .note_discovered(addr, format!("redirect:{redirect_from}"), now_unix);
+                    state.services.peerfinder.note_discovered(
+                        addr,
+                        format!("redirect:{redirect_from}"),
+                        now_unix,
+                    );
                 }
                 state.add_known_peer_with_source(addr, "redirect");
             } else if let Ok(ip_addr) = ip_str.parse::<std::net::IpAddr>() {
@@ -113,10 +110,11 @@ impl Node {
                         .note_redirect(redirect_from, addr, now_unix);
                     redirected = true;
                 } else {
-                    state
-                        .services
-                        .peerfinder
-                        .note_discovered(addr, format!("redirect:{redirect_from}"), now_unix);
+                    state.services.peerfinder.note_discovered(
+                        addr,
+                        format!("redirect:{redirect_from}"),
+                        now_unix,
+                    );
                 }
                 state.add_known_peer_with_source(addr, "redirect");
             }

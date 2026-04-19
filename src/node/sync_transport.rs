@@ -62,10 +62,7 @@ impl Node {
                         requested_seq,
                         hex::encode_upper(&requested_hash[..8]),
                     );
-                    return PeerEvent::MessageReceived(
-                        MessageType::GetLedger,
-                        msg.payload.clone(),
-                    );
+                    return PeerEvent::MessageReceived(MessageType::GetLedger, msg.payload.clone());
                 }
 
                 match req.itype {
@@ -102,7 +99,10 @@ impl Node {
                         let reply =
                             RtxpMessage::new(MessageType::LedgerData, response.encode_to_vec());
                         let _ = tx.try_send(reply);
-                        info!("served liBASE to {:?} (ledger {})", peer.id, header.sequence);
+                        info!(
+                            "served liBASE to {:?} (ledger {})",
+                            peer.id, header.sequence
+                        );
                     }
                     x if x == crate::proto::TmLedgerInfoType::LiTxNode as i32 => {
                         let tx_records = state
@@ -120,15 +120,9 @@ impl Node {
                         let mut tx_map = crate::ledger::shamap::SHAMap::new_transaction();
                         for rec in tx_records {
                             let mut data = Vec::with_capacity(rec.blob.len() + rec.meta.len() + 8);
-                            crate::transaction::serialize::encode_length(
-                                rec.blob.len(),
-                                &mut data,
-                            );
+                            crate::transaction::serialize::encode_length(rec.blob.len(), &mut data);
                             data.extend_from_slice(&rec.blob);
-                            crate::transaction::serialize::encode_length(
-                                rec.meta.len(),
-                                &mut data,
-                            );
+                            crate::transaction::serialize::encode_length(rec.meta.len(), &mut data);
                             data.extend_from_slice(&rec.meta);
                             tx_map.insert(crate::ledger::Key(rec.hash), data);
                         }
@@ -148,7 +142,10 @@ impl Node {
                             let reply =
                                 RtxpMessage::new(MessageType::LedgerData, response.encode_to_vec());
                             let _ = tx.try_send(reply);
-                            info!("served liTX_NODE to {:?} (ledger {})", peer.id, header.sequence);
+                            info!(
+                                "served liTX_NODE to {:?} (ledger {})",
+                                peer.id, header.sequence
+                            );
                         } else {
                             let reply = crate::network::relay::encode_ledger_data_error(
                                 &header.hash,
@@ -174,8 +171,11 @@ impl Node {
                         };
                         let query_depth = req.query_depth.unwrap_or(0);
                         let Some(mut requested_state_map) = ({
-                            let mut ls =
-                                state.ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut ls = state
+                                .ctx
+                                .ledger_state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             if is_current {
                                 Some(ls.peer_state_map_snapshot())
                             } else {
@@ -199,8 +199,11 @@ impl Node {
                                 msg.payload.clone(),
                             );
                         };
-                        let (nodes, invalid_node_ids) =
-                            collect_shamap_ledger_nodes(&mut requested_state_map, &node_ids, query_depth);
+                        let (nodes, invalid_node_ids) = collect_shamap_ledger_nodes(
+                            &mut requested_state_map,
+                            &node_ids,
+                            query_depth,
+                        );
 
                         if !nodes.is_empty() {
                             let response = crate::proto::TmLedgerData {
@@ -405,21 +408,9 @@ impl Node {
                                 verified_objects += 1;
                                 match backend.store(&key, &store_data) {
                                     Ok(()) => fallback.persisted += 1,
-                                    Err(err)
-                                        if err.kind() == std::io::ErrorKind::InvalidData =>
-                                    {
-                                        match backend.store_unchecked(&key, &store_data) {
-                                            Ok(()) => {
-                                                fallback.persisted += 1;
-                                                fallback.unchecked_fallbacks += 1;
-                                                fallback.last_error = Some(err.to_string());
-                                            }
-                                            Err(fallback_err) => {
-                                                fallback.persist_errors += 1;
-                                                fallback.last_error =
-                                                    Some(fallback_err.to_string());
-                                            }
-                                        }
+                                    Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                                        fallback.persist_errors += 1;
+                                        fallback.last_error = Some(err.to_string());
                                     }
                                     Err(err) => {
                                         fallback.persist_errors += 1;
@@ -437,15 +428,13 @@ impl Node {
                     if unchecked_fallbacks > 0 {
                         warn!(
                             "GetObjects import used {} unchecked fallback(s) for peer {:?}",
-                            unchecked_fallbacks,
-                            peer.id,
+                            unchecked_fallbacks, peer.id,
                         );
                     }
                     if store_errors > 0 {
                         warn!(
                             "GetObjects import saw {} persistence error(s) for peer {:?}",
-                            store_errors,
-                            peer.id,
+                            store_errors, peer.id,
                         );
                     } else if let Some(err) = import_result.last_error.as_ref() {
                         debug!("GetObjects import last error: {}", err);
@@ -558,10 +547,16 @@ impl Node {
                 .inbound_ledgers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let had_acquisition = guard.find(&hash).is_some();
             let routed = guard.got_tx_data(&hash, &ld.nodes);
-            if !routed && !ld.nodes.is_empty() {
-                warn!(
-                    "liTX_NODE dropped: no acquisition for hash={} seq={} nodes={} pending_acquisitions={}",
+            if !had_acquisition && !ld.nodes.is_empty() {
+                debug!(
+                    "liTX_NODE buffered before header/acquire: hash={} seq={} nodes={} pending_acquisitions={}",
+                    hex::encode_upper(&hash[..8]), ld.ledger_seq, ld.nodes.len(), guard.len(),
+                );
+            } else if !routed && !ld.nodes.is_empty() {
+                debug!(
+                    "liTX_NODE merged but acquisition still incomplete: hash={} seq={} nodes={} pending_acquisitions={}",
                     hex::encode_upper(&hash[..8]), ld.ledger_seq, ld.nodes.len(), guard.len(),
                 );
             }
@@ -574,19 +569,11 @@ impl Node {
                 continue;
             }
 
-            let is_inner = (data.len() == 512 || data.len() == 513)
-                || (data.len() >= 516
-                    && data[0] == 0x4D
-                    && data[1] == 0x49
-                    && data[2] == 0x4E
-                    && data[3] == 0x00);
-
-            if is_inner {
-                continue;
-            }
-
             let wire_type = data[data.len() - 1];
             let payload = &data[..data.len() - 1];
+            if wire_type == 0x02 || wire_type == 0x03 {
+                continue;
+            }
 
             if wire_type == 0x04 && payload.len() > 32 {
                 let item_data = &payload[..payload.len() - 32];

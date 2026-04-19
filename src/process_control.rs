@@ -73,9 +73,8 @@ pub fn install_pid_guard_if_needed(
     }
 
     if let Some(parent) = files.pid_file.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create pid file directory {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create pid file directory {}", parent.display()))?;
     }
 
     if let Some(pid) = read_pid(&files.pid_file)? {
@@ -89,9 +88,8 @@ pub fn install_pid_guard_if_needed(
         let _ = fs::remove_file(&files.pid_file);
     }
 
-    fs::write(&files.pid_file, format!("{}\n", std::process::id())).with_context(|| {
-        format!("failed to write pid file {}", files.pid_file.display())
-    })?;
+    fs::write(&files.pid_file, format!("{}\n", std::process::id()))
+        .with_context(|| format!("failed to write pid file {}", files.pid_file.display()))?;
 
     Ok(Some(PidFileGuard {
         path: files.pid_file.clone(),
@@ -146,21 +144,20 @@ fn start_process(files: &ControlFiles) -> Result<()> {
     }
 
     if let Some(parent) = files.log_file.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create log file directory {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log file directory {}", parent.display()))?;
     }
     if let Some(parent) = files.pid_file.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create pid file directory {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create pid file directory {}", parent.display()))?;
     }
 
     let log_file = open_log_file(&files.log_file)?;
     let log_file_err = log_file
         .try_clone()
         .with_context(|| format!("failed to clone log handle {}", files.log_file.display()))?;
-    let mut command = Command::new(std::env::current_exe().context("failed to locate xledgrs executable")?);
+    let mut command =
+        Command::new(std::env::current_exe().context("failed to locate xledgrs executable")?);
     command
         .args(filtered_child_args())
         .arg("--daemon-child")
@@ -176,9 +173,14 @@ fn start_process(files: &ControlFiles) -> Result<()> {
         });
     }
 
-    let mut child = command.spawn().context("failed to spawn detached xledgrs")?;
+    let mut child = command
+        .spawn()
+        .context("failed to spawn detached xledgrs")?;
     std::thread::sleep(Duration::from_millis(500));
-    if let Some(status) = child.try_wait().context("failed to poll detached xledgrs")? {
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to poll detached xledgrs")?
+    {
         bail!(
             "xledgrs exited early with status {}. Check {}",
             status,
@@ -197,7 +199,10 @@ fn start_process(files: &ControlFiles) -> Result<()> {
 
 fn stop_process(files: &ControlFiles) -> Result<()> {
     let Some(pid) = read_pid(&files.pid_file)? else {
-        println!("xledgrs is not running (no pid file at {})", files.pid_file.display());
+        println!(
+            "xledgrs is not running (no pid file at {})",
+            files.pid_file.display()
+        );
         return Ok(());
     };
 
@@ -364,8 +369,7 @@ mod tests {
             let mut filtered = Vec::new();
             let mut iter = args.into_iter().skip(1).peekable();
             while let Some(arg) = iter.next() {
-                if arg == "--start" || arg == "--stop" || arg == "--restart" || arg == "--status"
-                {
+                if arg == "--start" || arg == "--stop" || arg == "--restart" || arg == "--status" {
                     continue;
                 }
                 if arg == "--pid-file" || arg == "--log-file" {

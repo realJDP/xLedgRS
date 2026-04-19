@@ -32,6 +32,10 @@ impl Node {
         &self,
         sync_header: &crate::ledger::LedgerHeader,
     ) -> bool {
+        const ANCHOR_REQUEST_PEERS: usize = 8;
+        const ANCHOR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+        const ANCHOR_ACQUIRE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
         {
             let mut state = self.state.write().await;
             state.pending_sync_anchor = Some((sync_header.sequence, sync_header.hash));
@@ -52,42 +56,89 @@ impl Node {
                 rx
             };
 
-            let (sent_base, sent_tx) = {
-                let cookie_base = crate::sync::next_cookie();
-                let base_req =
-                    crate::network::relay::encode_get_ledger_base(&sync_header.hash, cookie_base);
-                let tx_req = crate::network::relay::encode_get_ledger_txs_for_hash(
-                    &sync_header.hash,
-                    crate::sync::next_cookie(),
-                );
-                let mut state = self.state.write().await;
-                let sent_base = state.send_to_peers_with_ledger(&base_req, sync_header.sequence, 3);
-                let sent_tx = if sync_header.transaction_hash == [0u8; 32] {
-                    0
-                } else {
-                    state.send_to_peers_with_ledger(&tx_req, sync_header.sequence, 3)
-                };
-                (sent_base, sent_tx)
-            };
-            info!(
-                "sync anchor acquisition: requesting seq={} hash={} base_peers={} tx_peers={}",
-                sync_header.sequence,
-                hex::encode_upper(&sync_header.hash[..8]),
-                sent_base,
-                sent_tx,
-            );
-
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+            let deadline = tokio::time::Instant::now() + ANCHOR_ACQUIRE_DEADLINE;
+            let mut attempt = 0u32;
             loop {
+                let (sent_base, sent_tx, missing_tx_nodes) = {
+                    let missing_tx_nodes = {
+                        let guard = self
+                            .inbound_ledgers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        guard.missing_tx_node_ids(&sync_header.hash, 64)
+                    };
+                    let cookie_base = crate::sync::next_cookie();
+                    let base_req = crate::network::relay::encode_get_ledger_base(
+                        &sync_header.hash,
+                        cookie_base,
+                    );
+                    let use_root_tx_request = missing_tx_nodes.is_empty()
+                        || missing_tx_nodes
+                            == vec![crate::ledger::shamap_id::SHAMapNodeID::root()
+                                .to_wire()
+                                .to_vec()];
+                    let tx_req = if use_root_tx_request {
+                        crate::network::relay::encode_get_ledger_txs_for_hash(
+                            &sync_header.hash,
+                            crate::sync::next_cookie(),
+                        )
+                    } else {
+                        crate::network::relay::encode_get_ledger_txs_for_hash_nodes(
+                            &sync_header.hash,
+                            &missing_tx_nodes,
+                            crate::sync::next_cookie(),
+                        )
+                    };
+                    let mut state = self.state.write().await;
+                    let sent_base = state.send_to_peers_with_ledger(
+                        &base_req,
+                        sync_header.sequence,
+                        ANCHOR_REQUEST_PEERS,
+                    );
+                    let sent_tx = if sync_header.transaction_hash == [0u8; 32] {
+                        0
+                    } else {
+                            state.send_to_peers_with_ledger(
+                                &tx_req,
+                                sync_header.sequence,
+                                ANCHOR_REQUEST_PEERS,
+                            )
+                    };
+                    (sent_base, sent_tx, missing_tx_nodes.len())
+                };
+                if attempt == 0 {
+                    info!(
+                        "sync anchor acquisition: requesting seq={} hash={} base_peers={} tx_peers={} missing_tx_nodes={}",
+                        sync_header.sequence,
+                        hex::encode_upper(&sync_header.hash[..8]),
+                        sent_base,
+                        sent_tx,
+                        missing_tx_nodes,
+                    );
+                } else {
+                    info!(
+                        "sync anchor acquisition retry #{}: seq={} hash={} base_peers={} tx_peers={} missing_tx_nodes={}",
+                        attempt,
+                        sync_header.sequence,
+                        hex::encode_upper(&sync_header.hash[..8]),
+                        sent_base,
+                        sent_tx,
+                        missing_tx_nodes,
+                    );
+                }
+
                 if *watch_rx.borrow() {
                     break;
                 }
-                match tokio::time::timeout_at(deadline, watch_rx.changed()).await {
+                let next_wait = (tokio::time::Instant::now() + ANCHOR_RETRY_INTERVAL).min(deadline);
+                attempt = attempt.saturating_add(1);
+                match tokio::time::timeout_at(next_wait, watch_rx.changed()).await {
                     Ok(Ok(())) => {
                         if *watch_rx.borrow() {
                             break;
                         }
                     }
+                    Err(_) if tokio::time::Instant::now() < deadline => continue,
                     _ => break,
                 }
             }
@@ -102,7 +153,7 @@ impl Node {
                 result
             };
 
-            let Some((header, tx_blobs)) = result else {
+            let Some((header, tx_blobs, acquired_tx_root)) = result else {
                 warn!(
                     "sync anchor acquisition incomplete for seq={} hash={}",
                     sync_header.sequence,
@@ -122,7 +173,7 @@ impl Node {
                 return false;
             }
 
-            let tx_root = compute_acquired_tx_root(&tx_blobs);
+            let tx_root = acquired_tx_root.unwrap_or_else(|| compute_acquired_tx_root(&tx_blobs));
             if tx_root != sync_header.transaction_hash {
                 warn!(
                     "sync anchor tx hash mismatch: seq={} expected={} got={} txs={}",
@@ -187,6 +238,10 @@ impl Node {
             let _ = store.clear_sync_handoff();
         }
 
+        if let Some(ref backend) = self.nudb_backend {
+            backend.clear_in_memory();
+        }
+
         {
             let mut state = self.state.write().await;
             state.sync_done = false;
@@ -197,10 +252,7 @@ impl Node {
         info!("trigger_resync: sync state cleared — will re-sync to current validated ledger");
     }
 
-    pub(super) async fn run_post_sync_checkpoint(
-        &self,
-        sync_header: &crate::ledger::LedgerHeader,
-    ) {
+    pub(super) async fn run_post_sync_checkpoint(&self, sync_header: &crate::ledger::LedgerHeader) {
         let Some(script) = self.config.post_sync_checkpoint_script.clone() else {
             return;
         };

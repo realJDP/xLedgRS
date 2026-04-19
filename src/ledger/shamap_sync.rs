@@ -13,8 +13,8 @@ use std::sync::Arc;
 use crate::crypto::sha512_first_half;
 use crate::ledger::full_below_cache::FullBelowCache;
 use crate::ledger::node_store::NodeStore;
-use crate::ledger::shamap::{PREFIX_INNER_NODE, PREFIX_LEAF_STATE, PREFIX_LEAF_TX};
 use crate::ledger::shamap::{InnerNode, Key, LeafNode, MapType, Node};
+use crate::ledger::shamap::{PREFIX_INNER_NODE, PREFIX_LEAF_STATE, PREFIX_LEAF_TX};
 use crate::ledger::shamap_id::SHAMapNodeID;
 
 /// Result of adding a known node.
@@ -42,6 +42,8 @@ enum StoredNode {
 // ── Wire format constants ───────────────────────────────────────────────────
 
 const WIRE_LEAF_ACCOUNT_STATE: u8 = 0x01;
+const WIRE_LEAF_TRANSACTION: u8 = 0x00;
+const WIRE_LEAF_TRANSACTION_WITH_META: u8 = 0x04;
 const WIRE_INNER_FULL: u8 = 0x02;
 const WIRE_INNER_COMPRESSED: u8 = 0x03;
 
@@ -336,6 +338,7 @@ pub(crate) fn get_missing_nodes_report(
                                                 "shamap sync cached stub failed typed decode for child {}",
                                                 hex::encode_upper(&content_hash[..8]),
                                             );
+                                            be.mark_corrupt(content_hash);
                                             report.backend_fetch_errors += 1;
                                             report.missing.push((child_id, *content_hash));
                                             full_below_flag = false;
@@ -399,6 +402,7 @@ pub(crate) fn get_missing_nodes_report(
                                                 "shamap sync typed decode failed for child {}",
                                                 hex::encode_upper(&child_hash[..8]),
                                             );
+                                            be.mark_corrupt(&child_hash);
                                             report.backend_fetch_errors += 1;
                                             report.missing.push((child_id, child_hash));
                                             full_below_flag = false;
@@ -526,7 +530,7 @@ fn parse_wire_node(data: &[u8], wire_type: u8, _map_type: MapType) -> Option<Nod
             inner.dirty = false;
             Some(Node::Inner(inner))
         }
-        WIRE_LEAF_ACCOUNT_STATE => {
+        WIRE_LEAF_TRANSACTION | WIRE_LEAF_TRANSACTION_WITH_META | WIRE_LEAF_ACCOUNT_STATE => {
             if data.len() <= 32 {
                 return None;
             }
@@ -614,23 +618,22 @@ fn deserialize_inner_from_store(data: &[u8]) -> Option<InnerNode> {
 }
 
 fn decode_validated_store_node(expected_hash: &[u8; 32], data: &[u8]) -> Option<StoredNode> {
+    let mut inner_hash = None;
     if data.len() == 16 * 32 {
         let mut inner = deserialize_inner_from_store(data)?;
         let mut payload = Vec::with_capacity(PREFIX_INNER_NODE.len() + data.len());
         payload.extend_from_slice(&PREFIX_INNER_NODE);
         payload.extend_from_slice(data);
         let computed = sha512_first_half(&payload);
-        if computed != *expected_hash {
-            tracing::warn!(
-                "shamap sync backend inner node hash mismatch: expected={} computed={}",
-                hex::encode_upper(&expected_hash[..8]),
-                hex::encode_upper(&computed[..8]),
-            );
-            return None;
+        if computed == *expected_hash {
+            inner.cached_hash = Some(computed);
+            inner.dirty = false;
+            return Some(StoredNode::Inner(inner));
         }
-        inner.cached_hash = Some(computed);
-        inner.dirty = false;
-        return Some(StoredNode::Inner(inner));
+        // A persisted leaf can also be exactly 512 bytes long (480-byte payload
+        // plus the 32-byte key). Fall through and validate the leaf forms
+        // before rejecting the backend row.
+        inner_hash = Some(computed);
     }
 
     if data.len() < 32 {
@@ -669,12 +672,41 @@ fn decode_validated_store_node(expected_hash: &[u8; 32], data: &[u8]) -> Option<
     tx_payload.extend_from_slice(&stored_key);
     let tx_hash = sha512_first_half(&tx_payload);
 
-    tracing::warn!(
-        "shamap sync backend leaf hash mismatch: expected={} state={} tx={}",
-        hex::encode_upper(&expected_hash[..8]),
-        hex::encode_upper(&state_hash[..8]),
-        hex::encode_upper(&tx_hash[..8]),
-    );
+    if data.len() >= 33 {
+        let wire_type = data[data.len() - 1];
+        let prefix = match wire_type {
+            WIRE_LEAF_ACCOUNT_STATE => Some(&PREFIX_LEAF_STATE),
+            WIRE_LEAF_TRANSACTION | WIRE_LEAF_TRANSACTION_WITH_META => Some(&PREFIX_LEAF_TX),
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            let payload_end = data.len() - 33;
+            let mut wire_key = [0u8; 32];
+            wire_key.copy_from_slice(&data[payload_end..data.len() - 1]);
+            let wire_leaf =
+                build_validated_leaf(&Key(wire_key), &data[..payload_end], prefix, expected_hash);
+            if wire_leaf.is_some() {
+                return Some(StoredNode::Leaf);
+            }
+        }
+    }
+
+    if let Some(inner_hash) = inner_hash {
+        tracing::warn!(
+            "shamap sync backend 512-byte object hash mismatch: expected={} inner={} state={} tx={}",
+            hex::encode_upper(&expected_hash[..8]),
+            hex::encode_upper(&inner_hash[..8]),
+            hex::encode_upper(&state_hash[..8]),
+            hex::encode_upper(&tx_hash[..8]),
+        );
+    } else {
+        tracing::warn!(
+            "shamap sync backend leaf hash mismatch: expected={} state={} tx={}",
+            hex::encode_upper(&expected_hash[..8]),
+            hex::encode_upper(&state_hash[..8]),
+            hex::encode_upper(&tx_hash[..8]),
+        );
+    }
     None
 }
 
@@ -982,7 +1014,9 @@ mod tests {
             panic!("expected reusable wire node");
         };
         store_data[0] ^= 0xFF;
-        store.store(&expected_hash, &store_data).expect("store corrupt row");
+        store
+            .store(&expected_hash, &store_data)
+            .expect("store corrupt row");
 
         root.children[2] = Some(Box::new(Node::Stub {
             key: Key(key),
@@ -995,5 +1029,70 @@ mod tests {
         assert_eq!(report.missing.len(), 1);
         assert_eq!(report.missing[0].1, expected_hash);
         assert_eq!(report.backend_fetch_errors, 1);
+    }
+
+    #[test]
+    fn exact_512_byte_leaf_in_backend_is_not_misclassified_as_inner() {
+        let store: Arc<dyn NodeStore> = Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let mut root = InnerNode::new();
+        let mut fb = FullBelowCache::new(1000);
+
+        let key = [0xCD; 32];
+        let leaf_data = vec![0x5A; 480];
+        let wire = make_leaf_wire(key, &leaf_data);
+        let Some((expected_hash, store_data)) =
+            prepare_wire_node_for_reuse(&wire, MapType::AccountState).unwrap()
+        else {
+            panic!("expected reusable 512-byte leaf");
+        };
+        assert_eq!(
+            store_data.len(),
+            16 * 32,
+            "fixture must be exactly 512 bytes"
+        );
+
+        store
+            .store(&expected_hash, &store_data)
+            .expect("store exact-size leaf");
+        root.set_child_hash(6, expected_hash);
+
+        let report =
+            get_missing_nodes_report(&mut root, 256, MapType::AccountState, Some(&store), &mut fb);
+        assert!(
+            report.missing.is_empty(),
+            "exact-size leaf should be satisfied from backend"
+        );
+        assert_eq!(report.backend_fetch_errors, 0);
+    }
+
+    #[test]
+    fn exact_512_byte_wire_leaf_in_backend_is_not_misclassified_as_inner() {
+        let store: Arc<dyn NodeStore> = Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let mut root = InnerNode::new();
+        let mut fb = FullBelowCache::new(1000);
+
+        let key = [0xCE; 32];
+        let leaf_data = vec![0x5B; 479];
+        let wire = make_leaf_wire(key, &leaf_data);
+        assert_eq!(wire.len(), 16 * 32, "fixture must be exactly 512 bytes");
+
+        let mut payload = Vec::with_capacity(4 + leaf_data.len() + 32);
+        payload.extend_from_slice(&crate::ledger::shamap::PREFIX_LEAF_STATE);
+        payload.extend_from_slice(&leaf_data);
+        payload.extend_from_slice(&key);
+        let expected_hash = crate::crypto::sha512_first_half(&payload);
+
+        store
+            .store(&expected_hash, &wire)
+            .expect("store wire leaf row");
+        root.set_child_hash(7, expected_hash);
+
+        let report =
+            get_missing_nodes_report(&mut root, 256, MapType::AccountState, Some(&store), &mut fb);
+        assert!(
+            report.missing.is_empty(),
+            "wire-format exact-size leaf should be satisfied from backend"
+        );
+        assert_eq!(report.backend_fetch_errors, 0);
     }
 }

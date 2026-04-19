@@ -40,12 +40,6 @@ impl Node {
         } else {
             s.services.peerfinder.note_closed(addr, now_unix);
         }
-        if !peer_reserved && !addr.ip().is_loopback() {
-            s.peer_cooldowns.insert(
-                addr,
-                std::time::Instant::now() + std::time::Duration::from_secs(130),
-            );
-        }
         s.refresh_runtime_health(std::time::Instant::now());
         peer_reserved
     }

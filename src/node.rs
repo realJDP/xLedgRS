@@ -24,80 +24,80 @@ use crate::tls::OpenSslConfig;
 
 #[path = "node/close_loop.rs"]
 mod close_loop;
-#[path = "node/peer_handshake.rs"]
-mod peer_handshake;
-#[path = "node/peer_policy.rs"]
-mod peer_policy;
+#[path = "node/consensus_control.rs"]
+mod consensus_control;
+#[path = "node/http_io.rs"]
+mod http_io;
+#[path = "node/init.rs"]
+mod init;
+#[path = "node/legacy_sync.rs"]
+mod legacy_sync;
+#[path = "node/load_manager.rs"]
+mod load_manager;
+#[path = "node/message_router.rs"]
+mod message_router;
 #[path = "node/peer_connect.rs"]
 mod peer_connect;
+#[path = "node/peer_control.rs"]
+mod peer_control;
+#[path = "node/peer_disconnect.rs"]
+mod peer_disconnect;
+#[path = "node/peer_discovery.rs"]
+mod peer_discovery;
+#[path = "node/peer_handshake.rs"]
+mod peer_handshake;
+#[path = "node/peer_io.rs"]
+mod peer_io;
+#[path = "node/peer_policy.rs"]
+mod peer_policy;
 #[path = "node/peer_read.rs"]
 mod peer_read;
 #[path = "node/peer_session.rs"]
 mod peer_session;
-#[path = "node/peer_io.rs"]
-mod peer_io;
-#[path = "node/http_io.rs"]
-mod http_io;
 #[path = "node/protocol_helpers.rs"]
 mod protocol_helpers;
-#[path = "node/peer_control.rs"]
-mod peer_control;
-#[path = "node/tx_ingress.rs"]
-mod tx_ingress;
-#[path = "node/peer_disconnect.rs"]
-mod peer_disconnect;
-#[path = "node/sync_transport.rs"]
-mod sync_transport;
-#[path = "node/sync_ingress.rs"]
-mod sync_ingress;
-#[path = "node/consensus_control.rs"]
-mod consensus_control;
-#[path = "node/legacy_sync.rs"]
-mod legacy_sync;
-#[path = "node/sync_lifecycle.rs"]
-mod sync_lifecycle;
-#[path = "node/peer_discovery.rs"]
-mod peer_discovery;
-#[path = "node/init.rs"]
-mod init;
-#[path = "node/startup.rs"]
-mod startup;
-#[path = "node/sync_timer.rs"]
-mod sync_timer;
-#[path = "node/sync_data.rs"]
-mod sync_data;
-#[path = "node/sync_mesh.rs"]
-mod sync_mesh;
-#[path = "node/sync_helpers.rs"]
-mod sync_helpers;
+#[path = "node/resource_manager.rs"]
+mod resource_manager;
 #[path = "node/rpc_server.rs"]
 mod rpc_server;
-#[path = "node/message_router.rs"]
-mod message_router;
+#[path = "node/runtime_helpers.rs"]
+mod runtime_helpers;
 #[path = "node/runtime_snapshots.rs"]
 mod runtime_snapshots;
 #[path = "node/shared_state.rs"]
 mod shared_state;
-#[path = "node/runtime_helpers.rs"]
-mod runtime_helpers;
-#[path = "node/load_manager.rs"]
-mod load_manager;
-#[path = "node/resource_manager.rs"]
-mod resource_manager;
+#[path = "node/startup.rs"]
+mod startup;
+#[path = "node/sync_data.rs"]
+mod sync_data;
+#[path = "node/sync_helpers.rs"]
+mod sync_helpers;
+#[path = "node/sync_ingress.rs"]
+mod sync_ingress;
+#[path = "node/sync_lifecycle.rs"]
+mod sync_lifecycle;
+#[path = "node/sync_mesh.rs"]
+mod sync_mesh;
+#[path = "node/sync_timer.rs"]
+mod sync_timer;
+#[path = "node/sync_transport.rs"]
+mod sync_transport;
+#[path = "node/tx_ingress.rs"]
+mod tx_ingress;
 
-use sync_helpers::{
-    build_li_base_nodes, compute_acquired_tx_root, is_pending_sync_anchor,
-    plan_sync_completion_outcome, resolve_get_ledger_header, should_issue_reply_followup,
-    tune_sync_request_for_peer_latency,
-};
+#[cfg(test)]
+use peer_policy::peer_reservation_headroom;
 use peer_policy::{peer_is_reserved, peer_reservation_description, peer_reservations_map};
 use protocol_helpers::{
     collect_shamap_ledger_nodes, encode_ledger_base_header_bytes, node_event_label,
     node_status_label, parse_host_port, requested_get_ledger_hash, should_close_ledger,
     transaction_accounts_from_blob,
 };
-#[cfg(test)]
-use peer_policy::peer_reservation_headroom;
+use sync_helpers::{
+    build_li_base_nodes, compute_acquired_tx_root, is_pending_sync_anchor,
+    plan_sync_completion_outcome, resolve_get_ledger_header, should_issue_reply_followup,
+    tune_sync_request_for_peer_latency,
+};
 #[cfg(test)]
 use sync_helpers::{should_use_timeout_object_fallback, sync_gate_accepts_response};
 
@@ -162,6 +162,9 @@ pub struct NodeConfig {
     /// Base58-encoded validation seed. When set, the node becomes a validator
     /// and signs proposals/validations with the derived key instead of node_key.
     pub validation_seed: Option<String>,
+    /// Base64-encoded rippled validator token. When present, the validator
+    /// signing key is derived from the token payload.
+    pub validator_token: Option<String>,
 }
 
 impl NodeConfig {
@@ -199,6 +202,7 @@ impl Default for NodeConfig {
             enable_consensus_close_loop: false,
             post_sync_checkpoint_script: None,
             validation_seed: None,
+            validator_token: None,
         }
     }
 }
@@ -276,8 +280,7 @@ pub struct SharedState {
     validated_hash_order: std::collections::VecDeque<u32>,
 }
 
-impl SharedState {
-}
+impl SharedState {}
 
 // ── Node ──────────────────────────────────────────────────────────────────────
 
@@ -339,10 +342,9 @@ impl Node {}
 #[cfg(test)]
 mod tests {
     use super::{
-        http_io, is_pending_sync_anchor, peer_is_reserved,
-        peer_reservation_headroom, plan_sync_completion_outcome, sync_mesh,
-        should_close_ledger, should_issue_reply_followup, should_use_timeout_object_fallback,
-        sync_gate_accepts_response,
+        http_io, is_pending_sync_anchor, peer_is_reserved, peer_reservation_headroom,
+        plan_sync_completion_outcome, should_close_ledger, should_issue_reply_followup,
+        should_use_timeout_object_fallback, sync_gate_accepts_response, sync_mesh,
         tune_sync_request_for_peer_latency, Node, NodeConfig, SharedState, TriggerReason,
     };
     use crate::network::message::{MessageType, RtxpMessage};
@@ -459,8 +461,7 @@ mod tests {
         let master = crate::crypto::keys::Secp256k1KeyPair::generate();
         let signing = crate::crypto::keys::Secp256k1KeyPair::generate();
         let manifest = crate::consensus::Manifest::new_signed(1, &master, &signing);
-        let msg =
-            crate::network::relay::encode_manifests(&[manifest.clone(), manifest.clone()]);
+        let msg = crate::network::relay::encode_manifests(&[manifest.clone(), manifest.clone()]);
 
         let _ = node.handle_manifests_message(&source_peer, &msg).await;
 
@@ -525,8 +526,7 @@ mod tests {
         let signing2 = crate::crypto::keys::Secp256k1KeyPair::generate();
         let manifest1 = crate::consensus::Manifest::new_signed(1, &master, &signing1);
         let manifest2 = crate::consensus::Manifest::new_signed(2, &master, &signing2);
-        let msg =
-            crate::network::relay::encode_manifests(&[manifest1.clone(), manifest2.clone()]);
+        let msg = crate::network::relay::encode_manifests(&[manifest1.clone(), manifest2.clone()]);
 
         let _ = node.handle_manifests_message(&source_peer, &msg).await;
 
@@ -627,11 +627,174 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
 
-        let relayed = relay_rx.try_recv().expect("first manifest batch should relay");
+        let relayed = relay_rx
+            .try_recv()
+            .expect("first manifest batch should relay");
         let decoded = crate::network::relay::decode_manifests(&relayed.payload);
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].sequence, manifest.sequence);
         assert!(relay_rx.try_recv().is_err());
+    }
+
+    fn test_validation_message(ledger_seq: u32, ledger_hash: [u8; 32]) -> RtxpMessage {
+        use prost::Message as _;
+
+        let pubkey = vec![0xED; 33];
+        let sig = vec![0xAA; 72];
+        let sign_time: u32 = 1_712_000_000;
+
+        let mut blob = Vec::new();
+        blob.push(0x22);
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        blob.push(0x26);
+        blob.extend_from_slice(&ledger_seq.to_be_bytes());
+        blob.push(0x29);
+        blob.extend_from_slice(&sign_time.to_be_bytes());
+        blob.push(0x51);
+        blob.extend_from_slice(&ledger_hash);
+        blob.push(0x73);
+        blob.push(pubkey.len() as u8);
+        blob.extend_from_slice(&pubkey);
+        blob.push(0x76);
+        blob.push(sig.len() as u8);
+        blob.extend_from_slice(&sig);
+
+        let pb = crate::proto::TmValidation {
+            validation: blob,
+            ..Default::default()
+        };
+        RtxpMessage::new(MessageType::Validation, pb.encode_to_vec())
+    }
+
+    fn test_signed_validation_message(
+        kp: &crate::crypto::keys::Secp256k1KeyPair,
+        ledger_seq: u32,
+        ledger_hash: [u8; 32],
+    ) -> RtxpMessage {
+        use prost::Message as _;
+
+        let sign_time: u32 = 1_712_000_000;
+        let validation =
+            crate::consensus::Validation::new_signed(ledger_seq, ledger_hash, sign_time, true, kp);
+        let pb = crate::proto::TmValidation {
+            validation: validation.to_bytes(),
+            ..Default::default()
+        };
+        RtxpMessage::new(MessageType::Validation, pb.encode_to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_implausible_untrusted_validation_does_not_bench_peer_while_syncing() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let peer = Peer::new(PeerId(1), addr, Direction::Inbound, consumer);
+        let msg = test_validation_message(100_000, [0xAB; 32]);
+
+        {
+            let mut state = node.state.write().await;
+            state.sync_done = false;
+            state.peer_addrs.insert(peer.id, addr);
+            state.peer_ledger_range.insert(peer.id, (99_500, 100_500));
+            state
+                .peer_ledger_range
+                .insert(PeerId(99), (300_000, 300_500));
+        }
+
+        let _ = node.handle_validation_message(&peer, &msg).await;
+
+        let state = node.state.read().await;
+        assert!(
+            !state.sync_peer_cooldown.contains_key(&peer.id),
+            "syncing node should not bench a peer for untrusted implausible validations"
+        );
+        assert!(
+            !state.peer_cooldowns.contains_key(&addr),
+            "syncing node should not dial-cooldown the peer address for untrusted implausible validations"
+        );
+        assert!(
+            !state.implausible_validation_state.contains_key(&peer.id),
+            "syncing node should not accumulate implausible-validation repeat state for untrusted traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_implausible_validation_does_not_bench_peer_after_sync() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let peer = Peer::new(PeerId(1), addr, Direction::Inbound, consumer);
+        let msg = test_validation_message(100_000, [0xAB; 32]);
+
+        {
+            let mut state = node.state.write().await;
+            state.sync_done = true;
+            state.peer_addrs.insert(peer.id, addr);
+            state.peer_ledger_range.insert(peer.id, (99_500, 100_500));
+            state
+                .peer_ledger_range
+                .insert(PeerId(99), (300_000, 300_500));
+        }
+
+        for _ in 0..10 {
+            let _ = node.handle_validation_message(&peer, &msg).await;
+        }
+
+        let state = node.state.read().await;
+        assert!(
+            !state.sync_peer_cooldown.contains_key(&peer.id),
+            "relayed validations should not bench the transport peer after sync"
+        );
+        assert!(
+            !state.peer_cooldowns.contains_key(&addr),
+            "relayed validations should not dial-cooldown the peer address after sync"
+        );
+        assert!(
+            !state.implausible_validation_state.contains_key(&peer.id),
+            "relay-level implausibility tracking should not poison a peer after sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_validation_advances_tracking_without_current_round() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let validator = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let peer = Peer::new(PeerId(1), addr, Direction::Inbound, consumer);
+        let ledger_hash = [0xCD; 32];
+        let msg = test_signed_validation_message(&validator, 300_000, ledger_hash);
+
+        node.unl
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(validator.public_key_bytes());
+
+        {
+            let mut state = node.state.write().await;
+            state.sync_done = true;
+            state.peer_addrs.insert(peer.id, addr);
+            state.peer_ledger_range.insert(peer.id, (99_500, 100_500));
+            state
+                .peer_ledger_range
+                .insert(PeerId(99), (300_000, 300_500));
+            state.ctx.ledger_seq = 100_000;
+            state.ctx.ledger_hash = hex::encode_upper([0xAB; 32]);
+            state.current_round = None;
+        }
+
+        let _ = node.handle_validation_message(&peer, &msg).await;
+
+        let state = node.state.read().await;
+        assert_eq!(state.ctx.ledger_seq, 300_000);
+        assert_eq!(state.ctx.ledger_hash, hex::encode_upper(ledger_hash));
+        assert!(
+            !state.sync_peer_cooldown.contains_key(&peer.id),
+            "trusted relayed validations should advance tracking without benching the peer"
+        );
     }
 
     #[test]
@@ -801,6 +964,32 @@ mod tests {
         assert!(selected.contains(&PeerId(2)));
         assert!(selected.contains(&PeerId(3)));
         assert!(!selected.contains(&PeerId(1)));
+    }
+
+    #[test]
+    fn test_select_timeout_sync_peers_backfills_from_broader_mesh() {
+        let node = Node::new(NodeConfig::default());
+        let mut state = SharedState::new(crate::rpc::NodeContext::default());
+
+        for id in 1..=4 {
+            let peer = PeerId(id);
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            state.peer_txs.insert(peer, tx);
+            state.peer_ledger_range.insert(peer, (1, 10));
+            state.peers.insert(peer, PeerState::Active);
+            state.peer_sync_useful.insert(peer, (100 - id) as u32);
+        }
+
+        let now = std::time::Instant::now();
+        state
+            .peer_sync_last_useful
+            .insert(PeerId(2), now - std::time::Duration::from_secs(5));
+
+        let selected = node.select_timeout_sync_peers(&state, 5, 3);
+        assert_eq!(selected.len(), 3);
+        assert!(selected.contains(&PeerId(2)));
+        assert!(selected.contains(&PeerId(1)));
+        assert!(selected.contains(&PeerId(3)));
     }
 
     #[test]
@@ -977,9 +1166,14 @@ mod tests {
     #[test]
     fn test_fixed_target_sync_reacquires_immediately_after_failure() {
         let inactive = Some((777, [0xAB; 32]));
-        let (seq, hash, reason) = crate::sync_bootstrap::choose_sync_kickstart_target(inactive, 900, [0xCD; 32]);
+        let (seq, hash, reason) = crate::sync_bootstrap::choose_sync_kickstart_target(
+            inactive,
+            900,
+            Some([0xCD; 32]),
+            None,
+        );
         assert_eq!(seq, 777);
-        assert_eq!(hash, [0xAB; 32]);
+        assert_eq!(hash, Some([0xAB; 32]));
         assert_eq!(reason, "fixed-target reacquire");
     }
 
@@ -1024,12 +1218,60 @@ mod tests {
         let latest_hash = [0x11; 32];
         let fixed_hash = [0xAB; 32];
         assert_eq!(
-            crate::sync_bootstrap::choose_sync_kickstart_target(Some((123, fixed_hash)), 456, latest_hash),
-            (123, fixed_hash, "fixed-target reacquire"),
+            crate::sync_bootstrap::choose_sync_kickstart_target(
+                Some((123, fixed_hash)),
+                456,
+                Some(latest_hash),
+                None,
+            ),
+            (123, Some(fixed_hash), "fixed-target reacquire"),
         );
         assert_eq!(
-            crate::sync_bootstrap::choose_sync_kickstart_target(None, 456, latest_hash),
-            (456, latest_hash, "no syncer yet"),
+            crate::sync_bootstrap::choose_sync_kickstart_target(
+                None,
+                456,
+                Some(latest_hash),
+                None,
+            ),
+            (456, Some(latest_hash), "no syncer yet"),
+        );
+        assert_eq!(
+            crate::sync_bootstrap::choose_sync_kickstart_target(None, 456, None, Some(789)),
+            (
+                789,
+                None,
+                "no syncer yet (seq-only; using reachable peer latest)"
+            ),
+        );
+        assert_eq!(
+            crate::sync_bootstrap::choose_sync_kickstart_target(None, 456, None, None),
+            (
+                456,
+                None,
+                "no syncer yet (seq-only; trusted hash unavailable)"
+            ),
+        );
+    }
+
+    #[test]
+    fn test_choose_reachable_seq_only_target_uses_peer_latest_when_local_is_stale() {
+        assert_eq!(
+            crate::sync_bootstrap::choose_reachable_seq_only_target(
+                100,
+                &[(150, 200), (180, 250)],
+            ),
+            Some(250),
+        );
+        assert_eq!(
+            crate::sync_bootstrap::choose_reachable_seq_only_target(
+                190,
+                &[(150, 200), (180, 250)],
+            ),
+            None,
+        );
+        assert_eq!(
+            crate::sync_bootstrap::choose_reachable_seq_only_target(100, &[]),
+            None,
         );
     }
 
@@ -1054,7 +1296,9 @@ mod tests {
             target_hash,
             Some((123, target_hash)),
         ));
-        assert!(crate::sync_bootstrap::should_start_sync_from_header(true, 999, [0x11; 32], None,));
+        assert!(crate::sync_bootstrap::should_start_sync_from_header(
+            true, 999, [0x11; 32], None,
+        ));
     }
 
     #[test]
@@ -1077,6 +1321,13 @@ mod tests {
         assert!(!crate::sync_bootstrap::should_resume_from_sync_anchor(
             false, true, true, true, true
         ));
+    }
+
+    #[test]
+    fn test_should_prefer_history_latest_only_after_completed_sync_without_resume_header() {
+        assert!(crate::sync_bootstrap::should_prefer_history_latest(true, false));
+        assert!(!crate::sync_bootstrap::should_prefer_history_latest(true, true));
+        assert!(!crate::sync_bootstrap::should_prefer_history_latest(false, false));
     }
 
     #[test]

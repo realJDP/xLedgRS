@@ -502,13 +502,13 @@ impl Storage {
 
         let pruned_hashes: Vec<[u8; 32]> = if let Some(min_seq) = min_seq {
             let conn = self.read_conn();
-            let mut stmt = conn.prepare(
-                "SELECT tx_hashes FROM ledgers WHERE seq >= ?1 AND seq <= ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![min_seq as i64, max_seq as i64], |row| {
-                let tx_hashes_blob: Option<Vec<u8>> = row.get(0)?;
-                Ok(tx_hashes_blob)
-            })?;
+            let mut stmt =
+                conn.prepare("SELECT tx_hashes FROM ledgers WHERE seq >= ?1 AND seq <= ?2")?;
+            let rows =
+                stmt.query_map(rusqlite::params![min_seq as i64, max_seq as i64], |row| {
+                    let tx_hashes_blob: Option<Vec<u8>> = row.get(0)?;
+                    Ok(tx_hashes_blob)
+                })?;
             rows.filter_map(|r| r.ok())
                 .flatten()
                 .flat_map(|blob| bincode::deserialize::<Vec<[u8; 32]>>(&blob).unwrap_or_default())

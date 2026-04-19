@@ -130,7 +130,9 @@ impl StateAccounting {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mode = OperatingMode::from_server_state(current_server_state);
         if mode != inner.current_mode {
-            let elapsed = now.saturating_duration_since(inner.current_start).as_micros() as u64;
+            let elapsed = now
+                .saturating_duration_since(inner.current_start)
+                .as_micros() as u64;
             let current_idx = inner.current_mode.idx();
             inner.counters[current_idx].duration_us = inner.counters[current_idx]
                 .duration_us
@@ -141,13 +143,17 @@ impl StateAccounting {
             inner.counters[next_idx].transitions =
                 inner.counters[next_idx].transitions.saturating_add(1);
             if mode == OperatingMode::Full && inner.initial_sync_duration_us.is_none() {
-                inner.initial_sync_duration_us =
-                    Some(now.saturating_duration_since(inner.process_start).as_micros() as u64);
+                inner.initial_sync_duration_us = Some(
+                    now.saturating_duration_since(inner.process_start)
+                        .as_micros() as u64,
+                );
             }
         }
 
         let mut counters = inner.counters;
-        let current_elapsed = now.saturating_duration_since(inner.current_start).as_micros() as u64;
+        let current_elapsed = now
+            .saturating_duration_since(inner.current_start)
+            .as_micros() as u64;
         counters[inner.current_mode.idx()].duration_us = counters[inner.current_mode.idx()]
             .duration_us
             .saturating_add(current_elapsed);
@@ -164,8 +170,13 @@ impl StateAccounting {
     }
 }
 
-pub fn snapshot_server_state_label(sync_done: bool, age: u64, peer_count: usize) -> &'static str {
-    if sync_done && age < 60 {
+pub fn snapshot_server_state_label(
+    sync_done: bool,
+    follower_healthy: bool,
+    age: u64,
+    peer_count: usize,
+) -> &'static str {
+    if sync_done && follower_healthy && age < 60 {
         "full"
     } else if sync_done {
         "tracking"

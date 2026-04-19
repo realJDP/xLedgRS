@@ -1,6 +1,31 @@
 use super::*;
 
 impl Node {
+    fn validation_is_trusted_without_round(
+        &self,
+        manifest_cache: Option<&std::sync::Arc<std::sync::Mutex<crate::consensus::ManifestCache>>>,
+        val: &crate::consensus::Validation,
+    ) -> bool {
+        let master_key = manifest_cache
+            .and_then(|cache| {
+                let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                let master = cache.master_key(&val.node_pubkey);
+                if cache.is_revoked(&master) {
+                    None
+                } else {
+                    Some(master)
+                }
+            })
+            .unwrap_or_else(|| val.node_pubkey.clone());
+
+        self.unl
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|key| key == &master_key)
+            && val.verify_signature()
+    }
+
     pub(super) async fn handle_validation_message(
         self: &Arc<Self>,
         peer: &Peer,
@@ -12,114 +37,30 @@ impl Node {
                 val.ledger_seq, peer.id
             );
 
-            let round_validation_trusted = {
+            let (round_validation_trusted, manifest_cache) = {
                 let state = self.state.read().await;
-                state
-                    .current_round
-                    .as_ref()
-                    .map(|round| round.validation_is_trusted(&val))
-                    .unwrap_or(false)
+                (
+                    state
+                        .current_round
+                        .as_ref()
+                        .map(|round| round.validation_is_trusted(&val))
+                        .unwrap_or(false),
+                    state.ctx.manifest_cache.clone(),
+                )
+            };
+            let validation_trusted = if round_validation_trusted {
+                true
+            } else {
+                self.validation_is_trusted_without_round(manifest_cache.as_ref(), &val)
             };
             let mut should_request_base = false;
             let mut should_register_acquisition = false;
             {
                 let mut state = self.state.write().await;
-
-                let peer_range_ok = state
-                    .peer_ledger_range
-                    .get(&peer.id)
-                    .map(|(first, last)| {
-                        let lower = first.saturating_sub(1024);
-                        let upper = last.saturating_add(1024);
-                        val.ledger_seq >= lower && val.ledger_seq <= upper
-                    })
-                    .unwrap_or(true);
-                let follower_anchor = state
-                    .follower_state
-                    .as_ref()
-                    .map(|fs| fs.current_seq.load(std::sync::atomic::Ordering::Relaxed))
-                    .unwrap_or(0);
-                let history_anchor = state
-                    .ctx
-                    .history
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .latest_ledger()
-                    .map(|l| l.header.sequence)
-                    .unwrap_or(0);
-                let peer_anchor = state
-                    .peer_ledger_range
-                    .values()
-                    .map(|(_, last)| *last)
-                    .max()
-                    .unwrap_or(0);
-                let anchor = peer_anchor.max(follower_anchor).max(history_anchor);
-                let anchor_ok = if anchor > 0 {
-                    val.ledger_seq >= anchor.saturating_sub(100_000)
-                        && val.ledger_seq <= anchor.saturating_add(100_000)
-                } else {
-                    true
-                };
-                let plausible = peer_range_ok && anchor_ok;
-                if !plausible {
-                    let now = std::time::Instant::now();
-                    let entry = state
-                        .implausible_validation_state
-                        .entry(peer.id)
-                        .or_insert((now, 0));
-                    if now.duration_since(entry.0) > std::time::Duration::from_secs(30) {
-                        *entry = (now, 1);
-                    } else {
-                        entry.0 = now;
-                        entry.1 = entry.1.saturating_add(1);
-                    }
-                    let repeats = entry.1;
-                    debug!(
-                        "ignoring implausible validation seq={} from peer {:?} (peer_range_ok={} anchor={} follower={} history={} repeats={})",
-                        val.ledger_seq, peer.id, peer_range_ok, anchor, follower_anchor, history_anchor, repeats,
-                    );
-                    {
-                        static IMPLAUSIBLE_COUNT: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        static LAST_SUMMARY: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        let count =
-                            IMPLAUSIBLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                + 1;
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let prev = LAST_SUMMARY.load(std::sync::atomic::Ordering::Relaxed);
-                        if now_secs >= prev + 30 {
-                            LAST_SUMMARY.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                            info!("suppressed {} implausible validations in last 30s", count);
-                            IMPLAUSIBLE_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                    if repeats >= 10 {
-                        let expires = now + std::time::Duration::from_secs(600);
-                        state.sync_peer_cooldown.insert(peer.id, expires);
-                        let _ = state.services.resource_manager.charge_consumer(
-                            &peer.resource_consumer,
-                            6_000,
-                            "implausible_validation",
-                            now,
-                        );
-                    } else if repeats >= 5 {
-                        let _ = state.services.resource_manager.charge_consumer(
-                            &peer.resource_consumer,
-                            4_000,
-                            "implausible_validation",
-                            now,
-                        );
-                    }
-                } else {
-                    state.implausible_validation_state.remove(&peer.id);
-                }
+                state.implausible_validation_state.remove(&peer.id);
 
                 let is_trusted = if let Some(ref mut round) = state.current_round {
-                    let t = if round_validation_trusted {
+                    let t = if validation_trusted {
                         round.add_prevalidated_validation(val.clone())
                     } else {
                         false
@@ -130,9 +71,9 @@ impl Node {
                             val.ledger_seq
                         );
                     }
-                    t && plausible
+                    t
                 } else {
-                    plausible
+                    validation_trusted
                 };
 
                 if is_trusted {
@@ -377,8 +318,7 @@ impl Node {
         if suppressed > 0 {
             debug!(
                 "suppressed {} stale/duplicate/invalid manifests from peer {:?}",
-                suppressed,
-                peer.id
+                suppressed, peer.id
             );
         }
         if ws_has_receivers {
@@ -396,11 +336,7 @@ impl Node {
             if ws_has_receivers {
                 let _ = self.ws_events.send(crate::rpc::ws::WsEvent::PeerMessage {
                     msg_type: "manifest".into(),
-                    detail: format!(
-                        "accepted={} from {:?}",
-                        accepted_manifests.len(),
-                        peer.id
-                    ),
+                    detail: format!("accepted={} from {:?}", accepted_manifests.len(), peer.id),
                 });
             }
         }

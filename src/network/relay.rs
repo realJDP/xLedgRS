@@ -764,6 +764,28 @@ pub fn encode_get_ledger_txs_for_hash(ledger_hash: &[u8; 32], cookie: u64) -> Rt
     RtxpMessage::new(MessageType::GetLedger, pb.encode_to_vec())
 }
 
+/// Encode a TMGetLedger request for specific transaction-tree node IDs.
+///
+/// Used when an acquisition already has part of the tx SHAMap and needs
+/// authoritative follow-up for missing descendants.
+pub fn encode_get_ledger_txs_for_hash_nodes(
+    ledger_hash: &[u8; 32],
+    node_ids: &[Vec<u8>],
+    cookie: u64,
+) -> RtxpMessage {
+    let pb = proto::TmGetLedger {
+        itype: proto::TmLedgerInfoType::LiTxNode as i32,
+        ltype: Some(proto::TmLedgerType::LtAccepted as i32),
+        ledger_hash: Some(ledger_hash.to_vec()),
+        ledger_seq: None,
+        node_i_ds: node_ids.to_vec(),
+        request_cookie: if cookie != 0 { Some(cookie) } else { None },
+        query_type: None,
+        query_depth: Some(0),
+    };
+    RtxpMessage::new(MessageType::GetLedger, pb.encode_to_vec())
+}
+
 /// Encode a TMGetLedger request for a consensus transaction set (liTS_CANDIDATE).
 ///
 /// The tx set is a SHAMap whose leaves are raw transaction blobs.

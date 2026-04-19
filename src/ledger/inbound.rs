@@ -6,7 +6,7 @@
 //! gate. Completion uses state + watch signal (not Notify) so late readers
 //! always see the current state — matching rippled's cache + job pattern.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,10 @@ pub struct InboundLedger {
     pub header: Option<LedgerHeader>,
     /// Filled when liTX_NODE response arrives: (tx_blob, meta_blob) pairs.
     pub tx_blobs: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Transaction tree root computed directly from the received wire nodes.
+    tx_root: Option<[u8; 32]>,
+    /// Indexed liTX_NODE wire nodes collected across one or more replies.
+    tx_wire_nodes: BTreeMap<[u8; 33], Vec<u8>>,
     /// Watch channel — stores completion state. Late readers always see it.
     watch_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub watch_rx: tokio::sync::watch::Receiver<bool>,
@@ -179,6 +183,8 @@ impl InboundLedger {
             reason,
             header: None,
             tx_blobs: None,
+            tx_root: None,
+            tx_wire_nodes: BTreeMap::new(),
             watch_tx: Arc::new(tx),
             watch_rx: rx,
             created_at: now,
@@ -222,6 +228,9 @@ impl InboundLedger {
         }
         if header.transaction_hash == [0u8; 32] {
             self.tx_blobs = Some(Vec::new());
+            self.tx_root = Some([0u8; 32]);
+        } else {
+            self.try_finalize_tx_tree();
         }
         self.header = Some(header);
         self.touch();
@@ -240,8 +249,8 @@ impl InboundLedger {
         if self.tx_blobs.is_some() {
             return false;
         }
-        let blobs = crate::ledger::close::extract_tx_blobs_from_tx_tree(nodes);
-        self.tx_blobs = Some(blobs);
+        self.merge_tx_wire_nodes(nodes);
+        self.try_finalize_tx_tree();
         self.touch();
         self.timeout.note_progress();
         if self.is_complete() {
@@ -252,6 +261,159 @@ impl InboundLedger {
             false
         }
     }
+
+    pub fn missing_tx_node_ids(&self, limit: usize) -> Vec<Vec<u8>> {
+        if self.tx_blobs.is_some() {
+            return Vec::new();
+        }
+        let mut missing = missing_tx_node_ids_from_wire_nodes(&self.tx_wire_nodes);
+        if missing.len() > limit {
+            missing.truncate(limit);
+        }
+        missing.into_iter().map(|id| id.to_vec()).collect()
+    }
+
+    fn merge_tx_wire_nodes(&mut self, nodes: &[crate::proto::TmLedgerNode]) {
+        for node in nodes {
+            let Some(node_id) = node.nodeid.as_deref().and_then(copy_node_id) else {
+                continue;
+            };
+            self.tx_wire_nodes
+                .entry(node_id)
+                .or_insert_with(|| node.nodedata.clone());
+        }
+    }
+
+    fn try_finalize_tx_tree(&mut self) {
+        if self.tx_blobs.is_some() {
+            return;
+        }
+        if !missing_tx_node_ids_from_wire_nodes(&self.tx_wire_nodes).is_empty() {
+            return;
+        }
+
+        let indexed_nodes: Vec<_> = self
+            .tx_wire_nodes
+            .iter()
+            .map(|(node_id, nodedata)| crate::proto::TmLedgerNode {
+                nodedata: nodedata.clone(),
+                nodeid: Some(node_id.to_vec()),
+            })
+            .collect();
+        self.tx_root = compute_tx_root_from_wire_nodes(&indexed_nodes);
+        self.tx_blobs = Some(crate::ledger::close::extract_tx_blobs_from_tx_tree(
+            &indexed_nodes,
+        ));
+    }
+}
+
+fn copy_node_id(raw: &[u8]) -> Option<[u8; 33]> {
+    if raw.len() != 33 {
+        return None;
+    }
+    let mut node_id = [0u8; 33];
+    node_id.copy_from_slice(raw);
+    Some(node_id)
+}
+
+fn wire_inner_child_hashes(data: &[u8]) -> Option<[[u8; 32]; 16]> {
+    if data.is_empty() {
+        return None;
+    }
+    let (body, wire_type) = (data.get(..data.len() - 1)?, *data.last()?);
+    if wire_type != 0x02 && wire_type != 0x03 {
+        return None;
+    }
+
+    let start = if body.len() >= 516
+        && body[0] == 0x4D
+        && body[1] == 0x49
+        && body[2] == 0x4E
+        && body[3] == 0x00
+    {
+        4usize
+    } else if body.len() == 512 {
+        0usize
+    } else {
+        return None;
+    };
+
+    if body.len() < start + 512 {
+        return None;
+    }
+
+    let mut child_hashes = [[0u8; 32]; 16];
+    for (branch, child_hash) in child_hashes.iter_mut().enumerate() {
+        let off = start + branch * 32;
+        child_hash.copy_from_slice(&body[off..off + 32]);
+    }
+    Some(child_hashes)
+}
+
+fn missing_tx_node_ids_from_wire_nodes(
+    tx_wire_nodes: &BTreeMap<[u8; 33], Vec<u8>>,
+) -> Vec<[u8; 33]> {
+    let root = crate::ledger::shamap_id::SHAMapNodeID::root().to_wire();
+    if !tx_wire_nodes.contains_key(&root) {
+        return vec![root];
+    }
+
+    let mut missing = Vec::new();
+    let mut stack = vec![crate::ledger::shamap_id::SHAMapNodeID::root()];
+    let mut visited = HashSet::new();
+
+    while let Some(node_id) = stack.pop() {
+        if !visited.insert(node_id.to_wire()) {
+            continue;
+        }
+        let Some(nodedata) = tx_wire_nodes.get(&node_id.to_wire()) else {
+            missing.push(node_id.to_wire());
+            continue;
+        };
+        let Some(child_hashes) = wire_inner_child_hashes(nodedata) else {
+            continue;
+        };
+        for (branch, child_hash) in child_hashes.iter().enumerate() {
+            if *child_hash == [0u8; 32] {
+                continue;
+            }
+            let child_id = node_id.child_id(branch as u8);
+            if tx_wire_nodes.contains_key(&child_id.to_wire()) {
+                stack.push(child_id);
+            } else {
+                missing.push(child_id.to_wire());
+            }
+        }
+    }
+
+    missing.sort_unstable();
+    missing.dedup();
+    missing
+}
+
+fn compute_tx_root_from_wire_nodes(nodes: &[crate::proto::TmLedgerNode]) -> Option<[u8; 32]> {
+    let mut tx_map = crate::ledger::shamap::SHAMap::new_transaction();
+    let mut full_below = crate::ledger::full_below_cache::FullBelowCache::new(256);
+
+    for node in nodes {
+        let node_id = node
+            .nodeid
+            .as_deref()
+            .and_then(crate::ledger::shamap_id::SHAMapNodeID::from_wire)?;
+        let result = crate::ledger::shamap_sync::add_known_node(
+            &mut tx_map.root,
+            &node_id,
+            &node.nodedata,
+            crate::ledger::shamap::MapType::Transaction,
+            None,
+            &mut full_below,
+        );
+        if matches!(result, crate::ledger::shamap_sync::AddNodeResult::Invalid) {
+            return None;
+        }
+    }
+
+    Some(tx_map.root_hash())
 }
 
 /// Collection of active acquisitions, keyed by ledger hash.
@@ -354,8 +516,16 @@ impl InboundLedgers {
 
         let mut snapshot = InboundLedgersSnapshot {
             active: self.map.len(),
-            complete: self.map.values().filter(|ledger| ledger.is_complete()).count(),
-            failed: self.map.values().filter(|ledger| ledger.is_failed()).count(),
+            complete: self
+                .map
+                .values()
+                .filter(|ledger| ledger.is_complete())
+                .count(),
+            failed: self
+                .map
+                .values()
+                .filter(|ledger| ledger.is_failed())
+                .count(),
             retry_ready: self.retry_ready_count(),
             stale: self.stale_count(LEDGER_REACQUIRE_INTERVAL),
             fetch_rate,
@@ -542,7 +712,8 @@ impl InboundLedgers {
     }
 
     /// Route a liTX_NODE response by hash. If no acquisition exists yet,
-    /// create one and buffer the TX data — the header may arrive shortly after.
+    /// create one and buffer the indexed TX tree nodes — the header may arrive
+    /// shortly after, or a later follow-up may fill missing descendants.
     pub fn got_tx_data(&mut self, hash: &[u8; 32], nodes: &[crate::proto::TmLedgerNode]) -> bool {
         self.prune_recent_failures();
         if let Some(il) = self.map.get_mut(hash) {
@@ -566,13 +737,23 @@ impl InboundLedgers {
         false
     }
 
+    pub fn missing_tx_node_ids(&self, hash: &[u8; 32], limit: usize) -> Vec<Vec<u8>> {
+        self.map
+            .get(hash)
+            .map(|il| il.missing_tx_node_ids(limit))
+            .unwrap_or_default()
+    }
+
     /// Check if complete.
     pub fn is_complete(&self, hash: &[u8; 32]) -> bool {
         self.map.get(hash).map_or(false, |il| il.is_complete())
     }
 
-    /// Take a completed acquisition out. Returns (header, tx_blobs).
-    pub fn take(&mut self, hash: &[u8; 32]) -> Option<(LedgerHeader, Vec<(Vec<u8>, Vec<u8>)>)> {
+    /// Take a completed acquisition out. Returns (header, tx_blobs, tx_root).
+    pub fn take(
+        &mut self,
+        hash: &[u8; 32],
+    ) -> Option<(LedgerHeader, Vec<(Vec<u8>, Vec<u8>)>, Option<[u8; 32]>)> {
         self.prune_recent_failures();
         let complete = self.is_complete(hash);
         if !complete {
@@ -601,7 +782,7 @@ impl InboundLedgers {
             il.ledger_seq,
             il.tx_blobs.as_ref().map_or(0, |b| b.len()),
         );
-        Some((il.header.unwrap(), il.tx_blobs.unwrap()))
+        Some((il.header.unwrap(), il.tx_blobs.unwrap(), il.tx_root))
     }
 
     /// Remove stale acquisitions older than max_age.
@@ -632,7 +813,8 @@ impl InboundLedgers {
         self.prune_recent_failures();
         let removed = self.map.len();
         for (hash, il) in self.map.drain() {
-            self.recent_failures.insert(hash, (il.ledger_seq, Instant::now()));
+            self.recent_failures
+                .insert(hash, (il.ledger_seq, Instant::now()));
         }
         self.seq_hashes.clear();
         self.seq_headers.clear();
@@ -761,6 +943,53 @@ mod tests {
         };
         hdr.hash = hdr.compute_hash();
         hdr
+    }
+
+    fn tx_fixture() -> (
+        crate::ledger::LedgerHeader,
+        crate::ledger::shamap::SHAMap,
+        usize,
+    ) {
+        let mut leaves = Vec::new();
+        let mut used_root_branches = std::collections::HashSet::new();
+        for seed in 0u16..4096 {
+            let tx_blob = vec![0x12, (seed >> 8) as u8, seed as u8];
+            let tx_id = crate::transaction::serialize::tx_blob_hash(&tx_blob);
+            if !used_root_branches.insert(tx_id[0] >> 4) {
+                continue;
+            }
+            let meta_blob = vec![0xE0, seed as u8];
+            leaves.push((tx_id, tx_blob, meta_blob));
+            if leaves.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(leaves.len(), 2, "fixture needs two distinct root branches");
+
+        let mut tx_map = crate::ledger::shamap::SHAMap::new_transaction();
+        for (tx_id, tx_blob, meta_blob) in &leaves {
+            let mut leaf_data = Vec::new();
+            crate::transaction::serialize::encode_length(tx_blob.len(), &mut leaf_data);
+            leaf_data.extend_from_slice(tx_blob);
+            crate::transaction::serialize::encode_length(meta_blob.len(), &mut leaf_data);
+            leaf_data.extend_from_slice(meta_blob);
+            tx_map.insert(crate::ledger::Key(*tx_id), leaf_data);
+        }
+
+        let mut hdr = header(3001);
+        hdr.transaction_hash = tx_map.root_hash();
+        hdr.hash = hdr.compute_hash();
+        (hdr, tx_map, leaves.len())
+    }
+
+    fn tm_nodes_from_wire(nodes: Vec<([u8; 33], Vec<u8>)>) -> Vec<crate::proto::TmLedgerNode> {
+        nodes
+            .into_iter()
+            .map(|(nodeid, nodedata)| crate::proto::TmLedgerNode {
+                nodedata,
+                nodeid: Some(nodeid.to_vec()),
+            })
+            .collect()
     }
 
     #[test]
@@ -903,12 +1132,14 @@ mod tests {
 
     #[test]
     fn taking_history_ledger_updates_fetch_rate_and_totals() {
-        let hdr = header(1006);
+        let mut hdr = header(1006);
+        hdr.transaction_hash = [0u8; 32];
+        hdr.hash = hdr.compute_hash();
         let mut inbound = InboundLedgers::new();
 
         let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
-        assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
-        assert!(inbound.got_tx_data(&hdr.hash, &[]));
+        assert!(inbound.got_header(&hdr.hash, hdr.clone()));
+        assert!(!inbound.got_tx_data(&hdr.hash, &[]));
 
         let taken = inbound.take(&hdr.hash);
 
@@ -923,13 +1154,19 @@ mod tests {
         let mut inbound = InboundLedgers::new();
 
         let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
-        let ledger = inbound.map.get_mut(&hdr.hash).expect("acquisition should exist");
+        let ledger = inbound
+            .map
+            .get_mut(&hdr.hash)
+            .expect("acquisition should exist");
         ledger.recent_nodes.insert([0xAB; 32]);
         ledger.timeout.progress = false;
 
         inbound.got_fetch_pack();
 
-        let ledger = inbound.map.get(&hdr.hash).expect("acquisition should remain");
+        let ledger = inbound
+            .map
+            .get(&hdr.hash)
+            .expect("acquisition should remain");
         assert!(ledger.timeout.progress);
         assert!(ledger.recent_nodes.is_empty());
         assert_eq!(inbound.fetch_pack_hits, 1);
@@ -1031,5 +1268,66 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.reason == "history" && entry.has_header));
+    }
+
+    #[test]
+    fn partial_tx_tree_waits_for_missing_node_followups() {
+        let (hdr, mut tx_map, expected_txs) = tx_fixture();
+        let mut inbound = InboundLedgers::new();
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
+
+        let root_only = tm_nodes_from_wire(
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 0),
+        );
+        assert!(!inbound.got_tx_data(&hdr.hash, &root_only));
+        assert!(!inbound.is_complete(&hdr.hash));
+
+        let missing = inbound.missing_tx_node_ids(&hdr.hash, 16);
+        assert_eq!(missing.len(), expected_txs);
+        for node_id in missing {
+            let node_id = crate::ledger::shamap_id::SHAMapNodeID::from_wire(&node_id)
+                .expect("valid child node id");
+            let followup = tm_nodes_from_wire(tx_map.get_wire_nodes_for_query(&node_id, 0));
+            assert!(
+                !followup.is_empty(),
+                "follow-up request for missing child should return a node"
+            );
+            inbound.got_tx_data(&hdr.hash, &followup);
+        }
+
+        assert!(inbound.is_complete(&hdr.hash));
+        let (_taken_header, tx_blobs, tx_root) =
+            inbound.take(&hdr.hash).expect("complete acquisition");
+        assert_eq!(tx_blobs.len(), expected_txs);
+        assert_eq!(tx_root, Some(hdr.transaction_hash));
+    }
+
+    #[test]
+    fn tx_prefetch_before_header_still_completes_after_attach() {
+        let (hdr, mut tx_map, expected_txs) = tx_fixture();
+        let mut inbound = InboundLedgers::new();
+
+        let root_only = tm_nodes_from_wire(
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 0),
+        );
+        assert!(!inbound.got_tx_data(&hdr.hash, &root_only));
+        assert_eq!(inbound.get(&hdr.hash).map(|il| il.ledger_seq), Some(0));
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
+        assert!(!inbound.is_complete(&hdr.hash));
+
+        let missing = inbound.missing_tx_node_ids(&hdr.hash, 16);
+        assert_eq!(missing.len(), expected_txs);
+        for node_id in missing {
+            let node_id = crate::ledger::shamap_id::SHAMapNodeID::from_wire(&node_id)
+                .expect("valid child node id");
+            let followup = tm_nodes_from_wire(tx_map.get_wire_nodes_for_query(&node_id, 0));
+            inbound.got_tx_data(&hdr.hash, &followup);
+        }
+
+        assert!(inbound.is_complete(&hdr.hash));
     }
 }

@@ -103,6 +103,20 @@ impl Secp256k1KeyPair {
         Ok(Self::from_seed_entropy(&entropy))
     }
 
+    /// Construct a keypair directly from a 32-byte secp256k1 secret key.
+    pub fn from_secret_bytes(secret_bytes: &[u8]) -> Result<Self> {
+        let secret = secp256k1::SecretKey::from_slice(secret_bytes)?;
+        let secp = secp256k1::Secp256k1::new();
+        let public = secp256k1::PublicKey::from_secret_key(&secp, &secret);
+        Ok(Self { secret, public })
+    }
+
+    /// Construct a keypair from a hex-encoded 32-byte secp256k1 secret key.
+    pub fn from_secret_hex(secret_hex: &str) -> Result<Self> {
+        let secret_bytes = hex::decode(secret_hex)?;
+        Self::from_secret_bytes(&secret_bytes)
+    }
+
     pub fn public_key_bytes(&self) -> Vec<u8> {
         self.public.serialize().to_vec() // 33-byte compressed
     }

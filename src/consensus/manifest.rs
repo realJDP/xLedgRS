@@ -166,7 +166,7 @@ impl Manifest {
             self.domain.as_deref(),
             self.version,
         );
-        let master_ok = verify_secp256k1(&self.master_pubkey, &bytes, &self.master_sig);
+        let master_ok = verify_manifest_signature(&self.master_pubkey, &bytes, &self.master_sig);
         if !master_ok {
             return false;
         }
@@ -175,7 +175,7 @@ impl Manifest {
             return true; // only master sig needed
         }
 
-        verify_secp256k1(&self.signing_pubkey, &bytes, &self.signing_sig)
+        verify_manifest_signature(&self.signing_pubkey, &bytes, &self.signing_sig)
     }
 
     /// `true` if this manifest permanently revokes its master key.
@@ -343,6 +343,25 @@ impl Manifest {
     }
 }
 
+fn verify_manifest_signature(pubkey: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    if pubkey.len() == 33 && pubkey[0] == 0xED {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let Ok(key_bytes) = <[u8; 32]>::try_from(&pubkey[1..]) else {
+            return false;
+        };
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&key_bytes) else {
+            return false;
+        };
+        let Ok(signature) = Signature::try_from(signature) else {
+            return false;
+        };
+        verifying_key.verify(message, &signature).is_ok()
+    } else {
+        verify_secp256k1(pubkey, message, signature)
+    }
+}
+
 // ── ManifestCache ─────────────────────────────────────────────────────────────
 
 /// Maintains the current valid manifest for every known master key.
@@ -499,7 +518,9 @@ impl ManifestCache {
 
     pub fn manifest_for_master(&self, master_pubkey: &[u8]) -> Option<Vec<u8>> {
         let signing = self.master_to_signing.get(master_pubkey)?;
-        self.by_signing_key.get(signing).map(|manifest| manifest.to_bytes())
+        self.by_signing_key
+            .get(signing)
+            .map(|manifest| manifest.to_bytes())
     }
 
     pub fn sequence_for_master(&self, master_pubkey: &[u8]) -> Option<u32> {
@@ -552,9 +573,17 @@ pub enum ManifestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::keys::Ed25519KeyPair;
 
     fn kp() -> Secp256k1KeyPair {
         Secp256k1KeyPair::generate()
+    }
+
+    fn ed_pubkey_bytes(kp: &Ed25519KeyPair) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(0xED);
+        out.extend_from_slice(&kp.public_key_bytes());
+        out
     }
 
     // ── Manifest creation and verification ────────────────────────────────────
@@ -575,6 +604,25 @@ mod tests {
         assert!(m.verify(), "revocation manifest must verify");
         assert!(m.is_revocation());
         assert_eq!(m.sequence, REVOKE_SEQ);
+    }
+
+    #[test]
+    fn test_ed25519_manifest_verifies() {
+        let master = Ed25519KeyPair::from_seed_entropy(&[1u8; 16]);
+        let signing = Ed25519KeyPair::from_seed_entropy(&[2u8; 16]);
+        let master_pub = ed_pubkey_bytes(&master);
+        let signing_pub = ed_pubkey_bytes(&signing);
+        let bytes = Manifest::signing_bytes(&master_pub, &signing_pub, 1, None, None);
+        let manifest = Manifest {
+            master_pubkey: master_pub,
+            signing_pubkey: signing_pub,
+            sequence: 1,
+            master_sig: master.sign(&bytes),
+            signing_sig: signing.sign(&bytes),
+            domain: None,
+            version: None,
+        };
+        assert!(manifest.verify(), "Ed25519 manifest must verify");
     }
 
     #[test]

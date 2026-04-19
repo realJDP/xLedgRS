@@ -23,6 +23,12 @@ pub(super) struct ClosedLedgerRound {
 }
 
 impl Node {
+    async fn pause_consensus_close_loop(&self, reason: &'static str) {
+        info!("consensus close loop paused: {reason}");
+        let mut state = self.state.write().await;
+        state.current_round = None;
+    }
+
     pub(super) fn signing_key(&self) -> &Secp256k1KeyPair {
         self.validator_key.as_ref().unwrap_or(&self.node_key)
     }
@@ -45,18 +51,32 @@ impl Node {
         let mut persistent_mode = crate::consensus::ConsensusMode::Proposing;
 
         loop {
-            self.await_open_phase(prev_round_time).await;
+            if let Some(reason) = self.consensus_close_loop_pause_reason().await {
+                self.pause_consensus_close_loop(reason).await;
+                return;
+            }
+
+            if !self.await_open_phase(prev_round_time).await {
+                return;
+            }
             let round_start = self
                 .start_consensus_round(prev_round_time, prev_proposers, persistent_mode)
                 .await;
             let close_time = round_start.close_time;
 
-            let establish = self.run_consensus_establish_phase(&round_start).await;
+            let Some(establish) = self.run_consensus_establish_phase(&round_start).await else {
+                return;
+            };
 
             if let Some(correct_hash) = establish.wrong_ledger_hash {
                 self.handle_wrong_ledger_recovery(correct_hash).await;
                 persistent_mode = crate::consensus::ConsensusMode::WrongLedger;
                 continue;
+            }
+
+            if let Some(reason) = self.consensus_close_loop_pause_reason().await {
+                self.pause_consensus_close_loop(reason).await;
+                return;
             }
 
             let closed = self
@@ -72,9 +92,14 @@ impl Node {
         }
     }
 
-    pub(super) async fn await_open_phase(&self, prev_round_time: Duration) {
+    pub(super) async fn await_open_phase(&self, prev_round_time: Duration) -> bool {
         let open_start = tokio::time::Instant::now();
         loop {
+            if let Some(reason) = self.consensus_close_loop_pause_reason().await {
+                self.pause_consensus_close_loop(reason).await;
+                return false;
+            }
+
             tokio::time::sleep(Duration::from_millis(250)).await;
             let open_time = open_start.elapsed();
             let (has_txs, prev_proposers, proposers_closed, proposers_validated) = {
@@ -135,7 +160,7 @@ impl Node {
                 if force_close {
                     info!("ledger_accept requested: forcing ledger close");
                 }
-                break;
+                return true;
             }
         }
     }
@@ -168,8 +193,14 @@ impl Node {
             let state = self.state.read().await;
             state.ctx.ledger_header.hash
         };
-        let proposal =
-            Proposal::new_signed(next_seq, tx_set_hash, prev_hash, close_time, 0, self.signing_key());
+        let proposal = Proposal::new_signed(
+            next_seq,
+            tx_set_hash,
+            prev_hash,
+            close_time,
+            0,
+            self.signing_key(),
+        );
         let prop_msg = relay::encode_proposal(&proposal);
 
         let should_propose = persistent_mode == ConsensusMode::Proposing
@@ -194,7 +225,8 @@ impl Node {
             round.close_ledger(tx_set_hash);
             let staged = std::mem::take(&mut state.staged_proposals);
             for (key, prop) in staged {
-                if prop.ledger_seq == next_seq && prop.prop_seq != crate::consensus::round::SEQ_LEAVE
+                if prop.ledger_seq == next_seq
+                    && prop.prop_seq != crate::consensus::round::SEQ_LEAVE
                 {
                     if round.add_proposal(prop.clone()) {
                         round.add_close_time_vote(prop.close_time as u64);
@@ -233,12 +265,17 @@ impl Node {
     pub(super) async fn run_consensus_establish_phase(
         &self,
         round_start: &ConsensusRoundStart,
-    ) -> ConsensusEstablishOutcome {
+    ) -> Option<ConsensusEstablishOutcome> {
         let phase_start = tokio::time::Instant::now();
         let mut prop_seq = 0u32;
         let mut last_propose_time = tokio::time::Instant::now();
         let mut wrong_ledger_hash: Option<[u8; 32]> = None;
         loop {
+            if let Some(reason) = self.consensus_close_loop_pause_reason().await {
+                self.pause_consensus_close_loop(reason).await;
+                return None;
+            }
+
             tokio::time::sleep(Duration::from_millis(250)).await;
 
             {
@@ -362,7 +399,7 @@ impl Node {
             }
         }
 
-        ConsensusEstablishOutcome { wrong_ledger_hash }
+        Some(ConsensusEstablishOutcome { wrong_ledger_hash })
     }
 
     pub(super) async fn handle_wrong_ledger_recovery(&self, correct_hash: [u8; 32]) {
@@ -376,7 +413,11 @@ impl Node {
                 .inbound_ledgers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            guard.acquire(correct_hash, 0, crate::ledger::inbound::InboundReason::Consensus);
+            guard.acquire(
+                correct_hash,
+                0,
+                crate::ledger::inbound::InboundReason::Consensus,
+            );
         }
 
         let cookie = rand::random::<u64>();
@@ -452,9 +493,8 @@ impl Node {
             let state = self.state.write().await;
             let prev_header = state.ctx.ledger_header.clone();
             let ls_arc = state.ctx.ledger_state.clone();
-            let tx_pool = std::mem::take(
-                &mut *state.ctx.tx_pool.write().unwrap_or_else(|e| e.into_inner()),
-            );
+            let tx_pool =
+                std::mem::take(&mut *state.ctx.tx_pool.write().unwrap_or_else(|e| e.into_inner()));
             (prev_header, ls_arc, tx_pool)
         };
 
@@ -661,13 +701,18 @@ impl Node {
                 .unwrap_or_else(|e| e.into_inner())
                 .complete_ledgers();
             let peer_count = st.peer_count();
-            let server_status = if st.sync_done {
-                "full"
-            } else if peer_count > 0 {
-                "syncing"
-            } else {
-                "disconnected"
-            };
+            let follower_healthy = Self::follower_healthy_for_status(&st);
+            let age = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_sub(st.ctx.ledger_header.close_time as u64 + 946_684_800);
+            let server_status = crate::network::ops::snapshot_server_state_label(
+                st.sync_done,
+                follower_healthy,
+                age,
+                peer_count,
+            );
             (
                 validated_ledgers,
                 peer_count,
@@ -700,11 +745,7 @@ impl Node {
         {
             let book_changes_ctx = {
                 let st = self.state.read().await;
-                Self::build_rpc_read_context(
-                    &st,
-                    0,
-                    None,
-                )
+                Self::build_rpc_read_context(&st, 0, None)
             };
             if let Ok(payload) = crate::rpc::handlers::book_changes(
                 &serde_json::json!({"ledger_index": closed.seq}),

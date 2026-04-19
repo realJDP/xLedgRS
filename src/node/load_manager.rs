@@ -33,13 +33,18 @@ impl Node {
                         .unwrap_or_else(|e| e.into_inner())
                         .complete_ledgers();
                     let peer_count = state.peer_count();
-                    let server_status = if state.sync_done {
-                        "full"
-                    } else if peer_count > 0 {
-                        "syncing"
-                    } else {
-                        "disconnected"
-                    };
+                    let follower_healthy = Self::follower_healthy_for_status(&state);
+                    let age = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                        .saturating_sub(state.ctx.ledger_header.close_time as u64 + 946_684_800);
+                    let server_status = crate::network::ops::snapshot_server_state_label(
+                        state.sync_done,
+                        follower_healthy,
+                        age,
+                        peer_count,
+                    );
                     Some(crate::rpc::ws::WsEvent::ServerStatus {
                         ledger_seq: state.ctx.ledger_seq,
                         ledger_hash: hex::encode_upper(state.ctx.ledger_header.hash),

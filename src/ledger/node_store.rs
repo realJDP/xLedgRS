@@ -10,6 +10,31 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+const PREFIX_INNER_NODE: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00]; // MIN\0
+const PREFIX_LEAF_STATE: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00]; // MLN\0
+
+pub fn validate_account_state_store_node(expected_hash: &[u8; 32], data: &[u8]) -> bool {
+    if data.len() == 16 * 32 {
+        let mut payload = Vec::with_capacity(PREFIX_INNER_NODE.len() + data.len());
+        payload.extend_from_slice(&PREFIX_INNER_NODE);
+        payload.extend_from_slice(data);
+        if crate::crypto::sha512_first_half(&payload) == *expected_hash {
+            return true;
+        }
+    }
+
+    if data.len() < 32 {
+        return false;
+    }
+
+    let key_start = data.len() - 32;
+    let mut payload = Vec::with_capacity(PREFIX_LEAF_STATE.len() + data.len());
+    payload.extend_from_slice(&PREFIX_LEAF_STATE);
+    payload.extend_from_slice(&data[..key_start]);
+    payload.extend_from_slice(&data[key_start..]);
+    crate::crypto::sha512_first_half(&payload) == *expected_hash
+}
+
 /// Content-addressed storage for SHAMap nodes.
 ///
 /// Keys are 32-byte content hashes, and values are the serialized node bytes.
@@ -44,6 +69,12 @@ pub trait NodeStore: Send + Sync {
     fn flush_to_disk(&self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Mark a hash as locally corrupt so future fetches can avoid reusing it.
+    fn mark_corrupt(&self, _hash: &[u8; 32]) {}
+
+    /// Clear in-memory caches without touching the persistent backend.
+    fn clear_in_memory(&self) {}
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -224,6 +255,14 @@ impl NodeStore for ObservedNodeStore {
         self.stats.note_flush_result(started_at, &result);
         result
     }
+
+    fn mark_corrupt(&self, hash: &[u8; 32]) {
+        self.inner.mark_corrupt(hash);
+    }
+
+    fn clear_in_memory(&self) {
+        self.inner.clear_in_memory();
+    }
 }
 
 fn atomic_option(value: u64) -> Option<u64> {
@@ -283,6 +322,15 @@ impl NuDBNodeStore {
 
 impl NodeStore for NuDBNodeStore {
     fn store(&self, hash: &[u8; 32], data: &[u8]) -> std::io::Result<()> {
+        if !validate_account_state_store_node(hash, data) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid SHAMap store node for {}",
+                    hex::encode_upper(&hash[..8])
+                ),
+            ));
+        }
         let mut s = self.guard();
         let _ = s.insert(hash, data)?;
         Ok(())
@@ -303,6 +351,17 @@ impl NodeStore for NuDBNodeStore {
     }
 
     fn store_batch(&self, nodes: &[([u8; 32], Vec<u8>)]) -> std::io::Result<()> {
+        for (hash, data) in nodes {
+            if !validate_account_state_store_node(hash, data) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid SHAMap store node for {}",
+                        hex::encode_upper(&hash[..8])
+                    ),
+                ));
+            }
+        }
         let mut s = self.guard();
         for (hash, data) in nodes {
             let _ = s.insert(hash, data)?;
@@ -369,11 +428,18 @@ mod tests {
         let dir = std::env::temp_dir().join("nudb_nodestore_test");
         let _ = std::fs::remove_dir_all(&dir);
         let store = NuDBNodeStore::open(&dir).unwrap();
-        let hash = [0xCD; 32];
+        let key = [0xCD; 32];
         let data = b"shamap node bytes";
-        store.store(&hash, data).unwrap();
+        let mut payload = Vec::with_capacity(4 + data.len() + key.len());
+        payload.extend_from_slice(b"MLN\0");
+        payload.extend_from_slice(data);
+        payload.extend_from_slice(&key);
+        let hash = crate::crypto::sha512_first_half(&payload);
+        let mut store_data = data.to_vec();
+        store_data.extend_from_slice(&key);
+        store.store(&hash, &store_data).unwrap();
         let fetched = store.fetch(&hash).unwrap().unwrap();
-        assert_eq!(fetched, data);
+        assert_eq!(fetched, store_data);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -447,5 +513,30 @@ mod tests {
         let snapshot = stats.snapshot();
         assert!(snapshot.last_error.is_none());
         assert_eq!(snapshot.store_ops, 2);
+    }
+
+    #[test]
+    fn validate_account_state_store_node_accepts_exact_512_byte_leaf() {
+        let key = [0x44; 32];
+        let data = vec![0xAA; 480];
+        let mut payload = Vec::with_capacity(4 + data.len() + key.len());
+        payload.extend_from_slice(b"MLN\0");
+        payload.extend_from_slice(&data);
+        payload.extend_from_slice(&key);
+        let hash = crate::crypto::sha512_first_half(&payload);
+
+        let mut store = data;
+        store.extend_from_slice(&key);
+        assert!(validate_account_state_store_node(&hash, &store));
+    }
+
+    #[test]
+    fn nudb_store_rejects_invalid_account_state_row() {
+        let dir = std::env::temp_dir().join("nudb_nodestore_invalid_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = NuDBNodeStore::open(&dir).unwrap();
+        let err = store.store(&[0xAB; 32], &[0xCD; 96]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

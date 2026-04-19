@@ -8,6 +8,10 @@ mod process_control;
 use xrpl::config::{ConfigFile, HistoryRetention};
 use xrpl::node::{Node, NodeConfig};
 
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "xledgrs",
@@ -141,6 +145,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_rustls_provider();
+
     {
         use tracing_subscriber::prelude::*;
         let (filter_layer, reload_handle) =
@@ -162,14 +168,21 @@ async fn main() -> anyhow::Result<()> {
                 None
             }
         });
-    let configured_data_dir = args.data_dir.clone().map(std::path::PathBuf::from).or_else(|| {
-        file_cfg
-            .as_ref()
-            .and_then(|cfg| cfg.runtime.data_dir.clone())
-    });
+    let configured_data_dir = args
+        .data_dir
+        .clone()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            file_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.runtime.data_dir.clone())
+        });
     let exe_name = std::env::current_exe()
         .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
         .unwrap_or_else(|| "xledgrs".to_string());
     let control_request = process_control::ControlRequest {
         start: args.start,
@@ -333,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
                             && !ip.starts_with("192.168.")
                         {
                             // Deep history = 100K+ ledger span (~4 days).
-            // These peers can serve ledgers needed for catch-up.
+                            // These peers can serve ledgers needed for catch-up.
                             let is_deep = peer
                                 .get("complete_ledgers")
                                 .and_then(|v| v.as_str())
@@ -553,6 +566,9 @@ async fn main() -> anyhow::Result<()> {
         validation_seed: file_cfg
             .as_ref()
             .and_then(|cfg| cfg.validation_seed.clone()),
+        validator_token: file_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.validator_token.clone()),
     };
 
     let test_one = args.test_one_ledger;

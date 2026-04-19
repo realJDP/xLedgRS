@@ -95,11 +95,7 @@ impl Node {
             if let Some(blocked) = state
                 .services
                 .resource_manager
-                .blocked_peer_status_for_logging(
-                    addr,
-                    peer_public_key.as_deref(),
-                    now,
-                )
+                .blocked_peer_status_for_logging(addr, peer_public_key.as_deref(), now)
             {
                 let reason = if blocked.last_reason.is_empty() {
                     "resource pressure"
@@ -157,9 +153,11 @@ impl Node {
                 crate::crypto::base58::PREFIX_NODE_PUBLIC,
                 &handshake_snapshot.node_pubkey,
             );
-            s.services
-                .resource_manager
-                .set_consumer_public_key(&mut peer.resource_consumer, &public_key, now);
+            s.services.resource_manager.set_consumer_public_key(
+                &mut peer.resource_consumer,
+                &public_key,
+                now,
+            );
             if !peer_reserved
                 && dir == Direction::Inbound
                 && s.inbound_count() > self.config.max_inbound()
@@ -202,7 +200,9 @@ impl Node {
                 s.peer_txs.remove(&id);
                 s.peer_direction.remove(&id);
                 if let Some(slot) = s.peerfinder_slots.remove(&id) {
-                    s.services.peerfinder.on_failure(&slot, "too_many_peers", now_unix);
+                    s.services
+                        .peerfinder
+                        .on_failure(&slot, "too_many_peers", now_unix);
                 } else {
                     s.note_peer_connect_failure(addr, "too_many_peers");
                     return None;
@@ -221,8 +221,9 @@ impl Node {
                 let _ = s.services.peerfinder.on_connected(slot, None, now_unix);
             }
             if peer_reserved || addr.ip().is_loopback() {
-                let tag = peer_reservation_description(s.ctx.peer_reservations.as_ref(), &public_key)
-                    .or_else(|| addr.ip().is_loopback().then_some("loopback".to_string()));
+                let tag =
+                    peer_reservation_description(s.ctx.peer_reservations.as_ref(), &public_key)
+                        .or_else(|| addr.ip().is_loopback().then_some("loopback".to_string()));
                 s.services.cluster.note_connected(
                     addr,
                     Some(public_key),

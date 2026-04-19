@@ -1,5 +1,5 @@
-use super::*;
 use super::http_io::{parse_forwarded_for, read_rpc_request};
+use super::*;
 
 impl Node {
     pub(super) async fn run_rpc_server(self: Arc<Self>) -> anyhow::Result<()> {
@@ -48,10 +48,12 @@ impl Node {
                 addr.ip().is_loopback(),
                 forwarded_for.as_deref(),
             );
-            let _ = state
-                .services
-                .resource_manager
-                .charge_consumer(&consumer, 250, "rpc_request", std::time::Instant::now());
+            let _ = state.services.resource_manager.charge_consumer(
+                &consumer,
+                250,
+                "rpc_request",
+                std::time::Instant::now(),
+            );
         }
 
         if body.is_empty() {

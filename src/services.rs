@@ -64,7 +64,9 @@ impl RuntimeServices {
 
     pub fn attach_path_requests(
         &mut self,
-        path_requests: std::sync::Arc<std::sync::Mutex<crate::rpc::path_requests::PathRequestManager>>,
+        path_requests: std::sync::Arc<
+            std::sync::Mutex<crate::rpc::path_requests::PathRequestManager>,
+        >,
     ) {
         self.path_requests = Some(path_requests);
     }
@@ -88,7 +90,9 @@ impl RuntimeServices {
     }
 
     pub fn fetch_pack_snapshot(&self) -> Option<crate::ledger::fetch_pack::FetchPackSnapshot> {
-        self.fetch_pack.as_ref().map(|fetch_pack| fetch_pack.snapshot(32))
+        self.fetch_pack
+            .as_ref()
+            .map(|fetch_pack| fetch_pack.snapshot(32))
     }
 
     pub fn inbound_ledgers_snapshot(
@@ -102,9 +106,7 @@ impl RuntimeServices {
         })
     }
 
-    pub fn path_request_snapshot(
-        &self,
-    ) -> Option<crate::rpc::path_requests::PathRequestSnapshot> {
+    pub fn path_request_snapshot(&self) -> Option<crate::rpc::path_requests::PathRequestSnapshot> {
         self.path_requests.as_ref().map(|path_requests| {
             path_requests
                 .lock()
@@ -113,18 +115,13 @@ impl RuntimeServices {
         })
     }
 
-    pub fn ledger_cleaner_snapshot(
-        &self,
-    ) -> Option<crate::ledger::control::LedgerCleanerSnapshot> {
+    pub fn ledger_cleaner_snapshot(&self) -> Option<crate::ledger::control::LedgerCleanerSnapshot> {
         self.ledger_cleaner
             .as_ref()
             .map(|ledger_cleaner| ledger_cleaner.snapshot())
     }
 
-    pub fn note_local_broadcasts(
-        &mut self,
-        pending: &[crate::network::message::RtxpMessage],
-    ) {
+    pub fn note_local_broadcasts(&mut self, pending: &[crate::network::message::RtxpMessage]) {
         let now_unix = crate::transaction::master::unix_now();
         for msg in pending {
             if msg.msg_type != crate::network::message::MessageType::Transaction {
@@ -136,8 +133,12 @@ impl RuntimeServices {
                 continue;
             };
             let hash = crate::transaction::serialize::tx_blob_hash(&pb.raw_transaction);
-            self.tx_master
-                .observe_submitted(hash, pb.raw_transaction.len(), "rpc_submit", now_unix);
+            self.tx_master.observe_submitted(
+                hash,
+                pb.raw_transaction.len(),
+                "rpc_submit",
+                now_unix,
+            );
             self.tx_master.note_relayed(&hash, now_unix);
         }
     }
@@ -185,10 +186,8 @@ impl RuntimeServices {
             active_inbound_ledgers,
         );
         let job_queue_snapshot = self.job_queue.snapshot();
-        self.load_manager.refresh_local_queue_health(
-            &job_queue_snapshot,
-            now,
-        );
+        self.load_manager
+            .refresh_local_queue_health(&job_queue_snapshot, now);
         let resource_snapshot = self.resource_manager.snapshot(now, 0);
         let peerfinder_snapshot = self.peerfinder.snapshot(0);
         self.load_manager.refresh_network_health(
@@ -254,7 +253,9 @@ mod tests {
             .unwrap_or_default()
             .as_secs();
         services.peerfinder.note_connected(from, now_unix);
-        services.peerfinder.note_redirect(from, to, now_unix.saturating_add(20));
+        services
+            .peerfinder
+            .note_redirect(from, to, now_unix.saturating_add(20));
         services.refresh_health(1, 0, std::time::Instant::now());
 
         let snapshot = services.load_manager.snapshot();
@@ -266,11 +267,9 @@ mod tests {
         let mut services = crate::services::RuntimeServices::new(std::time::Instant::now());
         let metrics = crate::ledger::pool::FeeMetrics::default();
         services.job_queue.refresh(0, 4, 0, 0, 0, 0);
-        services.open_ledger.note_queue_state(
-            7,
-            [0xAB; 32],
-            &metrics,
-        );
+        services
+            .open_ledger
+            .note_queue_state(7, [0xAB; 32], &metrics);
 
         services.refresh_health(1, 0, std::time::Instant::now());
 

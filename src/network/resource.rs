@@ -221,10 +221,9 @@ impl ResourceManager {
         if balance >= DISCONNECT_THRESHOLD {
             let overage = balance.saturating_sub(DISCONNECT_THRESHOLD) as u64;
             let extra_secs = (overage / 1_000).saturating_mul(10);
-            let block_for = (DISCONNECT_BLOCK_MIN + Duration::from_secs(extra_secs))
-                .min(DISCONNECT_BLOCK_MAX);
-            entry.blocked_until =
-                Some(entry.blocked_until.unwrap_or(now).max(now + block_for));
+            let block_for =
+                (DISCONNECT_BLOCK_MIN + Duration::from_secs(extra_secs)).min(DISCONNECT_BLOCK_MAX);
+            entry.blocked_until = Some(entry.blocked_until.unwrap_or(now).max(now + block_for));
         }
     }
 
@@ -235,8 +234,7 @@ impl ResourceManager {
         forwarded_for: Option<&str>,
     ) -> ResourceConsumer {
         let endpoint_ip = if proxy {
-            Self::forwarded_ip(forwarded_for)
-                .unwrap_or(addr.ip())
+            Self::forwarded_ip(forwarded_for).unwrap_or(addr.ip())
         } else {
             addr.ip()
         };
@@ -300,12 +298,7 @@ impl ResourceManager {
         target.blocked_until = Self::max_instant(target.blocked_until, source.blocked_until);
     }
 
-    fn migrate_local_pressure(
-        &mut self,
-        old_key: ResourceKey,
-        new_key: ResourceKey,
-        now: Instant,
-    ) {
+    fn migrate_local_pressure(&mut self, old_key: ResourceKey, new_key: ResourceKey, now: Instant) {
         if old_key == new_key {
             return;
         }
@@ -456,10 +449,9 @@ impl ResourceManager {
             entry.disconnects = entry.disconnects.saturating_add(1);
             let overage = balance.saturating_sub(DISCONNECT_THRESHOLD) as u64;
             let extra_secs = (overage / 1_000).saturating_mul(10);
-            let block_for = (DISCONNECT_BLOCK_MIN + Duration::from_secs(extra_secs))
-                .min(DISCONNECT_BLOCK_MAX);
-            entry.blocked_until =
-                Some(entry.blocked_until.unwrap_or(now).max(now + block_for));
+            let block_for =
+                (DISCONNECT_BLOCK_MIN + Duration::from_secs(extra_secs)).min(DISCONNECT_BLOCK_MAX);
+            entry.blocked_until = Some(entry.blocked_until.unwrap_or(now).max(now + block_for));
             ResourceDisposition::Disconnect
         } else if balance >= WARNING_THRESHOLD {
             let should_count = entry
@@ -633,7 +625,11 @@ impl ResourceManager {
             .filter(|(key, _)| matches!(key, ResourceKey::Peer(_)))
             .map(|(_, entry)| entry.balance_at(now))
             .sum();
-        let total_warnings = self.entries.values().map(|entry| u64::from(entry.warnings)).sum();
+        let total_warnings = self
+            .entries
+            .values()
+            .map(|entry| u64::from(entry.warnings))
+            .sum();
         let total_disconnects = self
             .entries
             .values()
@@ -659,43 +655,41 @@ impl ResourceManager {
     }
 
     pub fn export_consumers(&self, now: Instant, limit: usize) -> Vec<ResourceConsumerState> {
-        let mut consumers: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|(key, _)| matches!(key, ResourceKey::Ip(_)))
-            .filter_map(|(key, entry)| {
-                let balance = entry.balance_at(now);
-                if balance < MINIMUM_GOSSIP_BALANCE {
-                    return None;
-                }
-                Some(match key {
-                    ResourceKey::Ip(ip) => ResourceConsumerState {
-                        ip: Some(*ip),
-                        peer: None,
-                        balance,
-                        warnings: entry.warnings,
-                        disconnects: entry.disconnects,
-                        last_reason: entry.last_reason.clone(),
-                        blocked_until_ms: entry
-                            .blocked_until
-                            .filter(|until| *until > now)
-                            .map(|until| until.saturating_duration_since(now).as_millis() as u64),
-                    },
-                    ResourceKey::Peer(peer) => ResourceConsumerState {
-                        ip: None,
-                        peer: Some(peer.clone()),
-                        balance,
-                        warnings: entry.warnings,
-                        disconnects: entry.disconnects,
-                        last_reason: entry.last_reason.clone(),
-                        blocked_until_ms: entry
-                            .blocked_until
-                            .filter(|until| *until > now)
-                            .map(|until| until.saturating_duration_since(now).as_millis() as u64),
-                    },
+        let mut consumers: Vec<_> =
+            self.entries
+                .iter()
+                .filter(|(key, _)| matches!(key, ResourceKey::Ip(_)))
+                .filter_map(|(key, entry)| {
+                    let balance = entry.balance_at(now);
+                    if balance < MINIMUM_GOSSIP_BALANCE {
+                        return None;
+                    }
+                    Some(match key {
+                        ResourceKey::Ip(ip) => ResourceConsumerState {
+                            ip: Some(*ip),
+                            peer: None,
+                            balance,
+                            warnings: entry.warnings,
+                            disconnects: entry.disconnects,
+                            last_reason: entry.last_reason.clone(),
+                            blocked_until_ms: entry.blocked_until.filter(|until| *until > now).map(
+                                |until| until.saturating_duration_since(now).as_millis() as u64,
+                            ),
+                        },
+                        ResourceKey::Peer(peer) => ResourceConsumerState {
+                            ip: None,
+                            peer: Some(peer.clone()),
+                            balance,
+                            warnings: entry.warnings,
+                            disconnects: entry.disconnects,
+                            last_reason: entry.last_reason.clone(),
+                            blocked_until_ms: entry.blocked_until.filter(|until| *until > now).map(
+                                |until| until.saturating_duration_since(now).as_millis() as u64,
+                            ),
+                        },
+                    })
                 })
-            })
-            .collect();
+                .collect();
         consumers.sort_by(|a, b| {
             b.blocked_until_ms
                 .cmp(&a.blocked_until_ms)
@@ -821,8 +815,13 @@ mod tests {
         let mut manager = ResourceManager::default();
         let now = Instant::now();
         let addr: SocketAddr = "198.51.100.7:51235".parse().unwrap();
-        let disposition =
-            manager.charge_peer(addr, Some("n9ExamplePeer"), DISCONNECT_THRESHOLD, "drop", now);
+        let disposition = manager.charge_peer(
+            addr,
+            Some("n9ExamplePeer"),
+            DISCONNECT_THRESHOLD,
+            "drop",
+            now,
+        );
         assert_eq!(disposition, ResourceDisposition::Disconnect);
         assert!(manager.is_blocked_peer(addr, Some("n9ExamplePeer"), now));
         assert!(!manager.is_blocked_peer(addr, Some("n9OtherPeer"), now));
@@ -840,8 +839,7 @@ mod tests {
         let addr: SocketAddr = "198.51.100.17:51235".parse().unwrap();
         let mut consumer = manager.new_inbound_endpoint(addr, false, None);
 
-        let disposition =
-            manager.charge_consumer(&consumer, DISCONNECT_THRESHOLD, "drop", now);
+        let disposition = manager.charge_consumer(&consumer, DISCONNECT_THRESHOLD, "drop", now);
         assert_eq!(disposition, ResourceDisposition::Disconnect);
         assert!(manager.is_blocked(addr, now));
 
@@ -921,11 +919,7 @@ mod tests {
             last_reason: "gossip-b".to_string(),
             blocked_until_ms: None,
         };
-        manager.import_consumers(
-            "origin-a",
-            vec![imported],
-            now,
-        );
+        manager.import_consumers("origin-a", vec![imported], now);
 
         let exported = manager.export_consumers(now, 8);
         assert_eq!(exported.len(), 1);
@@ -963,8 +957,7 @@ mod tests {
         let addr: SocketAddr = "203.0.113.81:51235".parse().unwrap();
         let consumer = manager.new_unlimited_endpoint(addr);
 
-        let disposition =
-            manager.charge_consumer(&consumer, DISCONNECT_THRESHOLD, "admin", now);
+        let disposition = manager.charge_consumer(&consumer, DISCONNECT_THRESHOLD, "admin", now);
 
         assert_eq!(consumer.kind(), ResourceConsumerKind::Unlimited);
         assert_eq!(disposition, ResourceDisposition::Ok);

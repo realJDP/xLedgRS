@@ -163,9 +163,14 @@ impl Peerfinder {
         let discovery_score = i64::from(discovery_count.min(16)) * 50;
         let source_count = source_count.max(1).min(8) as i64;
         let source_diversity_bonus = (9 - source_count) * 120;
-        let failure_penalty =
-            i64::from(entry.failure_count.min(64)) * 75 + i64::from(consecutive_failures.min(16)) * 400;
-        let redirect_penalty = i64::from(runtime.map(|entry| entry.redirect_count).unwrap_or(0).min(8)) * 200;
+        let failure_penalty = i64::from(entry.failure_count.min(64)) * 75
+            + i64::from(consecutive_failures.min(16)) * 400;
+        let redirect_penalty = i64::from(
+            runtime
+                .map(|entry| entry.redirect_count)
+                .unwrap_or(0)
+                .min(8),
+        ) * 200;
         let backoff_penalty = if !entry.fixed && entry.next_attempt_unix > now_unix {
             100_000
         } else {
@@ -343,12 +348,7 @@ impl Peerfinder {
         self.has_slot_for(address) || self.has_live_runtime(address)
     }
 
-    pub fn note_endpoints(
-        &mut self,
-        from: SocketAddr,
-        addrs: &[SocketAddr],
-        now_unix: u64,
-    ) {
+    pub fn note_endpoints(&mut self, from: SocketAddr, addrs: &[SocketAddr], now_unix: u64) {
         let runtime = self.runtime_entry_mut(from);
         runtime.endpoint_reports = runtime.endpoint_reports.saturating_add(1);
         let source = format!("peer_endpoints:{from}");
@@ -370,11 +370,10 @@ impl Peerfinder {
         now_unix: u64,
         limit: usize,
     ) -> Vec<SocketAddr> {
-        let mut addrs =
-            Self::diversify_by_ip(self.ranked_entries(now_unix, true, true))
-                .into_iter()
-                .filter(|addr| *addr != peer_addr)
-                .collect::<Vec<_>>();
+        let mut addrs = Self::diversify_by_ip(self.ranked_entries(now_unix, true, true))
+            .into_iter()
+            .filter(|addr| *addr != peer_addr)
+            .collect::<Vec<_>>();
         if addrs.len() > limit {
             addrs.truncate(limit);
         }
@@ -507,12 +506,7 @@ impl Peerfinder {
         self.note_closed(slot.remote, now_unix);
     }
 
-    pub fn note_redirect(
-        &mut self,
-        from: SocketAddr,
-        to: SocketAddr,
-        now_unix: u64,
-    ) {
+    pub fn note_redirect(&mut self, from: SocketAddr, to: SocketAddr, now_unix: u64) {
         let redirect_source = format!("redirect:{from}");
         if let Some(runtime) = self.runtime.get_mut(&from) {
             runtime.redirect_count = runtime.redirect_count.saturating_add(1);
@@ -558,22 +552,12 @@ impl Peerfinder {
         self.remove_slots_for_address(address);
     }
 
-    pub fn on_failure(
-        &mut self,
-        slot: &PeerfinderSlot,
-        reason: impl Into<String>,
-        now_unix: u64,
-    ) {
+    pub fn on_failure(&mut self, slot: &PeerfinderSlot, reason: impl Into<String>, now_unix: u64) {
         self.slots.remove(&slot.id);
         self.note_failure(slot.remote, reason, now_unix);
     }
 
-    pub fn redirect(
-        &self,
-        slot: &PeerfinderSlot,
-        now_unix: u64,
-        limit: usize,
-    ) -> Vec<SocketAddr> {
+    pub fn redirect(&self, slot: &PeerfinderSlot, now_unix: u64, limit: usize) -> Vec<SocketAddr> {
         self.build_endpoints_for_peer(slot.remote, now_unix, limit)
     }
 
@@ -613,7 +597,8 @@ impl Peerfinder {
             }
             true
         });
-        self.runtime.retain(|address, _| self.entries.contains_key(address));
+        self.runtime
+            .retain(|address, _| self.entries.contains_key(address));
     }
 
     pub fn once_per_second(&mut self, now_unix: u64) {
@@ -689,11 +674,7 @@ impl Peerfinder {
             .values()
             .filter(|slot| slot.connected && slot.activated)
             .count();
-        let reserved_slots = self
-            .slots
-            .values()
-            .filter(|slot| slot.reserved)
-            .count();
+        let reserved_slots = self.slots.values().filter(|slot| slot.reserved).count();
         entries.truncate(limit);
         PeerfinderSnapshot {
             total_known: self.entries.len(),
@@ -952,7 +933,12 @@ mod tests {
         peerfinder.activate(&inbound_slot, Some("n9Inbound".to_string()), true, now + 1);
         let _ = peerfinder.on_connected(&mut inbound_slot, None, now + 1);
         let mut outbound_slot = peerfinder.note_slot_opened(outbound, false, now);
-        peerfinder.activate(&outbound_slot, Some("n9Outbound".to_string()), false, now + 1);
+        peerfinder.activate(
+            &outbound_slot,
+            Some("n9Outbound".to_string()),
+            false,
+            now + 1,
+        );
         let _ = peerfinder.on_connected(&mut outbound_slot, None, now + 1);
 
         let snapshot = peerfinder.snapshot(8);
@@ -988,7 +974,8 @@ mod tests {
         peerfinder.note_discovered(learned, "peer", now);
         let mut slot = peerfinder.new_inbound_slot(inbound, now);
         peerfinder.activate(&slot, Some("n9Inbound".to_string()), false, now + 1);
-        let _ = peerfinder.on_connected(&mut slot, Some("192.0.2.1:51235".parse().unwrap()), now + 1);
+        let _ =
+            peerfinder.on_connected(&mut slot, Some("192.0.2.1:51235".parse().unwrap()), now + 1);
 
         let bundles = peerfinder.build_endpoints_for_peers(now + 1, 8);
         assert_eq!(bundles.len(), 1);
