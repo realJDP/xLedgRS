@@ -126,6 +126,88 @@ fn iou_value_to_amount(v: &IouValue, template: &Amount) -> Amount {
     }
 }
 
+fn spendable_iou_funds_for_offer(
+    state: &mut LedgerState,
+    account: &[u8; 20],
+    issuer: &[u8; 20],
+    currency: &crate::transaction::amount::Currency,
+) -> IouValue {
+    let trustline = load_trustline_for_offer_funds(state, account, issuer, currency);
+
+    let Some(trustline) = trustline else {
+        return IouValue::ZERO;
+    };
+
+    let balance = trustline.balance_for(account);
+    let opposite_limit = if account == &trustline.low_account {
+        trustline.high_limit
+    } else {
+        trustline.low_limit
+    };
+    balance.add(&opposite_limit)
+}
+
+fn load_trustline_for_offer_funds(
+    state: &mut LedgerState,
+    account: &[u8; 20],
+    issuer: &[u8; 20],
+    currency: &crate::transaction::amount::Currency,
+) -> Option<crate::ledger::RippleState> {
+    let key = crate::ledger::trustline::shamap_key(account, issuer, currency);
+    if let Some(tl) = state.get_trustline(&key) {
+        return Some(tl.clone());
+    }
+    let raw = state.get_raw_owned(&key)?;
+    let tl = crate::ledger::RippleState::decode_from_sle(&raw)?;
+    state.hydrate_trustline(tl.clone());
+    Some(tl)
+}
+
+fn debug_offer_funding_enabled(seq: u32) -> bool {
+    std::env::var("XLEDGRS_DEBUG_OFFER_SEQS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|entry| entry.trim().parse::<u32>().ok())
+                .any(|target| target == seq)
+        })
+        .unwrap_or(false)
+}
+
+fn compare_iou_values(a: &IouValue, b: &IouValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (a.mantissa == 0, b.mantissa == 0) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+
+    if a.exponent == b.exponent {
+        return a.mantissa.cmp(&b.mantissa);
+    }
+
+    let exp_diff = a.exponent - b.exponent;
+    if exp_diff > 30 {
+        return Ordering::Greater;
+    }
+    if exp_diff < -30 {
+        return Ordering::Less;
+    }
+
+    if exp_diff > 0 {
+        (a.mantissa as i128 * 10i128.pow(exp_diff as u32)).cmp(&(b.mantissa as i128))
+    } else {
+        (a.mantissa as i128).cmp(&(b.mantissa as i128 * 10i128.pow((-exp_diff) as u32)))
+    }
+}
+
+fn compare_amounts(a: &Amount, b: &Amount) -> std::cmp::Ordering {
+    compare_iou_values(&amount_to_iou_value(a), &amount_to_iou_value(b))
+}
+
 /// Rippled's `Quality::ceil_in_strict` subset: given an offer's (in, out) and
 /// a limit on the IN side, compute the corresponding OUT side using the
 /// stored quality rate. `round_up = true` rounds away from zero on positive
@@ -144,16 +226,7 @@ fn ceil_in_strict_via_quality(
     // Compare `limit_in` to `offer_in`. If the full offer can be taken, do so.
     let limit_iou = amount_to_iou_value(limit_in);
     let offer_in_iou = amount_to_iou_value(offer_in);
-
-    // Use i128 comparison at common exponent for correctness
-    let cmp_result = {
-        let a = limit_iou.mantissa as i128 * 10i128.pow(limit_iou.exponent.max(0) as u32);
-        let _ = a;
-        // Simpler: both are non-negative at this point. Compare via f64 for
-        // This is a monotonic decision; only the larger value matters.
-        limit_iou.to_f64() >= offer_in_iou.to_f64()
-    };
-    if cmp_result {
+    if compare_iou_values(&limit_iou, &offer_in_iou) != std::cmp::Ordering::Less {
         return (offer_in.clone(), offer_out.clone());
     }
 
@@ -191,6 +264,45 @@ fn ceil_in_strict_via_quality(
     (limit_in.clone(), new_out)
 }
 
+/// Rippled's `Quality::ceil_out_strict` subset: given an offer's (in, out)
+/// and a limit on the OUT side, compute the corresponding IN side using the
+/// stored quality rate.
+fn ceil_out_strict_via_quality(
+    offer_in: &Amount,
+    offer_out: &Amount,
+    limit_out: &Amount,
+    book_directory: &[u8; 32],
+    round_up: bool,
+) -> (Amount, Amount) {
+    let limit_iou = amount_to_iou_value(limit_out);
+    let offer_out_iou = amount_to_iou_value(offer_out);
+    if compare_iou_values(&limit_iou, &offer_out_iou) != std::cmp::Ordering::Less {
+        return (offer_in.clone(), offer_out.clone());
+    }
+
+    let rate = quality_rate_from_book_dir(book_directory);
+    if rate.mantissa == 0 {
+        return (offer_in.clone(), offer_out.clone());
+    }
+
+    let result_negative = (limit_iou.mantissa < 0) != (rate.mantissa < 0);
+    let result_mantissa_u128 =
+        (limit_iou.mantissa.unsigned_abs() as u128).saturating_mul(rate.mantissa.unsigned_abs() as u128);
+    let result_exp = limit_iou.exponent + rate.exponent;
+    let (mant_norm, exp_norm) = normalize_u128(result_mantissa_u128, result_exp, round_up);
+    let new_in_iou = IouValue {
+        mantissa: if result_negative {
+            -(mant_norm as i64)
+        } else {
+            mant_norm as i64
+        },
+        exponent: exp_norm,
+    };
+
+    let new_in = iou_value_to_amount(&new_in_iou, offer_in);
+    (new_in, limit_out.clone())
+}
+
 /// Apply an OfferCreate: attempt to cross against the opposite book,
 /// then place any unfilled remainder as a standing order.
 pub(crate) fn apply_offer_create(
@@ -210,6 +322,12 @@ pub(crate) fn apply_offer_create(
         Some(a) => a.clone(),
         None => return ApplyResult::ClaimedCost("temBAD_OFFER"),
     };
+    let original_pays = remaining_pays.clone();
+    let original_gets = remaining_gets.clone();
+    let original_book_key = BookKey::from_amounts(&original_pays, &original_gets);
+    let original_book_quality = directory::offer_quality(&original_gets, &original_pays);
+    let original_book_directory =
+        directory::book_dir_quality_key(&original_book_key, original_book_quality);
 
     let offer_seq = super::sequence_proxy(tx);
 
@@ -257,43 +375,35 @@ pub(crate) fn apply_offer_create(
     // Funding check: does the account have enough of TakerGets to back the offer?
     // rippled returns tecUNFUNDED_OFFER if the account can't fund the offer.
     let funded = match &remaining_gets {
-        Amount::Xrp(drops) => {
-            // For XRP: account must have balance > reserve + offer amount
-            let fees = crate::ledger::fees::Fees::default();
+        Amount::Xrp(_) => {
+            // Rippled only rejects as unfunded when spendable XRP is zero.
+            // The offer amount itself may exceed the current liquid balance.
+            let fees = crate::ledger::read_fees(state);
             let acct = state.get_account(&tx.account);
             let balance = acct.map(|a| a.balance).unwrap_or(0);
             let owner_count = acct.map(|a| a.owner_count).unwrap_or(0);
-            let reserve = fees.reserve_base + (owner_count as u64 * fees.reserve_inc);
+            let owner_delta = owner_count_deltas.get(&tx.account).copied().unwrap_or(0) as i64;
+            let effective_owner_count = (owner_count as i64 + owner_delta).max(0) as u64;
+            let reserve = fees.reserve + (effective_owner_count * fees.increment);
             let released = match released_gets_from_cancel.as_ref() {
                 Some(Amount::Xrp(d)) => *d,
                 _ => 0,
             };
-            balance.saturating_add(released).saturating_sub(reserve) >= *drops
+            balance.saturating_add(released).saturating_sub(reserve) > 0
         }
         Amount::Iou {
-            value,
             currency,
             issuer,
+            ..
         } => {
             if &tx.account == issuer {
                 true
             } else {
-                // For IOU: trust line must have sufficient balance
-                let key = crate::ledger::trustline::shamap_key(&tx.account, issuer, currency);
-                let mut available = if let Some(tl) = state.get_trustline(&key) {
-                    tl.balance_for(&tx.account)
-                } else if let Some(raw) = state.get_raw_owned(&key) {
-                    // Hydrate from NuDB
-                    if let Some(tl) = crate::ledger::RippleState::decode_from_sle(&raw) {
-                        let available = tl.balance_for(&tx.account);
-                        state.hydrate_trustline(tl);
-                        available
-                    } else {
-                        IouValue::ZERO
-                    }
-                } else {
-                    IouValue::ZERO
-                };
+                // For IOU: spendable funds include the counterparty's credit
+                // headroom on the trust line, not just a currently-positive
+                // balance.
+                let mut available =
+                    spendable_iou_funds_for_offer(state, &tx.account, issuer, currency);
 
                 if let Some(Amount::Iou {
                     value: released,
@@ -306,12 +416,56 @@ pub(crate) fn apply_offer_create(
                     }
                 }
 
-                !available.sub(value).is_negative()
+                available.is_positive()
             }
         }
         _ => true,
     };
     if !funded {
+        if debug_offer_funding_enabled(tx.sequence) {
+            if let Amount::Iou {
+                currency, issuer, ..
+            } = &remaining_gets
+            {
+                let trustline =
+                    load_trustline_for_offer_funds(state, &tx.account, issuer, currency);
+                let available =
+                    spendable_iou_funds_for_offer(state, &tx.account, issuer, currency);
+                if let Some(tl) = trustline {
+                    let balance = tl.balance_for(&tx.account);
+                    let opposite_limit = if tx.account == tl.low_account {
+                        tl.high_limit
+                    } else {
+                        tl.low_limit
+                    };
+                    tracing::warn!(
+                        "offer funding debug: seq={} acct={} issuer={} balance={}e{} low_limit={}e{} high_limit={}e{} opposite_limit={}e{} available={}e{}",
+                        tx.sequence,
+                        hex::encode_upper(tx.account),
+                        hex::encode_upper(issuer),
+                        balance.mantissa,
+                        balance.exponent,
+                        tl.low_limit.mantissa,
+                        tl.low_limit.exponent,
+                        tl.high_limit.mantissa,
+                        tl.high_limit.exponent,
+                        opposite_limit.mantissa,
+                        opposite_limit.exponent,
+                        available.mantissa,
+                        available.exponent,
+                    );
+                } else {
+                    tracing::warn!(
+                        "offer funding debug: seq={} acct={} issuer={} trustline=missing available={}e{}",
+                        tx.sequence,
+                        hex::encode_upper(tx.account),
+                        hex::encode_upper(issuer),
+                        available.mantissa,
+                        available.exponent,
+                    );
+                }
+            }
+        }
         return ApplyResult::ClaimedCost("tecUNFUNDED_OFFER");
     }
 
@@ -327,6 +481,7 @@ pub(crate) fn apply_offer_create(
     let mut offers_to_remove = Vec::new();
     const MAX_CROSSING_STEPS: usize = 850; // matches rippled
     let mut steps = 0;
+    let mut crossed_any = false;
 
     for key in &crossing_keys {
         if steps >= MAX_CROSSING_STEPS {
@@ -411,11 +566,7 @@ pub(crate) fn apply_offer_create(
         let is_sell = (tx.flags & TF_SELL) != 0;
         let ratio_receive = normalize_ratio(we_want_i, exp_want, they_give_i, exp_give);
         let ratio_pay = normalize_ratio(we_can_pay_i, exp_can_pay, they_want_i, exp_they_want);
-        let (mut fill_num, fill_den) = if is_sell {
-            ratio_pay
-        } else {
-            min_ratio(ratio_receive, ratio_pay)
-        };
+        let (mut fill_num, fill_den) = if is_sell { ratio_pay } else { min_ratio(ratio_receive, ratio_pay) };
         if fill_num > fill_den {
             fill_num = fill_den;
         }
@@ -443,10 +594,37 @@ pub(crate) fn apply_offer_create(
             );
             (fin, fout)
         } else {
-            let filled_receive = scale_amount(&book_offer.taker_gets, fill_num, fill_den);
-            let filled_pay = scale_amount(&book_offer.taker_pays, fill_num, fill_den);
-            (filled_pay, filled_receive)
+            let desired_out = if compare_amounts(&remaining_pays, &book_offer.taker_gets)
+                == std::cmp::Ordering::Greater
+            {
+                book_offer.taker_gets.clone()
+            } else {
+                remaining_pays.clone()
+            };
+            let (pay_for_desired_out, filled_receive) = ceil_out_strict_via_quality(
+                &book_offer.taker_pays,
+                &book_offer.taker_gets,
+                &desired_out,
+                &book_offer.book_directory,
+                true,
+            );
+            if compare_amounts(&pay_for_desired_out, &remaining_gets) != std::cmp::Ordering::Greater
+            {
+                (pay_for_desired_out, filled_receive)
+            } else {
+                ceil_in_strict_via_quality(
+                    &book_offer.taker_pays,
+                    &book_offer.taker_gets,
+                    &remaining_gets,
+                    &book_offer.book_directory,
+                    false,
+                )
+            }
         };
+
+        if amount_is_zero(&filled_pay) || amount_is_zero(&filled_receive) {
+            continue;
+        }
 
         // Transfer assets between the two parties
         transfer_amount(state, &tx.account, true, &filled_receive);
@@ -457,14 +635,22 @@ pub(crate) fn apply_offer_create(
         // Update the remaining want/give values.
         remaining_pays = subtract_amount(&remaining_pays, &filled_receive);
         remaining_gets = subtract_amount(&remaining_gets, &filled_pay);
+        crossed_any = true;
 
-        let fully_consumed = fill_num >= fill_den;
+        let fully_consumed =
+            compare_amounts(&filled_receive, &book_offer.taker_gets) != std::cmp::Ordering::Less;
         if fully_consumed {
             offers_to_remove.push(*key);
         } else {
             state.remove_offer(key);
             let new_gets = subtract_amount(&book_offer.taker_gets, &filled_receive);
-            let new_pays = subtract_amount(&book_offer.taker_pays, &filled_pay);
+            let (new_pays, _) = ceil_out_strict_via_quality(
+                &book_offer.taker_pays,
+                &book_offer.taker_gets,
+                &new_gets,
+                &book_offer.book_directory,
+                true,
+            );
             if !amount_is_zero(&new_gets) && !amount_is_zero(&new_pays) {
                 let mut updated = book_offer.clone();
                 updated.taker_gets = new_gets;
@@ -569,6 +755,28 @@ pub(crate) fn apply_offer_create(
     const TF_IMMEDIATE_OR_CANCEL: u32 = 0x00020000;
     const TF_FILL_OR_KILL: u32 = 0x00040000;
 
+    if crossed_any && !amount_is_zero(&remaining_pays) && !amount_is_zero(&remaining_gets) {
+        if (tx.flags & 0x00080000) != 0 {
+            let (recomputed_pays, _) = ceil_out_strict_via_quality(
+                &original_pays,
+                &original_gets,
+                &remaining_gets,
+                &original_book_directory.0,
+                true,
+            );
+            remaining_pays = recomputed_pays;
+        } else {
+            let (_, recomputed_gets) = ceil_in_strict_via_quality(
+                &original_pays,
+                &original_gets,
+                &remaining_pays,
+                &original_book_directory.0,
+                false,
+            );
+            remaining_gets = recomputed_gets;
+        }
+    }
+
     // tfFillOrKill: cancel entire offer if any remainder (must be fully filled)
     if (tx.flags & TF_FILL_OR_KILL) != 0
         && (!amount_is_zero(&remaining_pays) || !amount_is_zero(&remaining_gets))
@@ -585,7 +793,7 @@ pub(crate) fn apply_offer_create(
         let offer_key = crate::ledger::offer::shamap_key(&tx.account, offer_seq);
         let owner_node = directory::dir_add(state, &tx.account, offer_key.0);
         let book_key = BookKey::from_amounts(&remaining_pays, &remaining_gets);
-        let book_quality = directory::offer_quality(&remaining_gets, &remaining_pays);
+        let book_quality = original_book_quality;
         let (book_directory, book_node) =
             directory::dir_add_book(state, &book_key, book_quality, offer_key.0);
         // Translate transaction flags → ledger entry flags.

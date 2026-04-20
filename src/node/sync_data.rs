@@ -256,26 +256,8 @@ impl Node {
                 Err(e) => error!("NuDB flush FAILED: {}", e),
             }
         }
-        info!("sync data processor: handing off SHAMap to LedgerState");
-        {
-            let state = self.state.read().await;
-            let mut ls = state
-                .ctx
-                .ledger_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            ls.set_nudb_shamap(shamap);
-        }
-        let verified_root_hash = {
-            let state = self.state.read().await;
-            let mut ls = state
-                .ctx
-                .ledger_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            ls.enable_sparse();
-            ls.state_hash()
-        };
+        let mut handoff_shamap = shamap;
+        let verified_root_hash = handoff_shamap.root_hash();
         let completion = plan_sync_completion_outcome(verified_root_hash, sync_header.account_hash);
 
         if completion.verified {
@@ -284,6 +266,17 @@ impl Node {
                 hex::encode_upper(&verified_root_hash[..8]),
             );
             let anchor_verified = self.acquire_sync_anchor_transactions(&sync_header).await;
+            info!("sync data processor: handing off SHAMap to LedgerState");
+            {
+                let state = self.state.read().await;
+                let mut ls = state
+                    .ctx
+                    .ledger_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                ls.set_nudb_shamap(handoff_shamap);
+                ls.enable_sparse();
+            }
             {
                 let mut state = self.state.write().await;
                 if completion.clear_sync_in_progress {

@@ -1198,6 +1198,230 @@ mod tests {
     }
 
     #[test]
+    fn validated_replay_same_currency_sendmax_does_not_mutate_trustline_locally() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_two_accounts();
+        let trustset = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1000.0);
+        assert_eq!(
+            apply_tx(&mut state, &trustset, &ctx(0)),
+            ApplyResult::Success
+        );
+
+        let usd = Currency::from_code("USD").unwrap();
+        let key = crate::ledger::trustline::shamap_key(&genesis_id(), &dest_id(), &usd);
+        {
+            let mut tl = state.get_trustline(&key).unwrap().clone();
+            if genesis_id() < dest_id() {
+                tl.balance = IouValue::from_f64(100.0);
+            } else {
+                tl.balance = IouValue::from_f64(-100.0);
+            }
+            state.insert_trustline(tl);
+        }
+        let before = state
+            .get_trustline(&key)
+            .unwrap()
+            .balance_for(&genesis_id());
+
+        let tx = ParsedTx {
+            tx_type: 0,
+            sequence: 2,
+            fee: 12,
+            account: genesis_id(),
+            destination: Some(dest_id()),
+            amount: Some(Amount::Iou {
+                value: IouValue::from_f64(50.0),
+                currency: usd.clone(),
+                issuer: dest_id(),
+            }),
+            send_max: Some(Amount::Iou {
+                value: IouValue::from_f64(60.0),
+                currency: usd.clone(),
+                issuer: dest_id(),
+            }),
+            ..ParsedTx::default()
+        };
+        let replay_ctx = TxContext {
+            ledger_seq: 3,
+            validated_result: Some(ter::TES_SUCCESS),
+            ..TxContext::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &replay_ctx, ApplyFlags::VALIDATED_REPLAY);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let after = state.get_trustline(&key).unwrap().balance_for(&genesis_id());
+        assert_eq!(after.mantissa, before.mantissa);
+        assert_eq!(after.exponent, before.exponent);
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.sequence, 3);
+    }
+
+    #[test]
+    fn validated_replay_direct_xrp_payment_applies_locally() {
+        let mut state = state_with_genesis(50_000_000);
+        let tx = sign_payment(1, 10_000_000, 12);
+        let replay_ctx = TxContext {
+            ledger_seq: 2,
+            validated_result: Some(ter::TES_SUCCESS),
+            ..TxContext::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &replay_ctx, ApplyFlags::VALIDATED_REPLAY);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 50_000_000 - 12 - 10_000_000);
+        assert_eq!(sender.sequence, 2);
+
+        let dest = state.get_account(&dest_id()).unwrap();
+        assert_eq!(dest.balance, 10_000_000);
+    }
+
+    #[test]
+    fn same_currency_sendmax_without_validated_replay_returns_path_dry() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_two_accounts();
+        let trustset = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1000.0);
+        assert_eq!(
+            apply_tx(&mut state, &trustset, &ctx(0)),
+            ApplyResult::Success
+        );
+
+        let usd = Currency::from_code("USD").unwrap();
+        let tx = ParsedTx {
+            tx_type: 0,
+            sequence: 2,
+            fee: 12,
+            account: genesis_id(),
+            destination: Some(dest_id()),
+            amount: Some(Amount::Iou {
+                value: IouValue::from_f64(50.0),
+                currency: usd.clone(),
+                issuer: dest_id(),
+            }),
+            send_max: Some(Amount::Iou {
+                value: IouValue::from_f64(60.0),
+                currency: usd,
+                issuer: dest_id(),
+            }),
+            ..ParsedTx::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEC_PATH_DRY);
+        assert!(result.applied, "unsupported same-currency SendMax should fee-claim");
+    }
+
+    #[test]
+    fn direct_xrp_payment_below_reserve_returns_tec_unfunded_payment() {
+        let mut state = state_with_genesis(20_000_000);
+        state.insert_account(AccountRoot {
+            account_id: dest_id(),
+            balance: 1,
+            sequence: 1,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        });
+        let tx = sign_payment(1, 10_500_000, 12);
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEC_UNFUNDED_PAYMENT);
+        assert!(result.applied, "direct tec should collapse to fee-only");
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 20_000_000 - 12);
+        assert_eq!(sender.sequence, 2);
+        assert_eq!(state.get_account(&dest_id()).unwrap().balance, 1);
+    }
+
+    #[test]
+    fn direct_xrp_payment_uses_existing_raw_destination_account() {
+        let mut state = state_with_genesis(50_000_000);
+        let dest = AccountRoot {
+            account_id: dest_id(),
+            balance: 25,
+            sequence: 7,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let dest_key = crate::ledger::account::shamap_key(&dest.account_id);
+        state.insert_raw(dest_key, dest.to_sle_binary());
+        assert!(state.get_account(&dest.account_id).is_none());
+
+        let tx = sign_payment(1, 10_000_000, 12);
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let hydrated = state.get_account(&dest.account_id).unwrap();
+        assert_eq!(hydrated.balance, 10_000_025);
+        assert_eq!(hydrated.sequence, 7);
+    }
+
+    #[test]
+    fn direct_xrp_payment_uses_committed_raw_destination_account() {
+        use crate::ledger::node_store::MemNodeStore;
+        use crate::ledger::shamap::{MapType, SHAMap};
+
+        let backend = std::sync::Arc::new(MemNodeStore::new());
+        let mut state = state_with_genesis(50_000_000);
+        state.set_nudb_shamap(SHAMap::with_backend(MapType::AccountState, backend));
+
+        let dest = AccountRoot {
+            account_id: dest_id(),
+            balance: 25,
+            sequence: 7,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let dest_key = crate::ledger::account::shamap_key(&dest.account_id);
+        state.insert_raw(dest_key, dest.to_sle_binary());
+        state.flush_nudb().unwrap();
+        state.enable_sparse();
+
+        let tx = sign_payment(1, 10_000_000, 12);
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let hydrated = state.get_account(&dest.account_id).unwrap();
+        assert_eq!(hydrated.balance, 10_000_025);
+        assert_eq!(hydrated.sequence, 7);
+    }
+
+    #[test]
     fn test_apply_creates_destination_account() {
         let mut state = state_with_genesis(50_000_000);
         assert!(state.get_account(&dest_id()).is_none());
@@ -1340,6 +1564,33 @@ mod tests {
         // Owner count incremented on both sides
         let sender = state.get_account(&genesis_id()).unwrap();
         assert_eq!(sender.owner_count, 1);
+    }
+
+    #[test]
+    fn test_trustset_records_actual_owner_directory_page_numbers() {
+        let mut state = state_with_two_accounts();
+        for i in 0..32u8 {
+            let mut fake = [0u8; 32];
+            fake[31] = i;
+            crate::ledger::directory::dir_add(&mut state, &genesis_id(), fake);
+        }
+
+        let tx = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1000.0);
+        let result = apply_tx(&mut state, &tx, &ctx(0));
+        assert_eq!(result, ApplyResult::Success);
+
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let tl = state
+            .get_trustline_for(&genesis_id(), &dest_id(), &usd)
+            .expect("trust line should have been created");
+
+        if tl.low_account == genesis_id() {
+            assert_eq!(tl.low_node, 1);
+            assert_eq!(tl.high_node, 0);
+        } else {
+            assert_eq!(tl.low_node, 0);
+            assert_eq!(tl.high_node, 1);
+        }
     }
 
     #[test]
@@ -1493,6 +1744,55 @@ mod tests {
         let sender = state.get_account(&genesis_id()).unwrap();
         assert_eq!(sender.owner_count, 1);
         assert_eq!(sender.sequence, 2);
+    }
+
+    #[test]
+    fn test_offer_create_with_positive_xrp_liquidity_is_not_unfunded() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_genesis(10_500_000);
+        let usd = Amount::Iou {
+            value: IouValue::from_f64(100.0),
+            currency: Currency::from_code("USD").unwrap(),
+            issuer: dest_id(),
+        };
+        let tx = sign_offer_create(1, usd, Amount::Xrp(100_000_000));
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+        assert_eq!(state.offers_by_account(&genesis_id()).len(), 1);
+    }
+
+    #[test]
+    fn test_offer_create_with_opposite_limit_headroom_is_not_unfunded() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_two_accounts();
+        let trustset = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1000.0);
+        apply_tx(&mut state, &trustset, &ctx(0));
+
+        let usd = Currency::from_code("USD").unwrap();
+        let key = crate::ledger::trustline::shamap_key(&genesis_id(), &dest_id(), &usd);
+        let mut tl = state.get_trustline(&key).unwrap().clone();
+        tl.balance = IouValue::ZERO;
+        tl.low_limit = IouValue::ZERO;
+        tl.high_limit = IouValue::ZERO;
+        if genesis_id() < dest_id() {
+            tl.high_limit = IouValue::from_f64(1000.0);
+        } else {
+            tl.low_limit = IouValue::from_f64(1000.0);
+        }
+        state.insert_trustline(tl);
+
+        let usd_amount = Amount::Iou {
+            value: IouValue::from_f64(10.0),
+            currency: usd,
+            issuer: dest_id(),
+        };
+        let tx = sign_offer_create(2, usd_amount, Amount::Xrp(1_000_000));
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+        assert_eq!(state.offers_by_account(&genesis_id()).len(), 1);
     }
 
     #[test]

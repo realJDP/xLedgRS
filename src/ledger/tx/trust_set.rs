@@ -70,8 +70,15 @@ pub(crate) fn apply_trustset(
             }
             // New trust line — add to BOTH accounts' owner directories
             // (rippled RippleStateHelpers.cpp:192,198)
-            directory::dir_add(state, &tx.account, key.0);
-            directory::dir_add(state, &counterparty, key.0);
+            let sender_owner_node = directory::dir_add(state, &tx.account, key.0);
+            let counterparty_owner_node = directory::dir_add(state, &counterparty, key.0);
+            if tx.account == tl.low_account {
+                tl.low_node = sender_owner_node;
+                tl.high_node = counterparty_owner_node;
+            } else {
+                tl.low_node = counterparty_owner_node;
+                tl.high_node = sender_owner_node;
+            }
             // New trust line — increment owner counts
             new_sender.owner_count += 1;
             if let Some(peer) = state.get_account(&counterparty) {

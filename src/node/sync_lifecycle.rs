@@ -207,9 +207,12 @@ impl Node {
     pub async fn trigger_resync(&self) {
         info!("trigger_resync: clearing sync state and re-entering sync mode");
 
-        let inbound_ledgers = {
+        let (inbound_ledgers, ledger_state) = {
             let state = self.state.read().await;
-            state.services.inbound_ledgers.clone()
+            (
+                state.services.inbound_ledgers.clone(),
+                state.ctx.ledger_state.clone(),
+            )
         };
 
         {
@@ -240,6 +243,11 @@ impl Node {
 
         if let Some(ref backend) = self.nudb_backend {
             backend.clear_in_memory();
+        }
+
+        {
+            let mut ledger_state = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+            ledger_state.reset_for_fresh_sync();
         }
 
         {

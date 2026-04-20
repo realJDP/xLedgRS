@@ -20,7 +20,7 @@
 //! offline, comparing its output byte-for-byte against rippled_reference.bin
 //! to identify the first divergent key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -77,7 +77,12 @@ pub struct Artifact {
 /// must not rely on the bundle existing.
 pub async fn capture_forensic_bundle(
     inputs: CaptureInputs,
-) -> anyhow::Result<(PathBuf, HashMap<[u8; 32], Vec<u8>>)> {
+) -> anyhow::Result<(
+    PathBuf,
+    HashMap<[u8; 32], Vec<u8>>,
+    HashSet<[u8; 32]>,
+    HashSet<[u8; 32]>,
+)> {
     let ts = iso8601_now();
     let dir = inputs.bundle_root.join(format!(
         "{}-{}-{}",
@@ -120,7 +125,8 @@ pub async fn capture_forensic_bundle(
     // 5. Fetch rippled reference bytes for touched keys while the ledger is
     //    still in rippled's retention window. This is the step that captures
     //    "authoritative expected post-state" offline.
-    let (rippled_reference, rippled_fetched) = if let Some(host) = inputs.rpc_host.as_deref() {
+    let (rippled_reference, rippled_not_found, rippled_unavailable, rippled_fetched) =
+        if let Some(host) = inputs.rpc_host.as_deref() {
         match fetch_rippled_reference(
             host,
             inputs.rpc_port,
@@ -129,15 +135,15 @@ pub async fn capture_forensic_bundle(
         )
         .await
         {
-            Ok(m) => (m, true),
+            Ok((m, not_found, unavailable)) => (m, not_found, unavailable, true),
             Err(e) => {
                 warn!("forensic: rippled reference fetch failed: {}", e);
-                (HashMap::new(), false)
+                (HashMap::new(), HashSet::new(), HashSet::new(), false)
             }
         }
     } else {
         warn!("forensic: no rpc_host configured; skipping rippled reference fetch");
-        (HashMap::new(), false)
+        (HashMap::new(), HashSet::new(), HashSet::new(), false)
     };
     fs::write(
         dir.join("rippled_reference.bin"),
@@ -178,7 +184,7 @@ pub async fn capture_forensic_bundle(
         rippled_fetched,
     );
 
-    Ok((dir, rippled_reference))
+    Ok((dir, rippled_reference, rippled_not_found, rippled_unavailable))
 }
 
 /// Public mainnet endpoints used as fallback when the local rippled doesn't
@@ -191,12 +197,37 @@ const PUBLIC_SERVERS: &[(&str, u16)] = &[
     ("54.208.98.161", 51234),
 ];
 
-/// Try one endpoint once. Returns:
-///   Ok(Some(bytes))  -> parsed a successful response with node_binary
-///   Ok(None)         -> reached the server but no usable data (lgrNotFound,
-///                       missing field, etc.)
-///   Err(_)           -> transport/parse error
-async fn try_fetch_one(host: &str, port: u16, req: &str) -> anyhow::Result<Option<Vec<u8>>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReferenceFetch {
+    Found(Vec<u8>),
+    NotFound,
+    Unavailable,
+}
+
+fn response_indicates_not_found(resp: &serde_json::Value) -> bool {
+    fn matches_not_found(value: &serde_json::Value) -> bool {
+        value.as_str().map_or(false, |s| {
+            let lower = s.to_ascii_lowercase();
+            lower.contains("entrynotfound")
+                || lower.contains("objectnotfound")
+                || lower.contains("notfound")
+                || lower.contains("not found")
+        })
+    }
+
+    [
+        &resp["error"],
+        &resp["error_message"],
+        &resp["result"]["error"],
+        &resp["result"]["error_message"],
+        &resp["result"]["message"],
+    ]
+    .into_iter()
+    .any(matches_not_found)
+}
+
+/// Try one endpoint once and preserve "not found" vs "unavailable".
+async fn try_fetch_one(host: &str, port: u16, req: &str) -> anyhow::Result<ReferenceFetch> {
     let body = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         crate::rpc_sync::http_post(host, port, req),
@@ -204,16 +235,16 @@ async fn try_fetch_one(host: &str, port: u16, req: &str) -> anyhow::Result<Optio
     .await
     .map_err(|_| anyhow::anyhow!("timeout"))??;
     let resp: serde_json::Value = serde_json::from_str(&body)?;
-    let result = &resp["result"];
-    if result["status"].as_str() != Some("success") {
-        return Ok(None);
-    }
-    if let Some(nb) = result["node_binary"].as_str() {
+    if let Some(nb) = resp["result"]["node_binary"].as_str() {
         if let Ok(bytes) = hex::decode(nb) {
-            return Ok(Some(bytes));
+            return Ok(ReferenceFetch::Found(bytes));
         }
     }
-    Ok(None)
+    if response_indicates_not_found(&resp) {
+        Ok(ReferenceFetch::NotFound)
+    } else {
+        Ok(ReferenceFetch::Unavailable)
+    }
 }
 
 async fn fetch_one_with_fallback(
@@ -221,18 +252,31 @@ async fn fetch_one_with_fallback(
     local_host: String,
     local_port: u16,
     req: String,
-) -> Option<Vec<u8>> {
+) -> ReferenceFetch {
+    let mut saw_not_found = false;
     if has_local {
-        if let Ok(Some(b)) = try_fetch_one(&local_host, local_port, &req).await {
-            return Some(b);
+        if let Ok(status) = try_fetch_one(&local_host, local_port, &req).await {
+            match status {
+                ReferenceFetch::Found(bytes) => return ReferenceFetch::Found(bytes),
+                ReferenceFetch::NotFound => saw_not_found = true,
+                ReferenceFetch::Unavailable => {}
+            }
         }
     }
     for (pub_host, pub_port) in PUBLIC_SERVERS {
-        if let Ok(Some(b)) = try_fetch_one(pub_host, *pub_port, &req).await {
-            return Some(b);
+        if let Ok(status) = try_fetch_one(pub_host, *pub_port, &req).await {
+            match status {
+                ReferenceFetch::Found(bytes) => return ReferenceFetch::Found(bytes),
+                ReferenceFetch::NotFound => saw_not_found = true,
+                ReferenceFetch::Unavailable => {}
+            }
         }
     }
-    None
+    if saw_not_found {
+        ReferenceFetch::NotFound
+    } else {
+        ReferenceFetch::Unavailable
+    }
 }
 
 async fn fetch_rippled_reference(
@@ -240,7 +284,7 @@ async fn fetch_rippled_reference(
     port: u16,
     ledger_seq: u32,
     keys: &[[u8; 32]],
-) -> anyhow::Result<HashMap<[u8; 32], Vec<u8>>> {
+) -> anyhow::Result<(HashMap<[u8; 32], Vec<u8>>, HashSet<[u8; 32]>, HashSet<[u8; 32]>)> {
     // Fan out all ledger_entry calls concurrently. Each task tries the local
     // rippled first (if configured), then falls back to public mainnet servers
     // in round-robin order. This matches the pattern used by the override
@@ -263,12 +307,24 @@ async fn fetch_rippled_reference(
         });
     }
     let mut out = HashMap::with_capacity(keys.len());
+    let mut not_found = HashSet::new();
+    let mut unavailable = HashSet::new();
     while let Some(res) = join_set.join_next().await {
-        if let Ok((key, Some(bytes))) = res {
-            out.insert(key, bytes);
+        if let Ok((key, status)) = res {
+            match status {
+                ReferenceFetch::Found(bytes) => {
+                    out.insert(key, bytes);
+                }
+                ReferenceFetch::NotFound => {
+                    not_found.insert(key);
+                }
+                ReferenceFetch::Unavailable => {
+                    unavailable.insert(key);
+                }
+            }
         }
     }
-    Ok(out)
+    Ok((out, not_found, unavailable))
 }
 
 fn hex32(bytes: [u8; 32]) -> String {

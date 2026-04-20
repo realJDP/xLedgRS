@@ -750,10 +750,661 @@ struct ReplayTx {
     blob: Vec<u8>,
     /// The raw metadata blob.
     meta: Vec<u8>,
+    /// Parsed authoritative metadata nodes for this transaction.
+    nodes: Vec<crate::ledger::meta::AffectedNode>,
     /// sfTransactionIndex from the metadata (execution order).
     tx_index: u32,
     /// txID = SHA-512-Half(TXN\0 + blob).
     tx_id: [u8; 32],
+}
+
+#[derive(Default)]
+struct DirectoryIndexDelta {
+    add: std::collections::BTreeSet<[u8; 32]>,
+    remove: std::collections::BTreeSet<[u8; 32]>,
+}
+
+fn sle_entry_type(sle: &[u8]) -> Option<u16> {
+    if sle.len() >= 3 && sle[0] == 0x11 {
+        Some(u16::from_be_bytes([sle[1], sle[2]]))
+    } else {
+        None
+    }
+}
+
+fn restore_validated_replay_before(
+    state: &mut LedgerState,
+    key: &crate::ledger::Key,
+    before: Option<&Vec<u8>>,
+) {
+    state.clear_typed_entry_for_key(key);
+    match before {
+        Some(bytes) => {
+            state.insert_raw(*key, bytes.clone());
+            if let Some(entry_type) = sle_entry_type(bytes) {
+                crate::ledger::follow::sync_typed(state, entry_type, key, bytes);
+            }
+        }
+        None => {
+            state.remove_raw(key);
+        }
+    }
+}
+
+fn incomplete_book_directory(sle: &[u8], key: &crate::ledger::Key) -> bool {
+    let Ok(dir) = crate::ledger::DirectoryNode::decode(sle, key.0) else {
+        return false;
+    };
+    dir.exchange_rate.is_some()
+        && (dir.taker_pays_currency.is_none()
+            || dir.taker_pays_issuer.is_none()
+            || dir.taker_gets_currency.is_none()
+            || dir.taker_gets_issuer.is_none())
+}
+
+fn find_parsed_field<'a>(
+    fields: &'a [crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<&'a [u8]> {
+    fields
+        .iter()
+        .find(|f| f.type_code == type_code && f.field_code == field_code)
+        .map(|f| f.data.as_slice())
+}
+
+fn parsed_hash256(
+    fields: &[crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<[u8; 32]> {
+    let bytes = find_parsed_field(fields, type_code, field_code)?;
+    (bytes.len() >= 32).then(|| bytes[..32].try_into().ok()).flatten()
+}
+
+fn parsed_account(
+    fields: &[crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<[u8; 20]> {
+    let bytes = find_parsed_field(fields, type_code, field_code)?;
+    (bytes.len() >= 20).then(|| bytes[..20].try_into().ok()).flatten()
+}
+
+fn parsed_amount_issuer(
+    fields: &[crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<[u8; 20]> {
+    let bytes = find_parsed_field(fields, type_code, field_code)?;
+    let (amount, _) = crate::transaction::amount::Amount::from_bytes(bytes).ok()?;
+    match amount {
+        crate::transaction::amount::Amount::Iou { issuer, .. } => Some(issuer),
+        _ => None,
+    }
+}
+
+fn parsed_u64(
+    fields: &[crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<u64> {
+    let bytes = find_parsed_field(fields, type_code, field_code)?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    Some(u64::from_be_bytes(bytes[..8].try_into().ok()?))
+}
+
+fn offer_directory_pages(
+    node: &crate::ledger::meta::AffectedNode,
+) -> Option<[crate::ledger::Key; 2]> {
+    if node.entry_type != 0x006f {
+        return None;
+    }
+    let owner = parsed_account(&node.fields, 8, 1)?;
+    let owner_node = parsed_u64(&node.fields, 3, 4).unwrap_or(0);
+    let book_root = parsed_hash256(&node.fields, 5, 16)?;
+    let book_node = parsed_u64(&node.fields, 3, 3).unwrap_or(0);
+    let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+    Some([
+        crate::ledger::directory::page_key(&book_root, book_node),
+        crate::ledger::directory::page_key(&owner_root.0, owner_node),
+    ])
+}
+
+fn offer_directory_pages_from_fields(
+    fields: &[crate::ledger::meta::ParsedField],
+) -> Option<[crate::ledger::Key; 2]> {
+    let owner = parsed_account(fields, 8, 1)?;
+    let owner_node = parsed_u64(fields, 3, 4).unwrap_or(0);
+    let book_root = parsed_hash256(fields, 5, 16)?;
+    let book_node = parsed_u64(fields, 3, 3).unwrap_or(0);
+    let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+    Some([
+        crate::ledger::directory::page_key(&book_root, book_node),
+        crate::ledger::directory::page_key(&owner_root.0, owner_node),
+    ])
+}
+
+fn modified_offer_directory_pages(
+    node: &crate::ledger::meta::AffectedNode,
+) -> Option<([crate::ledger::Key; 2], [crate::ledger::Key; 2])> {
+    if node.entry_type != 0x006f || node.action != crate::ledger::meta::Action::Modified {
+        return None;
+    }
+
+    let current = offer_directory_pages_from_fields(&node.fields)?;
+
+    let prior_owner = parsed_account(&node.previous_fields, 8, 1)
+        .or_else(|| parsed_account(&node.fields, 8, 1))?;
+    let prior_owner_node = parsed_u64(&node.previous_fields, 3, 4)
+        .or_else(|| parsed_u64(&node.fields, 3, 4))
+        .unwrap_or(0);
+    let prior_book_root = parsed_hash256(&node.previous_fields, 5, 16)
+        .or_else(|| parsed_hash256(&node.fields, 5, 16))?;
+    let prior_book_node = parsed_u64(&node.previous_fields, 3, 3)
+        .or_else(|| parsed_u64(&node.fields, 3, 3))
+        .unwrap_or(0);
+    let prior_owner_root = crate::ledger::directory::owner_dir_key(&prior_owner);
+    let prior = [
+        crate::ledger::directory::page_key(&prior_book_root, prior_book_node),
+        crate::ledger::directory::page_key(&prior_owner_root.0, prior_owner_node),
+    ];
+
+    Some((prior, current))
+}
+
+fn owner_directory_pages_from_fields(
+    entry_type: u16,
+    fields: &[crate::ledger::meta::ParsedField],
+) -> Vec<crate::ledger::Key> {
+    let mut pages = std::collections::BTreeSet::new();
+
+    match entry_type {
+        0x006f | 0x0043 | 0x0075 | 0x0078 | 0x0070 | 0x0054 | 0x0053 | 0x0049 => {
+            if let Some(account) = parsed_account(fields, 8, 1) {
+                let owner_node = parsed_u64(fields, 3, 4).unwrap_or(0);
+                let owner_root = crate::ledger::directory::owner_dir_key(&account);
+                pages.insert(crate::ledger::directory::page_key(&owner_root.0, owner_node));
+            }
+            if matches!(entry_type, 0x0043 | 0x0075 | 0x0078) {
+                if let Some(destination) = parsed_account(fields, 8, 3) {
+                    let destination_node = parsed_u64(fields, 3, 9).unwrap_or(0);
+                    let destination_root = crate::ledger::directory::owner_dir_key(&destination);
+                    pages.insert(crate::ledger::directory::page_key(
+                        &destination_root.0,
+                        destination_node,
+                    ));
+                }
+            }
+        }
+        0x0037 => {
+            if let Some(owner) = parsed_account(fields, 8, 2) {
+                let owner_node = parsed_u64(fields, 3, 12).unwrap_or(0);
+                let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+                pages.insert(crate::ledger::directory::page_key(&owner_root.0, owner_node));
+            }
+        }
+        0x0072 => {
+            if let Some(low_account) = parsed_amount_issuer(fields, 6, 6) {
+                let low_node = parsed_u64(fields, 3, 7).unwrap_or(0);
+                let low_root = crate::ledger::directory::owner_dir_key(&low_account);
+                pages.insert(crate::ledger::directory::page_key(&low_root.0, low_node));
+            }
+            if let Some(high_account) = parsed_amount_issuer(fields, 6, 7) {
+                let high_node = parsed_u64(fields, 3, 8).unwrap_or(0);
+                let high_root = crate::ledger::directory::owner_dir_key(&high_account);
+                pages.insert(crate::ledger::directory::page_key(&high_root.0, high_node));
+            }
+        }
+        _ => {}
+    }
+
+    pages.into_iter().collect()
+}
+
+pub(crate) fn ensure_owner_directory_entries_for_created_sle(
+    state: &mut LedgerState,
+    key: crate::ledger::Key,
+    entry_type: u16,
+    sle: &[u8],
+) -> Vec<crate::ledger::Key> {
+    fn load_directory(
+        state: &LedgerState,
+        key: &crate::ledger::Key,
+    ) -> Option<crate::ledger::directory::DirectoryNode> {
+        state
+            .get_raw_owned(key)
+            .and_then(|raw| crate::ledger::directory::DirectoryNode::decode(&raw, key.0).ok())
+            .or_else(|| state.get_directory(key).cloned())
+    }
+
+    let mut touched = std::collections::BTreeSet::new();
+
+    let mut ensure_owner = |owner: [u8; 20], owner_node: u64| {
+        let root = crate::ledger::directory::owner_dir_key(&owner);
+        let target = crate::ledger::directory::page_key(&root.0, owner_node);
+        if let Some(mut page) = load_directory(state, &target) {
+            if !page.indexes.iter().any(|existing| existing == &key.0) {
+                page.indexes.push(key.0);
+                page.raw_sle = None;
+                state.insert_directory(page);
+                touched.insert(target);
+            }
+            if owner_node == 0 {
+                touched.insert(root);
+            }
+            return;
+        }
+
+        if crate::ledger::directory::owner_dir_contains_entry(state, &owner, &key.0) {
+            return;
+        }
+
+        let page = crate::ledger::directory::dir_add(state, &owner, key.0);
+        touched.insert(root);
+        if page != 0 {
+            touched.insert(crate::ledger::directory::page_key(&root.0, page));
+        }
+    };
+
+    match entry_type {
+        0x006f => {
+            if let Some(offer) = crate::ledger::offer::Offer::decode_from_sle(sle) {
+                ensure_owner(offer.account, offer.owner_node);
+            }
+        }
+        0x0072 => {
+            if let Some(trustline) = crate::ledger::trustline::RippleState::decode_from_sle(sle) {
+                ensure_owner(trustline.low_account, trustline.low_node);
+                ensure_owner(trustline.high_account, trustline.high_node);
+            }
+        }
+        _ => {}
+    }
+
+    touched.into_iter().collect()
+}
+
+fn fields_include_indexes(fields: &[crate::ledger::meta::ParsedField]) -> bool {
+    fields.iter().any(|f| f.type_code == 19 && f.field_code == 1)
+}
+
+fn apply_directory_index_delta(
+    key: &crate::ledger::Key,
+    sle: Vec<u8>,
+    fields: &[crate::ledger::meta::ParsedField],
+    delta: Option<&DirectoryIndexDelta>,
+) -> Vec<u8> {
+    if fields_include_indexes(fields) {
+        return sle;
+    }
+    let Some(delta) = delta else {
+        return sle;
+    };
+    let Ok(mut dir) = crate::ledger::DirectoryNode::decode(&sle, key.0) else {
+        return sle;
+    };
+    for remove in &delta.remove {
+        dir.indexes.retain(|index| index != remove);
+    }
+    for add in &delta.add {
+        if !dir.indexes.iter().any(|index| index == add) {
+            dir.indexes.push(*add);
+        }
+    }
+    dir.raw_sle = None;
+    dir.encode()
+}
+
+fn apply_directory_book_context(
+    key: &crate::ledger::Key,
+    sle: Vec<u8>,
+    related_offer_book: Option<([u8; 20], [u8; 20], [u8; 20], [u8; 20])>,
+) -> Vec<u8> {
+    let Some((pays_cur, pays_iss, gets_cur, gets_iss)) = related_offer_book else {
+        return sle;
+    };
+    let Ok(mut dir) = crate::ledger::DirectoryNode::decode(&sle, key.0) else {
+        return sle;
+    };
+    dir.taker_pays_currency = Some(pays_cur);
+    dir.taker_pays_issuer = Some(pays_iss);
+    dir.taker_gets_currency = Some(gets_cur);
+    dir.taker_gets_issuer = Some(gets_iss);
+    dir.encode()
+}
+
+fn apply_authoritative_validated_tx_metadata(
+    state: &mut LedgerState,
+    tx_hash: &[u8; 32],
+    ledger_seq: u32,
+    nodes: &[crate::ledger::meta::AffectedNode],
+    local_touched: &[(crate::ledger::Key, Option<Vec<u8>>)],
+) -> Vec<crate::ledger::Key> {
+    let should_thread_entry_type = |entry_type: u16| {
+        crate::ledger::sle::LedgerEntryType::from_u16(entry_type)
+            .map(|entry_type| !matches!(entry_type, crate::ledger::sle::LedgerEntryType::LedgerHashes))
+            .unwrap_or(false)
+    };
+
+    let metadata_keys: std::collections::HashSet<crate::ledger::Key> =
+        nodes.iter().map(|node| crate::ledger::Key(node.ledger_index)).collect();
+    let local_before: std::collections::HashMap<crate::ledger::Key, Option<Vec<u8>>> = local_touched
+        .iter()
+        .map(|(key, before)| (*key, before.clone()))
+        .collect();
+
+    for (key, before) in local_touched {
+        if metadata_keys.contains(key) {
+            continue;
+        }
+        restore_validated_replay_before(state, key, before.as_ref());
+    }
+
+    let mut tx_book_dirs: std::collections::HashMap<
+        [u8; 32],
+        ([u8; 20], [u8; 20], [u8; 20], [u8; 20]),
+    > = std::collections::HashMap::new();
+    for node in nodes {
+        if node.entry_type != 0x006f {
+            continue;
+        }
+        if let Some((pays_cur, pays_iss, gets_cur, gets_iss, book_dir)) =
+            crate::ledger::follow::extract_offer_book_sides(&node.fields)
+        {
+            let sides = (pays_cur, pays_iss, gets_cur, gets_iss);
+            tx_book_dirs.insert(book_dir, sides);
+            let root = crate::ledger::directory::book_dir_root_key(
+                &crate::ledger::offer::BookKey {
+                    pays_currency: pays_cur,
+                    pays_issuer: pays_iss,
+                    gets_currency: gets_cur,
+                    gets_issuer: gets_iss,
+                },
+            )
+            .0;
+            tx_book_dirs.entry(root).or_insert(sides);
+        }
+    }
+    let mut dir_index_deltas: std::collections::HashMap<crate::ledger::Key, DirectoryIndexDelta> =
+        std::collections::HashMap::new();
+    for node in nodes {
+        let mut directory_pages = std::collections::BTreeSet::new();
+        directory_pages.extend(owner_directory_pages_from_fields(node.entry_type, &node.fields));
+        if let Some([book_page, owner_page]) = offer_directory_pages(node) {
+            directory_pages.insert(book_page);
+            directory_pages.insert(owner_page);
+        }
+        match node.action {
+            crate::ledger::meta::Action::Created => {
+                for page in directory_pages {
+                    dir_index_deltas
+                        .entry(page)
+                        .or_default()
+                        .add
+                        .insert(node.ledger_index);
+                }
+            }
+            crate::ledger::meta::Action::Deleted => {
+                for page in directory_pages {
+                    dir_index_deltas
+                        .entry(page)
+                        .or_default()
+                        .remove
+                        .insert(node.ledger_index);
+                }
+            }
+            crate::ledger::meta::Action::Modified => {
+                if let Some((before_pages, after_pages)) = modified_offer_directory_pages(node) {
+                    for before in before_pages {
+                        if !after_pages.iter().any(|page| page == &before) {
+                            dir_index_deltas
+                                .entry(before)
+                                .or_default()
+                                .remove
+                                .insert(node.ledger_index);
+                        }
+                    }
+                    for after in after_pages {
+                        if !before_pages.iter().any(|page| page == &after) {
+                            dir_index_deltas
+                                .entry(after)
+                                .or_default()
+                                .add
+                                .insert(node.ledger_index);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut authoritative_keys = Vec::new();
+    let created_nodes: Vec<crate::ledger::meta::AffectedNode> = nodes
+        .iter()
+        .filter(|node| node.action == crate::ledger::meta::Action::Created)
+        .cloned()
+        .collect();
+    let other_nodes: Vec<&crate::ledger::meta::AffectedNode> = nodes
+        .iter()
+        .filter(|node| node.action != crate::ledger::meta::Action::Created)
+        .collect();
+
+    let mut pending_created = created_nodes;
+    while !pending_created.is_empty() {
+        let mut next_pending = Vec::new();
+        let mut progressed = false;
+        for node in pending_created {
+            let key = crate::ledger::Key(node.ledger_index);
+            authoritative_keys.push(key);
+            let (new_ptid, new_ptseq) = if should_thread_entry_type(node.entry_type) {
+                (Some(*tx_hash), Some(ledger_seq))
+            } else {
+                (None, None)
+            };
+            let related_offer_book = crate::ledger::follow::related_offer_book_for_directory_node(
+                &node,
+                &tx_book_dirs,
+            );
+            let sle = if node.entry_type == 0x0064 {
+                crate::ledger::follow::build_created_sle_with_state(
+                    state,
+                    &key,
+                    node.entry_type,
+                    &node.fields,
+                    related_offer_book,
+                    new_ptid,
+                    new_ptseq,
+                )
+            } else {
+                crate::ledger::follow::build_created_sle_with_state(
+                    state,
+                    &key,
+                    node.entry_type,
+                    &node.fields,
+                    related_offer_book,
+                    new_ptid,
+                    new_ptseq,
+                )
+            };
+            let sle = if node.entry_type == 0x0064 {
+                apply_directory_index_delta(
+                    &key,
+                    sle,
+                    &node.fields,
+                    dir_index_deltas.get(&key),
+                    )
+                } else {
+                    sle
+                };
+            let sle = if node.entry_type == 0x0064 {
+                apply_directory_book_context(&key, sle, related_offer_book)
+            } else {
+                sle
+            };
+            if node.entry_type == 0x0064
+                && incomplete_book_directory(&sle, &key)
+                && next_pending.len() + 1 < metadata_keys.len()
+            {
+                next_pending.push(node);
+                continue;
+            }
+
+            state.insert_raw(key, sle.clone());
+            crate::ledger::follow::sync_typed(state, node.entry_type, &key, &sle);
+            authoritative_keys.extend(ensure_owner_directory_entries_for_created_sle(
+                state,
+                key,
+                node.entry_type,
+                &sle,
+            ));
+            progressed = true;
+        }
+
+        if !progressed {
+            for node in next_pending {
+                let key = crate::ledger::Key(node.ledger_index);
+                let (new_ptid, new_ptseq) = if should_thread_entry_type(node.entry_type) {
+                    (Some(*tx_hash), Some(ledger_seq))
+                } else {
+                    (None, None)
+                };
+                let related_offer_book =
+                    crate::ledger::follow::related_offer_book_for_directory_node(
+                        &node,
+                        &tx_book_dirs,
+                    );
+                let sle = if node.entry_type == 0x0064 {
+                    state
+                        .get_raw_owned(&key)
+                        .map(|local_raw| {
+                            crate::ledger::meta::patch_sle(
+                                &local_raw,
+                                &node.fields,
+                                new_ptid,
+                                new_ptseq,
+                                &[],
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            crate::ledger::follow::build_created_sle_with_state(
+                                state,
+                                &key,
+                                node.entry_type,
+                                &node.fields,
+                                related_offer_book,
+                                new_ptid,
+                                new_ptseq,
+                            )
+                        })
+                } else {
+                    crate::ledger::follow::build_created_sle_with_state(
+                        state,
+                        &key,
+                        node.entry_type,
+                        &node.fields,
+                        related_offer_book,
+                        new_ptid,
+                        new_ptseq,
+                    )
+                };
+                let sle = if node.entry_type == 0x0064 {
+                    apply_directory_index_delta(
+                        &key,
+                        sle,
+                        &node.fields,
+                        dir_index_deltas.get(&key),
+                    )
+                } else {
+                    sle
+                };
+                state.insert_raw(key, sle.clone());
+                crate::ledger::follow::sync_typed(state, node.entry_type, &key, &sle);
+                authoritative_keys.extend(ensure_owner_directory_entries_for_created_sle(
+                    state,
+                    key,
+                    node.entry_type,
+                    &sle,
+                ));
+            }
+            break;
+        }
+        pending_created = next_pending;
+    }
+
+    for node in other_nodes {
+        let key = crate::ledger::Key(node.ledger_index);
+        authoritative_keys.push(key);
+        let (new_ptid, new_ptseq) = if should_thread_entry_type(node.entry_type) {
+            (Some(*tx_hash), Some(ledger_seq))
+        } else {
+            (None, None)
+        };
+
+        match node.action {
+            crate::ledger::meta::Action::Modified => {
+                let final_keys: std::collections::HashSet<(u16, u16)> = node
+                    .fields
+                    .iter()
+                    .map(|f| (f.type_code, f.field_code))
+                    .collect();
+                let deleted: Vec<(u16, u16)> = node
+                    .previous_fields
+                    .iter()
+                    .map(|f| (f.type_code, f.field_code))
+                    .filter(|field| !final_keys.contains(field))
+                    .collect();
+
+                let base = local_before
+                    .get(&key)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| state.get_raw_owned(&key));
+                let Some(base) = base else {
+                    tracing::warn!(
+                        "validated replay metadata: missing ModifiedNode base object for key={} tx_hash={}",
+                        hex::encode_upper(&key.0[..8]),
+                        hex::encode_upper(&tx_hash[..8]),
+                    );
+                    continue;
+                };
+
+                let patched = crate::ledger::meta::patch_sle(
+                    &base,
+                    &node.fields,
+                    new_ptid,
+                    new_ptseq,
+                    &deleted,
+                );
+                let related_offer_book = crate::ledger::follow::related_offer_book_for_directory_node(
+                    node,
+                    &tx_book_dirs,
+                );
+                let patched = if node.entry_type == 0x0064 {
+                    let patched = apply_directory_book_context(&key, patched, related_offer_book);
+                    apply_directory_index_delta(
+                        &key,
+                        patched,
+                        &node.fields,
+                        dir_index_deltas.get(&key),
+                    )
+                } else {
+                    patched
+                };
+                state.insert_raw(key, patched.clone());
+                crate::ledger::follow::sync_typed(state, node.entry_type, &key, &patched);
+            }
+            crate::ledger::meta::Action::Deleted => {
+                state.clear_typed_entry_for_key(&key);
+                state.remove_raw(&key);
+            }
+            crate::ledger::meta::Action::Created => {}
+        }
+    }
+
+    authoritative_keys
 }
 
 /// Replay a validated ledger's transactions against the current state.
@@ -778,6 +1429,14 @@ pub fn replay_ledger(
     let replay_diag = new_seq == REPLAY_DIAG_SEQ;
     let mut per_tx_attribution: Vec<TxAttribution> = Vec::new();
 
+    // Replay depends on the authoritative amendment set from the seeded
+    // prestate. Without rehydrating it here, validated replay can behave like
+    // gated features (for example fixPreviousTxnID on DirectoryNodes) are
+    // disabled even when the network ledger expects them.
+    for amendment in crate::ledger::read_amendments(state) {
+        state.enable_amendment(amendment);
+    }
+
     // Parse all transactions, extract sfTransactionIndex, compute txID
     let mut replay_txs: Vec<ReplayTx> = Vec::new();
     let mut skipped_count = 0usize;
@@ -793,7 +1452,7 @@ pub fn replay_ledger(
         };
 
         // Extract sfTransactionIndex from metadata
-        let (tx_index_opt, _nodes) = crate::ledger::meta::parse_metadata_with_index(&meta);
+        let (tx_index_opt, nodes) = crate::ledger::meta::parse_metadata_with_index(&meta);
         let tx_index = match tx_index_opt {
             Some(idx) => idx,
             None => {
@@ -809,6 +1468,7 @@ pub fn replay_ledger(
         replay_txs.push(ReplayTx {
             blob,
             meta,
+            nodes,
             tx_index,
             tx_id,
         });
@@ -859,21 +1519,30 @@ pub fn replay_ledger(
         let outcome = classify_result(&result);
         let result_str = result.ter.token();
 
-        // Per-tx attribution: capture touched keys for forensic bundle.
-        // Only populated when the caller asks for byte-diff data (first
-        // post-sync replay). Replaces the former hardcoded-seq log block.
+        let authoritative_keys = apply_authoritative_validated_tx_metadata(
+            state,
+            &rtx.tx_id,
+            new_seq,
+            &rtx.nodes,
+            &result.touched,
+        );
+
+        // Per-tx attribution: during validated replay, use authoritative
+        // metadata keys rather than the raw local engine touch set. This keeps
+        // forensic bundles aligned with the real XRPL side effects even when
+        // the local engine needed metadata reconciliation.
         if byte_diff {
-            let created_keys: Vec<[u8; 32]> = result
-                .touched
+            let created_keys: Vec<[u8; 32]> = rtx
+                .nodes
                 .iter()
-                .filter(|(_, before)| before.is_none())
-                .map(|(k, _)| k.0)
+                .filter(|node| node.action == crate::ledger::meta::Action::Created)
+                .map(|node| node.ledger_index)
                 .collect();
-            let modified_keys: Vec<[u8; 32]> = result
-                .touched
+            let modified_keys: Vec<[u8; 32]> = rtx
+                .nodes
                 .iter()
-                .filter(|(_, before)| before.is_some())
-                .map(|(k, _)| k.0)
+                .filter(|node| node.action != crate::ledger::meta::Action::Created)
+                .map(|node| node.ledger_index)
                 .collect();
             per_tx_attribution.push(TxAttribution {
                 tx_id: rtx.tx_id,
@@ -887,12 +1556,11 @@ pub fn replay_ledger(
 
         match outcome {
             ApplyOutcome::Success => {
-                for (key, _before) in &result.touched {
+                for key in &authoritative_keys {
                     if touched_seen.insert(*key) {
                         touched_keys.push(*key);
                     }
                 }
-                stamp_touched_previous_fields(state, &result.touched, &rtx.tx_id, new_seq);
                 if result.ter.is_tes_success() {
                     applied_count += 1;
                 } else {
@@ -1608,6 +2276,766 @@ mod tests {
         assert_eq!(hashes[1], prev.hash);
     }
 
+    fn parsed_field(type_code: u16, field_code: u16, data: Vec<u8>) -> crate::ledger::meta::ParsedField {
+        crate::ledger::meta::ParsedField {
+            type_code,
+            field_code,
+            data,
+        }
+    }
+
+    #[test]
+    fn authoritative_replay_created_directory_adds_missing_offer_index() {
+        let mut state = crate::ledger::LedgerState::new();
+        let account = [0x11; 20];
+        let book_root = {
+            let mut key = [0x44; 32];
+            key[24..32].copy_from_slice(&0u64.to_be_bytes());
+            key
+        };
+        let dir_key = crate::ledger::Key(book_root);
+        let dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(7),
+            taker_pays_currency: Some([0xAA; 20]),
+            taker_pays_issuer: Some([0xBB; 20]),
+            taker_gets_currency: Some([0xCC; 20]),
+            taker_gets_issuer: Some([0xDD; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(dir_key, dir.encode());
+
+        let offer_key = crate::ledger::Key([0x99; 32]);
+        let tx_hash = [0x77; 32];
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x006f,
+                ledger_index: offer_key.0,
+                fields: vec![
+                    parsed_field(8, 1, account.to_vec()),
+                    parsed_field(3, 4, 0u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 16, book_root.to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x0064,
+                ledger_index: dir_key.0,
+                fields: vec![
+                    parsed_field(3, 6, 7u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 8, book_root.to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+
+        apply_authoritative_validated_tx_metadata(&mut state, &tx_hash, 55, &nodes, &[]);
+
+        let raw = state.get_raw_owned(&dir_key).expect("directory must exist");
+        let dir = crate::ledger::DirectoryNode::decode(&raw, dir_key.0).expect("valid directory");
+        assert_eq!(dir.indexes, vec![offer_key.0]);
+    }
+
+    #[test]
+    fn authoritative_replay_created_directory_rebuild_ignores_stale_local_book_fields() {
+        let mut state = crate::ledger::LedgerState::new();
+        let account = [0x31; 20];
+        let pays_currency = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let gets_currency = crate::transaction::amount::Currency::from_code("EUR").unwrap();
+        let book_root = {
+            let mut key = [0x74; 32];
+            key[24..32].copy_from_slice(&0u64.to_be_bytes());
+            key
+        };
+        let dir_key = crate::ledger::Key(book_root);
+        let stale_dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(7),
+            taker_pays_currency: Some([0xEE; 20]),
+            taker_pays_issuer: Some([0xED; 20]),
+            taker_gets_currency: Some([0xEC; 20]),
+            taker_gets_issuer: Some([0xEB; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(dir_key, stale_dir.encode());
+
+        let offer_key = crate::ledger::Key([0x98; 32]);
+        let tx_hash = [0x79; 32];
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x006f,
+                ledger_index: offer_key.0,
+                fields: vec![
+                    parsed_field(8, 1, account.to_vec()),
+                    parsed_field(3, 4, 0u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 16, book_root.to_vec()),
+                    parsed_field(
+                        6,
+                        4,
+                        crate::transaction::amount::Amount::Iou {
+                            value: crate::transaction::amount::IouValue::from_f64(1.0),
+                            currency: pays_currency.clone(),
+                            issuer: [0x02; 20],
+                        }
+                        .to_bytes(),
+                    ),
+                    parsed_field(
+                        6,
+                        5,
+                        crate::transaction::amount::Amount::Iou {
+                            value: crate::transaction::amount::IouValue::from_f64(2.0),
+                            currency: gets_currency.clone(),
+                            issuer: [0x04; 20],
+                        }
+                        .to_bytes(),
+                    ),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x0064,
+                ledger_index: dir_key.0,
+                fields: vec![
+                    parsed_field(3, 6, 7u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 8, book_root.to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+
+        apply_authoritative_validated_tx_metadata(&mut state, &tx_hash, 55, &nodes, &[]);
+
+        let raw = state.get_raw_owned(&dir_key).expect("directory must exist");
+        let dir = crate::ledger::DirectoryNode::decode(&raw, dir_key.0).expect("valid directory");
+        assert_eq!(dir.taker_pays_currency, Some(pays_currency.code));
+        assert_eq!(dir.taker_pays_issuer, Some([0x02; 20]));
+        assert_eq!(dir.taker_gets_currency, Some(gets_currency.code));
+        assert_eq!(dir.taker_gets_issuer, Some([0x04; 20]));
+    }
+
+    #[test]
+    fn authoritative_replay_modified_directory_applies_offer_swap_delta() {
+        let mut state = crate::ledger::LedgerState::new();
+        let account = [0x22; 20];
+        let book_root = {
+            let mut key = [0x55; 32];
+            key[24..32].copy_from_slice(&0u64.to_be_bytes());
+            key
+        };
+        let dir_key = crate::ledger::Key(book_root);
+        let deleted_offer = [0x10; 32];
+        let created_offer = [0x20; 32];
+        let dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: vec![deleted_offer],
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(9),
+            taker_pays_currency: Some([0x01; 20]),
+            taker_pays_issuer: Some([0x02; 20]),
+            taker_gets_currency: Some([0x03; 20]),
+            taker_gets_issuer: Some([0x04; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(dir_key, dir.encode());
+
+        let tx_hash = [0x88; 32];
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Deleted,
+                entry_type: 0x006f,
+                ledger_index: deleted_offer,
+                fields: vec![
+                    parsed_field(8, 1, account.to_vec()),
+                    parsed_field(3, 4, 0u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 16, book_root.to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x006f,
+                ledger_index: created_offer,
+                fields: vec![
+                    parsed_field(8, 1, account.to_vec()),
+                    parsed_field(3, 4, 0u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 16, book_root.to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: dir_key.0,
+                fields: vec![
+                    parsed_field(3, 6, 9u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 8, book_root.to_vec()),
+                    parsed_field(17, 1, [0x01; 20].to_vec()),
+                    parsed_field(17, 2, [0x02; 20].to_vec()),
+                    parsed_field(17, 3, [0x03; 20].to_vec()),
+                    parsed_field(17, 4, [0x04; 20].to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+
+        apply_authoritative_validated_tx_metadata(&mut state, &tx_hash, 56, &nodes, &[]);
+
+        let raw = state.get_raw_owned(&dir_key).expect("directory must exist");
+        let dir = crate::ledger::DirectoryNode::decode(&raw, dir_key.0).expect("valid directory");
+        assert_eq!(dir.indexes, vec![created_offer]);
+    }
+
+    #[test]
+    fn authoritative_replay_modified_directory_overrides_stale_book_fields() {
+        let mut state = crate::ledger::LedgerState::new();
+        let account = [0x42; 20];
+        let pays_currency = crate::transaction::amount::Currency::from_code("GBP").unwrap();
+        let gets_currency = crate::transaction::amount::Currency::from_code("CAD").unwrap();
+        let book_root = {
+            let mut key = [0x84; 32];
+            key[24..32].copy_from_slice(&0u64.to_be_bytes());
+            key
+        };
+        let dir_key = crate::ledger::Key(book_root);
+        let dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(9),
+            taker_pays_currency: Some([0xEE; 20]),
+            taker_pays_issuer: Some([0xED; 20]),
+            taker_gets_currency: Some([0xEC; 20]),
+            taker_gets_issuer: Some([0xEB; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(dir_key, dir.encode());
+
+        let tx_hash = [0x89; 32];
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x006f,
+                ledger_index: [0xC4; 32],
+                fields: vec![
+                    parsed_field(8, 1, account.to_vec()),
+                    parsed_field(3, 4, 0u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 16, book_root.to_vec()),
+                    parsed_field(
+                        6,
+                        4,
+                        crate::transaction::amount::Amount::Iou {
+                            value: crate::transaction::amount::IouValue::from_f64(3.0),
+                            currency: pays_currency.clone(),
+                            issuer: [0x02; 20],
+                        }
+                        .to_bytes(),
+                    ),
+                    parsed_field(
+                        6,
+                        5,
+                        crate::transaction::amount::Amount::Iou {
+                            value: crate::transaction::amount::IouValue::from_f64(4.0),
+                            currency: gets_currency.clone(),
+                            issuer: [0x04; 20],
+                        }
+                        .to_bytes(),
+                    ),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: dir_key.0,
+                fields: vec![
+                    parsed_field(3, 6, 9u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 8, book_root.to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+
+        apply_authoritative_validated_tx_metadata(&mut state, &tx_hash, 56, &nodes, &[]);
+
+        let raw = state.get_raw_owned(&dir_key).expect("directory must exist");
+        let dir = crate::ledger::DirectoryNode::decode(&raw, dir_key.0).expect("valid directory");
+        assert_eq!(dir.taker_pays_currency, Some(pays_currency.code));
+        assert_eq!(dir.taker_pays_issuer, Some([0x02; 20]));
+        assert_eq!(dir.taker_gets_currency, Some(gets_currency.code));
+        assert_eq!(dir.taker_gets_issuer, Some([0x04; 20]));
+    }
+
+    #[test]
+    fn authoritative_replay_modified_directory_uses_pre_tx_base_before_live_raw() {
+        let mut state = crate::ledger::LedgerState::new();
+        let book_root = {
+            let mut key = [0x94; 32];
+            key[24..32].copy_from_slice(&0u64.to_be_bytes());
+            key
+        };
+        let dir_key = crate::ledger::Key(book_root);
+        let before_dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(9),
+            taker_pays_currency: Some([0x01; 20]),
+            taker_pays_issuer: Some([0x02; 20]),
+            taker_gets_currency: Some([0x03; 20]),
+            taker_gets_issuer: Some([0x04; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        let live_dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(9),
+            taker_pays_currency: Some([0xEE; 20]),
+            taker_pays_issuer: Some([0xED; 20]),
+            taker_gets_currency: Some([0xEC; 20]),
+            taker_gets_issuer: Some([0xEB; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        let before_raw = before_dir.encode();
+        state.insert_raw(dir_key, live_dir.encode());
+
+        let tx_hash = [0x99; 32];
+        let nodes = vec![crate::ledger::meta::AffectedNode {
+            action: crate::ledger::meta::Action::Modified,
+            entry_type: 0x0064,
+            ledger_index: dir_key.0,
+            fields: vec![
+                parsed_field(3, 6, 9u64.to_be_bytes().to_vec()),
+                parsed_field(5, 8, book_root.to_vec()),
+            ],
+            previous_fields: vec![],
+            prev_txn_id: None,
+            prev_txn_lgrseq: None,
+        }];
+
+        apply_authoritative_validated_tx_metadata(
+            &mut state,
+            &tx_hash,
+            57,
+            &nodes,
+            &[(dir_key, Some(before_raw))],
+        );
+
+        let raw = state.get_raw_owned(&dir_key).expect("directory must exist");
+        let dir = crate::ledger::DirectoryNode::decode(&raw, dir_key.0).expect("valid directory");
+        assert_eq!(dir.taker_pays_currency, Some([0x01; 20]));
+        assert_eq!(dir.taker_pays_issuer, Some([0x02; 20]));
+        assert_eq!(dir.taker_gets_currency, Some([0x03; 20]));
+        assert_eq!(dir.taker_gets_issuer, Some([0x04; 20]));
+    }
+
+    #[test]
+    fn authoritative_replay_created_trustline_adds_both_owner_directory_indexes() {
+        let mut state = crate::ledger::LedgerState::new();
+        let low = [0x10; 20];
+        let high = [0x20; 20];
+        let currency = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let trustline_key = crate::ledger::trustline::shamap_key(&low, &high, &currency);
+        let low_root = crate::ledger::directory::owner_dir_key(&low);
+        let high_root = crate::ledger::directory::owner_dir_key(&high);
+        let low_page = crate::ledger::directory::page_key(&low_root.0, 2);
+        let high_page = crate::ledger::directory::page_key(&high_root.0, 12);
+
+        state.insert_raw(
+            low_page,
+            crate::ledger::DirectoryNode {
+                key: low_page.0,
+                root_index: low_root.0,
+                indexes: Vec::new(),
+                index_next: 0,
+                index_previous: 0,
+                owner: Some(low),
+                exchange_rate: None,
+                taker_pays_currency: None,
+                taker_pays_issuer: None,
+                taker_gets_currency: None,
+                taker_gets_issuer: None,
+                nftoken_id: None,
+                domain_id: None,
+                previous_txn_id: None,
+                previous_txn_lgr_seq: None,
+                has_index_next: false,
+                has_index_previous: false,
+                raw_sle: None,
+            }
+            .encode(),
+        );
+        state.insert_raw(
+            high_page,
+            crate::ledger::DirectoryNode {
+                key: high_page.0,
+                root_index: high_root.0,
+                indexes: Vec::new(),
+                index_next: 0,
+                index_previous: 12,
+                owner: Some(high),
+                exchange_rate: None,
+                taker_pays_currency: None,
+                taker_pays_issuer: None,
+                taker_gets_currency: None,
+                taker_gets_issuer: None,
+                nftoken_id: None,
+                domain_id: None,
+                previous_txn_id: None,
+                previous_txn_lgr_seq: None,
+                has_index_next: false,
+                has_index_previous: false,
+                raw_sle: None,
+            }
+            .encode(),
+        );
+
+        let tx_hash = [0xAB; 32];
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x0072,
+                ledger_index: trustline_key.0,
+                fields: vec![
+                    parsed_field(3, 7, 2u64.to_be_bytes().to_vec()),
+                    parsed_field(3, 8, 12u64.to_be_bytes().to_vec()),
+                    parsed_field(
+                        6,
+                        6,
+                        crate::transaction::amount::Amount::Iou {
+                            value: crate::transaction::amount::IouValue::from_f64(1.0),
+                            currency: currency.clone(),
+                            issuer: low,
+                        }
+                        .to_bytes(),
+                    ),
+                    parsed_field(
+                        6,
+                        7,
+                        crate::transaction::amount::Amount::Iou {
+                            value: crate::transaction::amount::IouValue::from_f64(1.0),
+                            currency: currency.clone(),
+                            issuer: high,
+                        }
+                        .to_bytes(),
+                    ),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: low_page.0,
+                fields: vec![
+                    parsed_field(5, 8, low_root.0.to_vec()),
+                    parsed_field(8, 2, low.to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: high_page.0,
+                fields: vec![
+                    parsed_field(5, 8, high_root.0.to_vec()),
+                    parsed_field(8, 2, high.to_vec()),
+                    parsed_field(3, 2, 12u64.to_be_bytes().to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+
+        apply_authoritative_validated_tx_metadata(&mut state, &tx_hash, 58, &nodes, &[]);
+
+        let low_raw = state.get_raw_owned(&low_page).expect("low directory must exist");
+        let low_dir =
+            crate::ledger::DirectoryNode::decode(&low_raw, low_page.0).expect("valid low dir");
+        assert!(low_dir.indexes.iter().any(|index| index == &trustline_key.0));
+
+        let high_raw = state.get_raw_owned(&high_page).expect("high directory must exist");
+        let high_dir =
+            crate::ledger::DirectoryNode::decode(&high_raw, high_page.0).expect("valid high dir");
+        assert!(high_dir.indexes.iter().any(|index| index == &trustline_key.0));
+    }
+
+    #[test]
+    fn authoritative_replay_modified_offer_page_move_removes_old_directory_index() {
+        let mut state = crate::ledger::LedgerState::new();
+        let owner = [0x33; 20];
+        let book_root = {
+            let mut key = [0x66; 32];
+            key[24..32].copy_from_slice(&0u64.to_be_bytes());
+            key
+        };
+        let old_dir_key = crate::ledger::Key(book_root);
+        let new_dir_key = crate::ledger::directory::page_key(&book_root, 1);
+        let offer_key = [0xC2; 32];
+
+        let mut old_dir = crate::ledger::DirectoryNode {
+            key: old_dir_key.0,
+            root_index: old_dir_key.0,
+            indexes: vec![offer_key],
+            index_next: 1,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(0x1122),
+            taker_pays_currency: Some([0x01; 20]),
+            taker_pays_issuer: Some([0x02; 20]),
+            taker_gets_currency: Some([0x03; 20]),
+            taker_gets_issuer: Some([0x04; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: true,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        old_dir.raw_sle = Some(old_dir.encode());
+        state.insert_raw(old_dir_key, old_dir.encode());
+
+        let mut new_dir = crate::ledger::DirectoryNode {
+            key: new_dir_key.0,
+            root_index: old_dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(0x1122),
+            taker_pays_currency: Some([0x01; 20]),
+            taker_pays_issuer: Some([0x02; 20]),
+            taker_gets_currency: Some([0x03; 20]),
+            taker_gets_issuer: Some([0x04; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        new_dir.raw_sle = Some(new_dir.encode());
+        state.insert_raw(new_dir_key, new_dir.encode());
+
+        let tx_hash = [0x99; 32];
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x006f,
+                ledger_index: offer_key,
+                fields: vec![
+                    parsed_field(8, 1, owner.to_vec()),
+                    parsed_field(3, 4, 0u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 16, book_root.to_vec()),
+                    parsed_field(3, 3, 1u64.to_be_bytes().to_vec()),
+                ],
+                previous_fields: vec![parsed_field(3, 3, 0u64.to_be_bytes().to_vec())],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: old_dir_key.0,
+                fields: vec![
+                    parsed_field(3, 1, 1u64.to_be_bytes().to_vec()),
+                    parsed_field(3, 6, 0x1122u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 8, book_root.to_vec()),
+                    parsed_field(17, 1, vec![0x01; 20]),
+                    parsed_field(17, 2, vec![0x02; 20]),
+                    parsed_field(17, 3, vec![0x03; 20]),
+                    parsed_field(17, 4, vec![0x04; 20]),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: new_dir_key.0,
+                fields: vec![
+                    parsed_field(3, 6, 0x1122u64.to_be_bytes().to_vec()),
+                    parsed_field(5, 8, book_root.to_vec()),
+                    parsed_field(17, 1, vec![0x01; 20]),
+                    parsed_field(17, 2, vec![0x02; 20]),
+                    parsed_field(17, 3, vec![0x03; 20]),
+                    parsed_field(17, 4, vec![0x04; 20]),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+
+        apply_authoritative_validated_tx_metadata(&mut state, &tx_hash, 57, &nodes, &[]);
+
+        let old_raw = state
+            .get_raw_owned(&old_dir_key)
+            .expect("old directory must exist");
+        let old_dir =
+            crate::ledger::DirectoryNode::decode(&old_raw, old_dir_key.0).expect("valid old dir");
+        assert!(old_dir.indexes.is_empty());
+
+        let new_raw = state
+            .get_raw_owned(&new_dir_key)
+            .expect("new directory must exist");
+        let new_dir =
+            crate::ledger::DirectoryNode::decode(&new_raw, new_dir_key.0).expect("valid new dir");
+        assert_eq!(new_dir.indexes, vec![offer_key]);
+    }
+
+    #[test]
+    fn authoritative_replay_deleted_ticket_removes_owner_directory_index() {
+        let mut state = crate::ledger::LedgerState::new();
+        let owner = [0x44; 20];
+        let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+        let ticket_key = [0xAB; 32];
+
+        let mut owner_dir = crate::ledger::DirectoryNode {
+            key: owner_root.0,
+            root_index: owner_root.0,
+            indexes: vec![ticket_key],
+            index_next: 0,
+            index_previous: 0,
+            owner: Some(owner),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        owner_dir.raw_sle = Some(owner_dir.encode());
+        state.insert_raw(owner_root, owner_dir.encode());
+
+        let tx_hash = [0x55; 32];
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Deleted,
+                entry_type: 0x0054,
+                ledger_index: ticket_key,
+                fields: vec![
+                    parsed_field(8, 1, owner.to_vec()),
+                    parsed_field(3, 4, 0u64.to_be_bytes().to_vec()),
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: owner_root.0,
+                fields: vec![parsed_field(5, 8, owner_root.0.to_vec())],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+
+        apply_authoritative_validated_tx_metadata(&mut state, &tx_hash, 58, &nodes, &[]);
+
+        let raw = state
+            .get_raw_owned(&owner_root)
+            .expect("owner directory must exist");
+        let dir =
+            crate::ledger::DirectoryNode::decode(&raw, owner_root.0).expect("valid owner dir");
+        assert!(dir.indexes.is_empty());
+    }
+
     /// Diff the state_maps produced by close_ledger vs replay_ledger for
     /// the same Payment. Prints keys-only-in-A / keys-only-in-B / common
     /// keys with byte diffs, plus a hex side-by-side of the first common
@@ -1854,7 +3282,7 @@ mod tests {
                 rpc_host: None,
                 rpc_port: 0,
             };
-            let (bundle_dir, _rippled_ref) =
+            let (bundle_dir, _rippled_ref, _rippled_not_found, _rippled_unavailable) =
                 crate::ledger::forensic::capture_forensic_bundle(inputs)
                     .await
                     .expect("capture_forensic_bundle must succeed");

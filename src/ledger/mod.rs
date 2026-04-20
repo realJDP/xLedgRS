@@ -138,9 +138,9 @@ pub(crate) fn should_thread_previous_txn_fields(
 pub struct Fees {
     /// Base transaction fee in drops (default: 10).
     pub base: u64,
-    /// Minimum XRP reserve for an account in drops (default: 10_000_000 = 10 XRP).
+    /// Minimum XRP reserve for an account in drops (default: 1_000_000 = 1 XRP).
     pub reserve: u64,
-    /// Additional reserve per owned object in drops (default: 2_000_000 = 2 XRP).
+    /// Additional reserve per owned object in drops (default: 200_000 = 0.2 XRP).
     pub increment: u64,
 }
 
@@ -148,8 +148,8 @@ impl Default for Fees {
     fn default() -> Self {
         Self {
             base: 10,
-            reserve: 10_000_000,
-            increment: 2_000_000,
+            reserve: 1_000_000,
+            increment: 200_000,
         }
     }
 }
@@ -956,6 +956,35 @@ impl LedgerState {
         self.defer_storage = false;
     }
 
+    /// Drop all in-memory typed state and SHAMap overlays before a fresh
+    /// state-sync epoch, while preserving disk access and the live amendment set.
+    ///
+    /// This is intentionally stronger than `reset_overlay_after_root_rehydrate()`.
+    /// Resyncs after follower failure must release the old typed collections and
+    /// any lazily-loaded SHAMap tree retained from the previous epoch; otherwise
+    /// repeated replay/resync cycles ratchet heap usage upward.
+    pub fn reset_for_fresh_sync(&mut self) {
+        let storage = self.storage.clone();
+        let active_amendments = std::mem::take(&mut self.active_amendments);
+        let nudb_backend = {
+            let backend = self.nudb_map_guard().and_then(|map| map.backend().cloned());
+            if let Some(ref backend) = backend {
+                backend.clear_in_memory();
+            }
+            backend
+        };
+
+        *self = Self::new();
+        self.storage = storage;
+        self.active_amendments = active_amendments;
+        if let Some(backend) = nudb_backend {
+            self.nudb_shamap = Some(std::sync::Mutex::new(SHAMap::with_backend(
+                MapType::AccountState,
+                backend,
+            )));
+        }
+    }
+
     /// Diagnostic-only: take a lazy snapshot of the current NuDB-backed SHAMap.
     /// Used to preserve the pristine sync-anchor base before replay mutates it.
     pub fn snapshot_nudb_for_diagnostics(&self) -> Option<shamap::SHAMap> {
@@ -1063,13 +1092,27 @@ impl LedgerState {
         match self.nudb_map_guard() {
             Some(mut map) => {
                 let flushed = map.flush_dirty()?;
-                if flushed > 0 {
-                    map.evict_clean_leaves();
+                let evicted = map.evict_clean_leaves();
+                if flushed > 0 || evicted > 0 {
+                    tracing::info!(
+                        "flush_nudb: flushed {} node(s), evicted {} clean leaf/leaves",
+                        flushed,
+                        evicted,
+                    );
                 }
                 Ok(flushed)
             }
             None => Ok(0),
         }
+    }
+
+    /// Evict clean leaves from the NuDB-backed SHAMap without forcing a dirty flush.
+    /// This is used after sync handoff and other restart-style transitions where the
+    /// tree is already persisted but still fully materialized in memory.
+    pub fn evict_clean_nudb_leaves(&self) -> usize {
+        self.nudb_map_guard()
+            .map(|mut map| map.evict_clean_leaves())
+            .unwrap_or(0)
     }
 
     /// Enable deferred storage mode. insert_raw/remove_raw will skip
@@ -2719,19 +2762,13 @@ impl LedgerState {
     /// Read raw binary data, returning owned bytes.
     /// Falls through to persistent storage in sparse mode.
     pub fn get_raw_owned(&self, key: &Key) -> Option<Vec<u8>> {
-        if self.deleted_raw.contains(key) {
-            return None;
-        }
-        if let Some(data) = self.state_map.get_if_loaded(key) {
-            return Some(data.to_vec());
-        }
-        // NuDB-backed SHAMap is the durable store when no overlay is pending.
-        if let Some(mut map) = self.nudb_map_guard() {
-            if let Some(data) = map.get(key) {
-                return Some(data);
-            }
-        }
-        None
+        self.current_overlay_bytes(key)
+    }
+
+    /// Read committed bytes directly from the durable NuDB-backed store.
+    /// Ignores overlay deletes and typed-only entries.
+    pub fn get_committed_raw_owned(&self, key: &Key) -> Option<Vec<u8>> {
+        self.nudb_map_guard().and_then(|mut map| map.get(key))
     }
 
     /// Explain where a raw lookup would source data from.
@@ -2855,6 +2892,17 @@ impl LedgerState {
         self.sparse_map = Some(sparse);
         // Clear state_map to free memory — data is on disk, hashes in sparse
         self.state_map = SHAMap::new_state();
+
+        // If a NuDB-backed SHAMap is present, compact any clean leaves now that
+        // the sparse view is active. This frees the large in-memory payloads that
+        // were retained by the sync handoff tree.
+        let evicted = self.evict_clean_nudb_leaves();
+        if evicted > 0 {
+            tracing::info!(
+                "enable_sparse: evicted {} clean leaf/leaves from NuDB-backed tree",
+                evicted
+            );
+        }
     }
 
     /// Merge typed collections (accounts, trustlines, etc.) from another
@@ -3598,5 +3646,115 @@ mod tests {
         assert_eq!(historical.get(&key), Some(new_data));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reset_for_fresh_sync_drops_runtime_state_but_preserves_backend() {
+        use crate::ledger::node_store::MemNodeStore;
+
+        let backend = std::sync::Arc::new(MemNodeStore::new());
+        let key = Key([0xAB; 32]);
+        let data = vec![0x11; 64];
+        let leaf_hash = crate::ledger::sparse_shamap::leaf_hash(&data, &key.0);
+        let mut state = LedgerState::new();
+        state.set_nudb_shamap(SHAMap::with_backend(MapType::AccountState, backend.clone()));
+        state.enable_amendment(*FEATURE_FIX_PREVIOUS_TXN_ID);
+        state.insert_raw(key, data);
+        state.flush_nudb().unwrap();
+        state.hydrate_account(make_account(0x22, 10, 1));
+        state.enable_sparse();
+        assert!(state.sparse_map.is_some());
+        assert_eq!(state.account_count(), 1);
+        assert!(state.nudb_shamap.is_some());
+
+        state.reset_for_fresh_sync();
+
+        assert_eq!(state.account_count(), 0);
+        assert!(state.sparse_map.is_none());
+        assert!(state.iter_raw_entries().is_empty());
+        assert_eq!(state.amendment_count(), 1);
+        assert!(state.nudb_shamap.is_some());
+        let nudb_map = state.nudb_map_guard().expect("nudb backend should persist");
+        let fetched = nudb_map
+            .backend()
+            .expect("backend should remain attached")
+            .fetch(&leaf_hash)
+            .unwrap();
+        assert!(fetched.is_some());
+        drop(nudb_map);
+        assert!(state.get_raw_owned(&key).is_none());
+    }
+
+    #[test]
+    fn flush_nudb_compacts_clean_loaded_leaves() {
+        use crate::ledger::node_store::MemNodeStore;
+
+        let backend = std::sync::Arc::new(MemNodeStore::new());
+        let key = Key([0xCD; 32]);
+        let data = vec![0x22; 80];
+
+        let mut seeded = LedgerState::new();
+        seeded.set_nudb_shamap(SHAMap::with_backend(MapType::AccountState, backend.clone()));
+        seeded.insert_raw(key, data.clone());
+        seeded.flush_nudb().unwrap();
+        let root = seeded.nudb_root_hash().unwrap();
+
+        let mut restarted = LedgerState::new();
+        restarted.set_nudb_shamap(SHAMap::with_backend(MapType::AccountState, backend.clone()));
+        assert!(restarted.load_nudb_root(root).unwrap());
+        assert_eq!(restarted.get_raw_owned(&key), Some(data.clone()));
+
+        {
+            let map = restarted
+                .nudb_map_guard()
+                .expect("nudb map should exist after root load");
+            assert!(map.get_if_loaded(&key).is_some());
+        }
+
+        let flushed = restarted.flush_nudb().unwrap();
+        assert_eq!(flushed, 0, "clean map should not require a dirty flush");
+
+        {
+            let map = restarted
+                .nudb_map_guard()
+                .expect("nudb map should exist after compaction");
+            assert!(
+                map.get_if_loaded(&key).is_none(),
+                "clean leaves should be evicted even when nothing was flushed"
+            );
+        }
+        assert_eq!(restarted.get_raw_owned(&key), Some(data));
+    }
+
+    #[test]
+    fn get_raw_owned_uses_typed_overlay_when_raw_bytes_are_absent() {
+        let mut state = LedgerState::new();
+        let account = make_account(0x52, 42, 7);
+        let key = crate::ledger::account::shamap_key(&account.account_id);
+
+        state.hydrate_account(account.clone());
+
+        assert_eq!(state.get_raw(&key), None);
+        assert_eq!(state.get_raw_owned(&key), Some(account.to_sle_binary()));
+    }
+
+    #[test]
+    fn committed_raw_lookup_bypasses_deleted_overlay() {
+        use crate::ledger::node_store::MemNodeStore;
+
+        let backend = std::sync::Arc::new(MemNodeStore::new());
+        let key = Key([0xEF; 32]);
+        let data = vec![0x5A; 96];
+
+        let mut state = LedgerState::new();
+        state.set_nudb_shamap(SHAMap::with_backend(MapType::AccountState, backend));
+        state.insert_raw(key, data.clone());
+        state.flush_nudb().unwrap();
+
+        state.deleted_raw.insert(key);
+        state.state_map.remove(&key);
+
+        assert_eq!(state.get_raw_owned(&key), None);
+        assert_eq!(state.get_committed_raw_owned(&key), Some(data));
     }
 }

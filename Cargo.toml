@@ -54,7 +54,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 prost = "0.13"
 tonic = { version = "0.12", features = ["transport"] }
 lz4_flex = "0.11"
-openssl = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
 tokio-openssl = "0.6"
 libc = "0.2.184"
 nudb = { path = "../nudb-rs" }

@@ -36,6 +36,7 @@ pub fn ripple_calculate(
     destination: &[u8; 20],
     deliver_amount: &Amount,
     send_max: Option<&Amount>,
+    deliver_min: Option<&Amount>,
     paths: &[Vec<PathStep>],
     flags: u32,
 ) -> RippleCalcResult {
@@ -56,12 +57,13 @@ pub fn ripple_calculate(
                 None => false,
             };
             let has_paths = !paths.is_empty();
+            let has_deliver_min = deliver_min.is_some();
 
-            if !is_cross_currency && !has_paths {
+            if !is_cross_currency && !has_paths && send_max.is_none() && !has_deliver_min {
                 // ── Direct IOU payment (single DirectStep) ──
                 // rippled: sender → issuer → destination on same trust lines
                 direct_iou_payment(state, sender, destination, issuer, currency, value, flags)
-            } else if !has_paths && send_max.is_some() {
+            } else if !has_paths && (send_max.is_some() || has_deliver_min) {
                 // Cross-currency with no explicit paths — needs default path.
                 // For XRP→IOU with SendMax: need BookStep (DEX crossing).
                 // Not yet implemented — return tecPATH_DRY matching rippled
@@ -130,12 +132,15 @@ fn direct_iou_payment(
     let sender_key = crate::ledger::trustline::shamap_key(sender, issuer, currency);
     let mut sender_tl = load_or_create_trustline(state, &sender_key, sender, issuer, currency);
 
-    // Check sender has sufficient balance
     let sender_balance = sender_tl.balance_for(sender);
-    if sender_balance.mantissa <= 0 && amount.mantissa > 0 {
-        // Sender has no positive balance on this trust line.
-        // Check if sender IS the issuer (issuers can create tokens).
-        if *sender != *issuer {
+    if *sender != *issuer {
+        let opposite_limit = if sender == &sender_tl.low_account {
+            sender_tl.high_limit
+        } else {
+            sender_tl.low_limit
+        };
+        let headroom = opposite_limit.add(&sender_balance);
+        if headroom.sub(&send_amount).is_negative() {
             return RippleCalcResult {
                 success: false,
                 ter: "tecPATH_DRY",
