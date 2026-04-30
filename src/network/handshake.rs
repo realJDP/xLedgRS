@@ -6,7 +6,7 @@
 //! **Initiator sends:**
 //! ```text
 //! GET / HTTP/1.1
-//! User-Agent: xledgrs/0.1.0
+//! User-Agent: xLedgRSv2Beta/0.1.0
 //! Upgrade: XRPL/2.2
 //! Connection: Upgrade
 //! Connect-As: Peer
@@ -44,7 +44,7 @@ use crate::crypto::base58::{decode, encode, PREFIX_NODE_PUBLIC};
 
 pub const XRPL_PROTOCOL: &str = "XRPL/2.2";
 pub const XRPL_PROTOCOL_MIN: &str = "XRPL/2.0";
-pub const USER_AGENT: &str = concat!("xledgrs/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("xLedgRSv2Beta/", env!("CARGO_PKG_VERSION"));
 
 /// Ripple epoch: 2000-01-01T00:00:00Z in Unix epoch seconds.
 const RIPPLE_EPOCH: u64 = 946684800;

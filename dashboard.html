@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>xLedgRS // testnet</title>
+<title>xLedgRSv2Beta // testnet</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #0a0a0a; color: #e0e0e0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; padding: 20px; }
@@ -52,7 +52,7 @@
 </head>
 <body>
 
-<h1>xLedgRS <span style="color:#444">//</span> <span style="color:#ffaa00">testnet</span></h1>
+<h1>xLedgRSv2Beta <span style="color:#444">//</span> <span style="color:#ffaa00">testnet</span></h1>
 <div class="subtitle" id="connection-status"><span class="dot off"></span> connecting...</div>
 
 <div class="grid">
@@ -137,8 +137,8 @@
 </div>
 
 <script>
-const RPC = 'http://127.0.0.1:5006';
-const WS_URL = 'ws://127.0.0.1:6007';
+const RPC = 'http://127.0.0.1:5005';
+const WS_URL = 'ws://127.0.0.1:6006';
 
 const counts = { proposals: 0, validations: 0, manifests: 0, status: 0, tx: 0, total: 0 };
 let msgPerSec = 0;
@@ -265,7 +265,7 @@ async function fetchServerInfo() {
     $('connection-status').innerHTML = '<span class="dot off"></span> RPC unreachable';
     $('peer-count').textContent = '-';
     $('peer-count').className = 'stat off';
-    logEvent('RPC unreachable - node may have crashed', true);
+    logEvent('RPC unreachable - node is not responding on the configured endpoint', true);
     disconnectCount++;
     lastDisconnect = time();
   }
@@ -292,7 +292,7 @@ async function fetchMemory() {
       $('memory-range').textContent = `min ${memoryMin} / max ${memoryMax} MB`;
     } else {
       $('memory-current').textContent = 'N/A';
-      $('memory-range').textContent = 'add memory_mb to server_info';
+      $('memory-range').textContent = 'memory reporting unavailable';
     }
   } catch(_) {}
 }
@@ -387,7 +387,7 @@ setInterval(fetchServerInfo, 3000);
 setInterval(fetchMemory, 10000);
 setInterval(updateBenchmarks, 5000);
 connectWS();
-logEvent('Dashboard started - monitoring overnight run');
+logEvent('Dashboard started');
 </script>
 </body>
 </html>

@@ -16,7 +16,7 @@ pub async fn run_diagnose(
     storage: Arc<Storage>,
     rpc_endpoint: Option<String>,
 ) -> anyhow::Result<()> {
-    println!("=== xledgrs state diagnostic ===\n");
+    println!("=== xLedgRSv2Beta state diagnostic ===\n");
 
     // Basic info from SQLite storage
     let sync_ledger = storage.get_sync_ledger();

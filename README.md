@@ -1,8 +1,12 @@
-# xLedgRS
+# xLedgRSv2Beta
 
-Version: `1.0beta`
+Version: `2.0.0-beta`
 
-`xLedgRS` is an XRP Ledger node implementation in Rust. The repository ships the core peer protocol runtime, ledger and SHAMap handling, JSON-RPC, WebSocket, optional gRPC services, persistent storage, and release-safe configuration templates for follower and validator deployments.
+`xLedgRSv2Beta` is a beta XRP Ledger node implementation in Rust. The repository ships the core peer protocol runtime, ledger and SHAMap handling, JSON-RPC, WebSocket, optional gRPC services, persistent storage, and release-safe configuration templates for follower and validator deployments.
+
+## Release Status
+
+This is a public beta release. It is intended for development, testing, protocol research, and operator evaluation. Do not treat it as a drop-in replacement for `rippled` in production validator infrastructure until your own validation and risk review are complete.
 
 ## What This Repository Includes
 
@@ -60,42 +64,42 @@ The binary will be written to:
 
 ## Command-Line Lifecycle
 
-`xledgrs` now includes native process lifecycle commands, so the binary can manage its own background process without a separate shell wrapper.
+`xLedgRSv2Beta` includes native process lifecycle commands, so the binary can manage its own background process without a separate shell wrapper.
 
 Common usage:
 
 ```bash
-./target/release/xledgrs --start --config ./xledgrs.cfg
-./target/release/xledgrs --status --config ./xledgrs.cfg
-./target/release/xledgrs --restart --config ./xledgrs.cfg
-./target/release/xledgrs --stop --config ./xledgrs.cfg
+./target/release/xledgrs --start --config ./xLedgRSv2Beta.cfg
+./target/release/xledgrs --status --config ./xLedgRSv2Beta.cfg
+./target/release/xledgrs --restart --config ./xLedgRSv2Beta.cfg
+./target/release/xledgrs --stop --config ./xLedgRSv2Beta.cfg
 ```
 
 By default:
 
 - the node reads its listeners and storage path from `--config`
-- the PID file is written under the configured data directory as `xledgrs.pid`
-- the log file is written under the configured data directory as `xledgrs.log`
+- the PID file is written under the configured data directory as `xLedgRSv2Beta.pid`
+- the log file is written under the configured data directory as `xLedgRSv2Beta.log`
 
 These can be overridden explicitly:
 
 ```bash
 ./target/release/xledgrs \
   --start \
-  --config ./xledgrs.cfg \
-  --pid-file /var/run/xledgrs.pid \
-  --log-file /var/log/xledgrs.log
+  --config ./xLedgRSv2Beta.cfg \
+  --pid-file /var/run/xLedgRSv2Beta.pid \
+  --log-file /var/log/xLedgRSv2Beta.log
 ```
 
 ## Default Ports
 
-The shipped source tree now uses rippled-style default ports:
+The shipped source tree uses rippled-style default ports:
 
 - peer: `51235`
 - JSON-RPC: `5005`
 - WebSocket: `6006`
 
-The binary CLI defaults match those ports, and the release config templates now do too.
+The binary CLI defaults match those ports, and the release config templates do too.
 
 ## Quick Start
 
@@ -104,7 +108,7 @@ The binary CLI defaults match those ports, and the release config templates now 
 1. Copy the mainnet template:
 
 ```bash
-cp cfg/xledgrs.cfg ./xledgrs.cfg
+cp cfg/xLedgRSv2Beta.cfg ./xLedgRSv2Beta.cfg
 ```
 
 2. Review:
@@ -117,13 +121,13 @@ cp cfg/xledgrs.cfg ./xledgrs.cfg
 3. Start the node:
 
 ```bash
-./target/release/xledgrs --start --config ./xledgrs.cfg
+./target/release/xledgrs --start --config ./xLedgRSv2Beta.cfg
 ```
 
 4. Check status:
 
 ```bash
-./target/release/xledgrs --status --config ./xledgrs.cfg
+./target/release/xledgrs --status --config ./xLedgRSv2Beta.cfg
 ```
 
 5. Query local JSON-RPC:
@@ -136,8 +140,8 @@ curl -s http://127.0.0.1:5005 \
 ### Testnet follower
 
 ```bash
-cp cfg/testnet.cfg ./xledgrs-testnet.cfg
-./target/release/xledgrs --start --config ./xledgrs-testnet.cfg
+cp cfg/testnet.cfg ./xLedgRSv2Beta-testnet.cfg
+./target/release/xledgrs --start --config ./xLedgRSv2Beta-testnet.cfg
 ```
 
 ### Foreground run
@@ -145,7 +149,7 @@ cp cfg/testnet.cfg ./xledgrs-testnet.cfg
 For debugging or direct terminal use, run without `--start`:
 
 ```bash
-./target/release/xledgrs --config ./xledgrs.cfg
+./target/release/xledgrs --config ./xLedgRSv2Beta.cfg
 ```
 
 The process will stay attached to the terminal and shut down on `Ctrl-C` or `SIGTERM`.
@@ -156,16 +160,16 @@ The process will stay attached to the terminal and shut down on `Ctrl-C` or `SIG
 
 `xledgrs --config` accepts:
 
-- the repository’s xLedgRS TOML format
+- the repository’s xLedgRSv2Beta TOML format
 - rippled/xrpld-style sectioned config files
 
 ### Shipped templates
 
-- `cfg/xledgrs.cfg` mainnet follower template
+- `cfg/xLedgRSv2Beta.cfg` mainnet follower template
 - `cfg/testnet.cfg` testnet follower template
 - `cfg/validator-mainnet.cfg` mainnet validator template
 - `cfg/validator-testnet.cfg` testnet validator template
-- `cfg/xledgrs-example.cfg` generic example template
+- `cfg/xLedgRSv2Beta-example.cfg` generic example template
 
 ### Important settings
 
@@ -175,7 +179,7 @@ The most important settings to review before running are:
 - `[node_db] path`
 - `[validators_file]`
 - `[ips]` and `[ips_fixed]`
-- `[xledgrs]`
+- `[xLedgRSv2Beta]`
   - `enable_consensus_close_loop`
   - `rpc_sync`
   - `post_sync_checkpoint_script`
@@ -221,14 +225,14 @@ The node exposes a local WebSocket server for event-driven consumers and operato
 The binary can also expose gRPC when `--grpc-addr` is supplied or a gRPC listener is configured. The repository includes:
 
 - `XRPLedgerAPIService`
-- `Xledgrs` extension service
+- `XLedgRSv2Beta` extension service
 
 The protobuf definitions live in `proto/`.
 
 ## Operational Notes
 
-- The default mainnet follower template stores data under `./xledgrs-data`
-- The default validator template stores data under `./xledgrs-validator-data`
+- The default mainnet follower template stores data under `./xLedgRSv2Beta-data`
+- The default validator template stores data under `./xLedgRSv2Beta-validator-data`
 - `post-sync-checkpoint.sh` is an optional post-sync helper referenced by the shipped configs
 - The built-in peer bootstrap list uses public XRPL hubs when no custom peer list is configured
 
@@ -244,6 +248,12 @@ Full test run:
 
 ```bash
 cargo test
+```
+
+Library-only validation, useful for fast release checks:
+
+```bash
+cargo test --lib
 ```
 
 Focused release-safety checks:

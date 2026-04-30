@@ -283,10 +283,10 @@ impl Node {
         let data_dir_for_cmd = data_dir.clone();
         let run = tokio::task::spawn_blocking(move || {
             std::process::Command::new(&script_for_cmd)
-                .env("XLEDGRS_SYNC_LEDGER_SEQ", &seq)
-                .env("XLEDGRS_SYNC_LEDGER_HASH", &ledger_hash)
-                .env("XLEDGRS_SYNC_ACCOUNT_HASH", &account_hash)
-                .env("XLEDGRS_SYNC_DATA_DIR", &data_dir_for_cmd)
+                .env("XLEDGRSV2BETA_SYNC_LEDGER_SEQ", &seq)
+                .env("XLEDGRSV2BETA_SYNC_LEDGER_HASH", &ledger_hash)
+                .env("XLEDGRSV2BETA_SYNC_ACCOUNT_HASH", &account_hash)
+                .env("XLEDGRSV2BETA_SYNC_DATA_DIR", &data_dir_for_cmd)
                 .output()
         })
         .await;

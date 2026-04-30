@@ -1,4 +1,8 @@
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=proto/xrpl.proto");
+    println!("cargo:rerun-if-changed=proto/grpc.proto");
+
     tonic_build::configure()
         .build_client(false)
         .build_server(true)

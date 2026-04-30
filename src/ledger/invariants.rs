@@ -608,6 +608,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,

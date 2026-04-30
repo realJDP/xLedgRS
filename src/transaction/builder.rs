@@ -64,6 +64,8 @@ pub struct TxBuilder {
     set_flag: Option<u32>,
     clear_flag: Option<u32>,
     transfer_rate: Option<u32>,
+    quality_in: Option<u32>,
+    quality_out: Option<u32>,
     tick_size: Option<u8>,
     limit_amount: Option<Amount>,
     taker_pays: Option<Amount>,
@@ -99,6 +101,8 @@ impl TxBuilder {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             limit_amount: None,
             taker_pays: None,
@@ -241,6 +245,18 @@ impl TxBuilder {
 
     pub fn transfer_rate(mut self, rate: u32) -> Self {
         self.transfer_rate = Some(rate);
+        self
+    }
+
+    /// Set QualityIn for TrustSet transactions.
+    pub fn quality_in(mut self, quality: u32) -> Self {
+        self.quality_in = Some(quality);
+        self
+    }
+
+    /// Set QualityOut for TrustSet transactions.
+    pub fn quality_out(mut self, quality: u32) -> Self {
+        self.quality_out = Some(quality);
         self
     }
 
@@ -396,6 +412,18 @@ impl TxBuilder {
             fields.push(Field {
                 def: field::TRANSFER_RATE,
                 value: FieldValue::UInt32(rate),
+            });
+        }
+        if let Some(quality) = self.quality_in {
+            fields.push(Field {
+                def: field::QUALITY_IN,
+                value: FieldValue::UInt32(quality),
+            });
+        }
+        if let Some(quality) = self.quality_out {
+            fields.push(Field {
+                def: field::QUALITY_OUT,
+                value: FieldValue::UInt32(quality),
             });
         }
         if let Some(fa) = self.finish_after {

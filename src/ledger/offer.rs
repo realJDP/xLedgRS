@@ -31,6 +31,123 @@ pub fn shamap_key(account: &[u8; 20], sequence: u32) -> Key {
     Key(sha512_first_half(&data))
 }
 
+/// Parse an sfAdditionalBooks STArray payload.
+///
+/// rippled stores each additional book as an inner sfBook object containing
+/// sfBookDirectory and sfBookNode. Older local fixtures wrote a malformed
+/// STArray entry directly; keep a small compatibility path so we can still
+/// inspect those fixtures.
+pub(crate) fn additional_book_entries_from_payload(data: &[u8]) -> Vec<([u8; 32], u64)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let (tc, fc, new_pos) = crate::ledger::meta::read_field_header(data, pos);
+        if new_pos <= pos {
+            break;
+        }
+        pos = new_pos;
+
+        match (tc, fc) {
+            (15, 1) | (14, 1) => break,
+            (14, 36) => {
+                if let Some(entry) = parse_additional_book_object(data, &mut pos) {
+                    out.push(entry);
+                }
+            }
+            (15, 3) => {
+                if let Some(entry) = parse_legacy_additional_book_object(data, &mut pos) {
+                    out.push(entry);
+                }
+            }
+            _ => {
+                pos = crate::ledger::meta::skip_field_raw(data, pos, tc);
+            }
+        }
+    }
+
+    out
+}
+
+pub(crate) fn additional_book_directories_from_payload(data: &[u8]) -> Vec<[u8; 32]> {
+    additional_book_entries_from_payload(data)
+        .into_iter()
+        .map(|(book_directory, _)| book_directory)
+        .collect()
+}
+
+fn parse_additional_book_object(data: &[u8], pos: &mut usize) -> Option<([u8; 32], u64)> {
+    let mut book_directory = None;
+    let mut book_node = 0u64;
+
+    while *pos < data.len() {
+        let (tc, fc, new_pos) = crate::ledger::meta::read_field_header(data, *pos);
+        if new_pos <= *pos {
+            break;
+        }
+        *pos = new_pos;
+
+        match (tc, fc) {
+            (14, 1) | (15, 1) => break,
+            (5, 16) => {
+                if *pos + 32 <= data.len() {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&data[*pos..*pos + 32]);
+                    book_directory = Some(h);
+                }
+                *pos = (*pos + 32).min(data.len());
+            }
+            (3, 3) => {
+                if *pos + 8 <= data.len() {
+                    book_node = u64::from_be_bytes(data[*pos..*pos + 8].try_into().ok()?);
+                }
+                *pos = (*pos + 8).min(data.len());
+            }
+            _ => {
+                *pos = crate::ledger::meta::skip_field_raw(data, *pos, tc);
+            }
+        }
+    }
+
+    book_directory.map(|dir| (dir, book_node))
+}
+
+fn parse_legacy_additional_book_object(data: &[u8], pos: &mut usize) -> Option<([u8; 32], u64)> {
+    let mut book_directory = None;
+    let mut book_node = 0u64;
+
+    while *pos < data.len() {
+        let (tc, fc, new_pos) = crate::ledger::meta::read_field_header(data, *pos);
+        if new_pos <= *pos {
+            break;
+        }
+        *pos = new_pos;
+
+        match (tc, fc) {
+            (14, 1) => break,
+            (5, 16) => {
+                if *pos + 32 <= data.len() {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&data[*pos..*pos + 32]);
+                    book_directory = Some(h);
+                }
+                *pos = (*pos + 32).min(data.len());
+            }
+            (3, 3) => {
+                if *pos + 8 <= data.len() {
+                    book_node = u64::from_be_bytes(data[*pos..*pos + 8].try_into().ok()?);
+                }
+                *pos = (*pos + 8).min(data.len());
+            }
+            _ => {
+                *pos = crate::ledger::meta::skip_field_raw(data, *pos, tc);
+            }
+        }
+    }
+
+    book_directory.map(|dir| (dir, book_node))
+}
+
 // ── Offer ─────────────────────────────────────────────────────────────────────
 
 /// A standing order on the DEX.
@@ -200,9 +317,10 @@ impl Offer {
         if !self.additional_books.is_empty() {
             let mut array = Vec::new();
             for book in &self.additional_books {
-                array.push(0xF3); // STObject field header: type=15, field=3 (ArrayEntry)
-                array.push(0x50); // Hash256 extended field
-                array.push(16); // sfBookDirectory
+                crate::ledger::meta::write_field_header_pub(&mut array, 14, 36); // sfBook
+                crate::ledger::meta::write_field_header_pub(&mut array, 3, 3); // sfBookNode
+                array.extend_from_slice(&0u64.to_be_bytes());
+                crate::ledger::meta::write_field_header_pub(&mut array, 5, 16); // sfBookDirectory
                 array.extend_from_slice(book);
                 array.push(0xE1); // STObject end marker
             }
@@ -453,36 +571,10 @@ impl Offer {
                     pos += vl_bytes + vl_len;
                 }
                 (15, 13) => {
-                    while pos < data.len() && data[pos] != 0xF1 {
-                        let hdr = data[pos];
-                        pos += 1;
-                        if hdr == 0xF3 {
-                            if pos + 2 > data.len() {
-                                break;
-                            }
-                            let f0 = data[pos];
-                            let f1 = data[pos + 1];
-                            pos += 2;
-                            if f0 == 0x50 && f1 == 16 {
-                                if pos + 32 > data.len() {
-                                    break;
-                                }
-                                let mut h = [0u8; 32];
-                                h.copy_from_slice(&data[pos..pos + 32]);
-                                additional_books.push(h);
-                                pos += 32;
-                            }
-                            while pos < data.len() && data[pos] != 0xE1 {
-                                pos += 1;
-                            }
-                            if pos < data.len() {
-                                pos += 1;
-                            }
-                        }
-                    }
-                    if pos < data.len() && data[pos] == 0xF1 {
-                        pos += 1;
-                    }
+                    let end = crate::ledger::meta::skip_field_raw(data, pos, 15);
+                    additional_books
+                        .extend(additional_book_directories_from_payload(&data[pos..end]));
+                    pos = end;
                 }
                 (16, _) => {
                     if pos >= data.len() {
@@ -845,6 +937,62 @@ mod tests {
             currency: Currency::from_code("USD").unwrap(),
             issuer: acct(issuer),
         }
+    }
+
+    fn additional_books_payload(entries: &[([u8; 32], u64)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (book_directory, book_node) in entries {
+            crate::ledger::meta::write_field_header_pub(&mut data, 14, 36);
+            crate::ledger::meta::write_field_header_pub(&mut data, 3, 3);
+            data.extend_from_slice(&book_node.to_be_bytes());
+            crate::ledger::meta::write_field_header_pub(&mut data, 5, 16);
+            data.extend_from_slice(book_directory);
+            data.push(0xE1);
+        }
+        data.push(0xF1);
+        data
+    }
+
+    #[test]
+    fn parses_rippled_additional_books_payload() {
+        let book_directory = [0x42; 32];
+        let payload = additional_books_payload(&[(book_directory, 9)]);
+
+        assert_eq!(
+            additional_book_entries_from_payload(&payload),
+            vec![(book_directory, 9)]
+        );
+        assert_eq!(
+            additional_book_directories_from_payload(&payload),
+            vec![book_directory]
+        );
+    }
+
+    #[test]
+    fn encodes_additional_books_as_book_objects() {
+        let book_directory = [0x55; 32];
+        let offer = Offer {
+            account: acct(1),
+            sequence: 1,
+            taker_pays: xrp(1_000_000),
+            taker_gets: usd(10.0, 2),
+            flags: 0,
+            book_directory: [0u8; 32],
+            book_node: 0,
+            owner_node: 0,
+            expiration: None,
+            domain_id: None,
+            additional_books: vec![book_directory],
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+
+        let raw = offer.encode();
+        let decoded = Offer::decode_from_sle(&raw).expect("valid offer SLE");
+
+        assert!(raw.windows(2).any(|window| window == [0xE0, 0x24]));
+        assert_eq!(decoded.additional_books, vec![book_directory]);
     }
 
     #[test]

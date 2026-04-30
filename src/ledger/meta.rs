@@ -324,6 +324,10 @@ pub fn build_sle(
     // Optional/default fields must stay absent when metadata omits them,
     // Otherwise extra bytes would be synthesized and the ledger hash would change.
     match entry_type {
+        0x0061 => {
+            // AccountRoot: OwnerCount is required, even when zero.
+            add_default_u32(&mut fields, 2, 13, 0);
+        }
         0x006f => {
             // Offer: BookNode, OwnerNode
             add_default_u64(&mut fields, 3, 3, 0); // sfBookNode
@@ -332,6 +336,11 @@ pub fn build_sle(
         0x0064 => {
             // DirectoryNode: Indexes is required even when the vector is empty.
             add_default_vector256(&mut fields, 19, 1);
+        }
+        0x0072 => {
+            // RippleState: LowNode, HighNode
+            add_default_u64(&mut fields, 3, 7, 0); // sfLowNode
+            add_default_u64(&mut fields, 3, 8, 0); // sfHighNode
         }
         0x0043 => {
             // Check: OwnerNode
@@ -648,14 +657,7 @@ fn parse_affected_node(data: &[u8], pos: &mut usize, action: Action) -> Option<A
                 *pos += 32;
             }
             (2, 5) if fc == 5 => {
-                // PreviousTxnLgrSeq (UInt32, type=2, field=5) — but wait,
-                // field=5 for type=2 could be OwnerCount too? No, OwnerCount is field=13.
-                // Let me check: sfPreviousTxnLgrSeq is UINT32 field 5. Actually wait...
-                // sfSourceTag is UINT32 field 3
-                // sfSequence is UINT32 field 4
-                // sfPreviousTxnLgrSeq is UINT32 field 5 (0x25)
-                // sfOwnerCount is UINT32 field 13 (0x2D)
-                // So yes, (2, 5) = PreviousTxnLgrSeq at the outer node level
+                // PreviousTxnLgrSeq is UInt32 field 5 at the outer node level.
                 if *pos + 4 > data.len() {
                     break;
                 }
@@ -730,6 +732,16 @@ pub struct ParsedField {
     pub type_code: u16,
     pub field_code: u16,
     pub data: Vec<u8>, // raw field data (without header, without VL prefix)
+}
+
+/// Best-effort check for whether a field payload is still at its default/empty
+/// representation.
+///
+/// This intentionally only treats empty or all-zero payloads as default-ish so
+/// callers can preserve omitted-vs-default distinctions without guessing
+/// beyond what the raw bytes tell us.
+pub(crate) fn field_data_is_default(data: &[u8]) -> bool {
+    data.is_empty() || data.iter().all(|b| *b == 0)
 }
 
 pub struct ParsedSLE {
@@ -1326,5 +1338,12 @@ mod tests {
             "patch_sle hung on trailing garbage"
         );
         let _ = result;
+    }
+
+    #[test]
+    fn test_field_data_is_default_is_conservative() {
+        assert!(field_data_is_default(&[]));
+        assert!(field_data_is_default(&[0, 0, 0]));
+        assert!(!field_data_is_default(&[0, 1, 0]));
     }
 }

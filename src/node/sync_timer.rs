@@ -192,14 +192,25 @@ impl Node {
                 let needs_kickstart = inactive_target.is_some() || !self.sync_runtime.has_syncer();
                 if needs_kickstart {
                     let state = self.state.read().await;
+                    let peer_ranges: Vec<(u32, u32)> =
+                        state.peer_ledger_range.values().copied().collect();
                     let have_validated_target =
                         state.ctx.ledger_seq > 1 && state.ctx.ledger_header.hash != [0u8; 32];
+                    let trusted_hash = state.validated_hashes.get(&state.ctx.ledger_seq).copied();
+                    let reachable_seq_only_target = if trusted_hash.is_none() {
+                        crate::sync_bootstrap::choose_reachable_seq_only_target(
+                            state.ctx.ledger_seq,
+                            &peer_ranges,
+                        )
+                    } else {
+                        None
+                    };
                     let anchor_pending = state.pending_sync_anchor.is_some();
                     if !state.sync_done
                         && !anchor_pending
                         && state.peer_count() >= 1
                         && self.storage.is_some()
-                        && have_validated_target
+                        && (have_validated_target || reachable_seq_only_target.is_some())
                     {
                         static LAST_KICKSTART: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
@@ -211,18 +222,6 @@ impl Node {
                         if now_secs >= prev + 15 {
                             LAST_KICKSTART.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                             let cookie = crate::sync::next_cookie();
-                            let trusted_hash =
-                                state.validated_hashes.get(&state.ctx.ledger_seq).copied();
-                            let peer_ranges: Vec<(u32, u32)> =
-                                state.peer_ledger_range.values().copied().collect();
-                            let reachable_seq_only_target = if trusted_hash.is_none() {
-                                crate::sync_bootstrap::choose_reachable_seq_only_target(
-                                    state.ctx.ledger_seq,
-                                    &peer_ranges,
-                                )
-                            } else {
-                                None
-                            };
                             let (target_seq, target_hash, reason) =
                                 crate::sync_bootstrap::choose_sync_kickstart_target(
                                     inactive_target,

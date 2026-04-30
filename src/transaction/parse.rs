@@ -70,6 +70,10 @@ pub struct ParsedTx {
     pub clear_flag: Option<u32>,
     /// `TransferRate` (type=2, field=11) — for AccountSet.
     pub transfer_rate: Option<u32>,
+    /// `QualityIn` (type=2, field=20) — for TrustSet.
+    pub quality_in: Option<u32>,
+    /// `QualityOut` (type=2, field=21) — for TrustSet.
+    pub quality_out: Option<u32>,
     /// `TickSize` (type=16, field=8) — for AccountSet (UInt8).
     pub tick_size: Option<u8>,
     /// `LastLedgerSequence` (type=2, field=27) — tx expires after this ledger.
@@ -303,6 +307,8 @@ impl Default for ParsedTx {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -399,6 +405,8 @@ pub fn parse_blob(data: &[u8]) -> Result<ParsedTx, ParseError> {
     let mut set_flag_val = None::<u32>;
     let mut clear_flag_val = None::<u32>;
     let mut transfer_rate = None::<u32>;
+    let mut quality_in = None::<u32>;
+    let mut quality_out = None::<u32>;
     let mut tick_size_val = None::<u8>;
     let mut last_ledger_seq = None::<u32>;
     let mut ticket_count = None::<u32>;
@@ -517,6 +525,8 @@ pub fn parse_blob(data: &[u8]) -> Result<ParsedTx, ParseError> {
                     4 => sequence = Some(v),         // Sequence
                     10 => expiration_val = Some(v),  // Expiration
                     11 => transfer_rate = Some(v),   // sfTransferRate = UINT32, 11
+                    20 => quality_in = Some(v),      // sfQualityIn = UINT32, 20
+                    21 => quality_out = Some(v),     // sfQualityOut = UINT32, 21
                     25 => offer_seq = Some(v),       // sfOfferSequence = UINT32, 25
                     27 => last_ledger_seq = Some(v), // sfLastLedgerSequence = UINT32, 27
                     31 => reserve_base = Some(v),    // sfReserveBase = UINT32, 31
@@ -928,6 +938,8 @@ pub fn parse_blob(data: &[u8]) -> Result<ParsedTx, ParseError> {
         set_flag: set_flag_val,
         clear_flag: clear_flag_val,
         transfer_rate,
+        quality_in,
+        quality_out,
         tick_size: tick_size_val,
         last_ledger_seq,
         ticket_count,
@@ -1088,6 +1100,33 @@ mod tests {
         assert!(parsed.destination.is_some());
         assert_eq!(parsed.signing_pubkey.len(), 33); // compressed secp256k1
         assert!(!parsed.signature.is_empty());
+    }
+
+    #[test]
+    fn test_parse_trustset_quality_fields() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let kp = genesis_kp();
+        let signed = TxBuilder::trust_set()
+            .account(&kp)
+            .limit_amount(Amount::Iou {
+                value: IouValue::from_f64(1000.0),
+                currency: Currency::from_code("USD").unwrap(),
+                issuer: dest_id(),
+            })
+            .quality_in(1_250_000_000)
+            .quality_out(1_500_000_000)
+            .fee(12)
+            .sequence(8)
+            .sign(&kp)
+            .unwrap();
+
+        let parsed = parse_blob(&signed.blob).expect("TrustSet parse should succeed");
+
+        assert_eq!(parsed.tx_type, 20); // TrustSet
+        assert_eq!(parsed.sequence, 8);
+        assert_eq!(parsed.quality_in, Some(1_250_000_000));
+        assert_eq!(parsed.quality_out, Some(1_500_000_000));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Load/stall tracking for server status surfaces.
 //!
-//! xledgrs keeps a dedicated load-manager cycle backed by a runtime job-queue
+//! xLedgRSv2Beta keeps a dedicated load-manager cycle backed by a runtime job-queue
 //! view so `server_info`, `server_state`, and WebSocket `serverStatus` expose
 //! live stall and fee-pressure state instead of fixed values.
 

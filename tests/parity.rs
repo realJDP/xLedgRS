@@ -1,9 +1,9 @@
-//! Parity tests — verify xLedgRS behavior matches rippled's expected outcomes.
+//! Parity tests — verify xLedgRSv2Beta behavior matches rippled's expected outcomes.
 //!
 //! Fixtures are derived from rippled's jtx and app test suites.
 //!
 //! Each test encodes a specific scenario from rippled's C++ tests and verifies
-//! that xLedgRS produces the same TER code, balance, sequence, and owner count.
+//! that xLedgRSv2Beta produces the same TER code, balance, sequence, and owner count.
 
 use xrpl::crypto::keys::{KeyPair, Secp256k1KeyPair};
 use xrpl::ledger::ter::{self, ApplyFlags};
@@ -2740,11 +2740,8 @@ fn nft_page_merge_on_removal() {
 
 // ── NFToken behavioral parity ─────────────────────────────────────────────────
 //
-// NOTE: xLedgRS uses flat NFT storage (one SHAMap entry per token), not rippled's
-// page-based model (32 tokens per NFTokenPage with split/merge logic). This means
-// state-tree hashes will NOT match rippled for NFT-heavy ledgers. Transaction
-// behavior (TER codes, owner counts, balances) IS tested here.
-// Page-based storage is a future state-hash parity task.
+// NFToken page-storage parity is still being tightened. These tests keep the
+// behavioral surface honest while lower-level page/hash coverage evolves.
 
 #[test]
 fn nft_mint_basic() {

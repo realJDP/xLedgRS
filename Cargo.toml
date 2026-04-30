@@ -1,13 +1,32 @@
 [package]
-name = "xledgrs"
-version = "1.0.0-beta"
+name = "xLedgRSv2Beta"
+version = "2.0.0-beta"
 edition = "2021"
+default-run = "xledgrs"
 description = "A Rust implementation of an XRP Ledger node"
 license = "MIT"
 repository = "https://github.com/realJDP/xLedgRS"
 readme = "README.md"
 keywords = ["xrpl", "xrp", "blockchain", "ledger", "ripple"]
 categories = ["cryptography::cryptocurrencies", "network-programming"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "build.rs",
+    "cfg/**",
+    "proto/**",
+    "release/**",
+    "scripts/**",
+    "site/**",
+    "src/**",
+    "tests/**",
+    "vendor/nudb-rs/**",
+    "dashboard.html",
+    "monitor.html",
+    "post-sync-checkpoint.sh",
+]
 
 [[bin]]
 name = "xledgrs"
@@ -57,7 +76,7 @@ lz4_flex = "0.11"
 openssl = { version = "0.10", features = ["vendored"] }
 tokio-openssl = "0.6"
 libc = "0.2.184"
-nudb = { path = "../nudb-rs" }
+nudb = { path = "vendor/nudb-rs" }
 webpki-roots = "0.26"
 rustls-pki-types = "1"
 bitflags = "2.11.0"

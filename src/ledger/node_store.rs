@@ -169,8 +169,9 @@ impl NodeStoreStats {
     fn note_flush_result(&self, started_at: std::time::Instant, result: &std::io::Result<()>) {
         self.flush_ops.fetch_add(1, Ordering::Relaxed);
         self.last_flush_unix.store(unix_now(), Ordering::Relaxed);
+        let elapsed_ms = started_at.elapsed().as_millis().max(1) as u64;
         self.last_flush_duration_ms
-            .store(started_at.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .store(elapsed_ms, Ordering::Relaxed);
         if let Err(err) = result {
             self.remember_error(err);
         } else {

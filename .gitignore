@@ -1,0 +1,9 @@
+/target/
+/.claude/
+.DS_Store
+*.log
+*.tmp
+*.tar
+*.tar.gz
+*.tgz
+*.zip

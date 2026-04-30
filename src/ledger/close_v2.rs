@@ -1,4 +1,4 @@
-//! close_v2 — ledger close using the view stack (matching rippled's BuildLedger).
+//! close_v2 — experimental ledger close using the view stack.
 //!
 //! Flow:
 //!   1. Parent ClosedLedger (immutable, shared via Arc)
@@ -9,7 +9,8 @@
 //!   5. Build tx tree → tx hash
 //!   6. Compute ledger header hash
 //!
-//! Matches rippled's buildLedgerImpl + applyTransactions from BuildLedger.cpp.
+//! Modeled after parts of rippled's BuildLedger flow, but not the primary
+//! runtime close path or a complete parity implementation.
 
 use crate::crypto::sha512_first_half;
 use crate::ledger::history::TxRecord;

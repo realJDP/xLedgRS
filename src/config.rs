@@ -66,7 +66,7 @@ pub struct ConfigFile {
     pub validation_seed: Option<String>,
     /// Hex-encoded secp256k1 validator signing secret key.
     pub validation_secret_key: Option<String>,
-    /// Base64-encoded rippled validator token. When present, xLedgRS derives
+    /// Base64-encoded rippled validator token. When present, xLedgRSv2Beta derives
     /// the validator signing key from the token payload.
     pub validator_token: Option<String>,
 }
@@ -301,7 +301,7 @@ impl ConfigFile {
                 runtime.data_dir = Some(resolve_path(path, p));
             }
         }
-        if let Some(section) = sections.get("xledgrs") {
+        if let Some(section) = sections.get("xledgrsv2beta") {
             runtime.rpc_sync = section.values.get("rpc_sync").cloned();
             runtime.standalone = section.values.get("standalone").and_then(|v| parse_bool(v));
             runtime.enable_consensus_close_loop = section
@@ -660,6 +660,9 @@ online_delete=2048
 
 [ips_fixed]
 127.0.0.1 51235
+
+[xLedgRSv2Beta]
+enable_consensus_close_loop=1
 "#;
         let path = write_temp(cfg_text, "cfg");
         let cfg = ConfigFile::load(&path).unwrap();
@@ -675,6 +678,7 @@ online_delete=2048
         assert_eq!(cfg.runtime.fetch_depth, Some(HistoryRetention::Count(512)));
         assert_eq!(cfg.runtime.online_delete, Some(2048));
         assert_eq!(cfg.runtime.fixed_peers, vec!["127.0.0.1 51235".to_string()]);
+        assert_eq!(cfg.runtime.enable_consensus_close_loop, Some(true));
         assert!(cfg.runtime.data_dir.unwrap().ends_with("db/nudb"));
     }
 
@@ -794,7 +798,7 @@ ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let id = CTR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("xledgrs_config_test_{id}.{ext}"));
+        let path = std::env::temp_dir().join(format!("xLedgRSv2Beta_config_test_{id}.{ext}"));
         std::fs::write(&path, contents).unwrap();
         path
     }

@@ -3757,6 +3757,9 @@ pub fn ledger_accept(ctx: &NodeContext) -> Result<Value, RpcError> {
     }
 
     if let Some(service) = ctx.ledger_accept_service.as_ref() {
+        if let Some(flag) = ctx.force_ledger_accept.as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let receiver = service.request();
         let ledger_current_index = receiver
             .recv_timeout(std::time::Duration::from_secs(15))
@@ -9182,7 +9185,7 @@ mod tests {
                 crate::crypto::base58::PREFIX_NODE_PUBLIC,
                 &[4u8; 33],
             )),
-            version: Some("xledgrs-test".to_string()),
+            version: Some("xLedgRSv2Beta-test".to_string()),
             cluster: Some(crate::network::cluster::ClusterPeerSummary {
                 address: "192.0.2.10:51235".to_string(),
                 public_key: Some(crate::crypto::base58::encode(
@@ -9210,7 +9213,7 @@ mod tests {
         assert_eq!(resp.result["peers"][0]["inbound"], false);
         assert_eq!(resp.result["peers"][0]["latency"], 42);
         assert_eq!(resp.result["peers"][0]["protocol"], "XRPL/2.2");
-        assert_eq!(resp.result["peers"][0]["version"], "xledgrs-test");
+        assert_eq!(resp.result["peers"][0]["version"], "xLedgRSv2Beta-test");
         assert_eq!(resp.result["peers"][0]["cluster"]["reserved"], json!(true));
         assert_eq!(resp.result["peers"][0]["cluster"]["tag"], json!("vip"));
     }
@@ -10505,6 +10508,7 @@ mod tests {
         let ctx = NodeContext {
             ledger_seq: 1,
             ledger_hash: "A".repeat(64),
+            admin_rpc_enabled: true,
             ..Default::default()
         };
         ctx.ledger_state
@@ -11255,6 +11259,7 @@ mod tests {
         let mut ctx = NodeContext {
             ledger_seq: 1,
             ledger_hash: "A".repeat(64),
+            admin_rpc_enabled: true,
             ..Default::default()
         };
         ctx.ledger_state

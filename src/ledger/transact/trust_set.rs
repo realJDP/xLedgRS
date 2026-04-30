@@ -1,6 +1,7 @@
 use super::{check_reserve, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::{LedgerEntryType, SLE};
+use crate::ledger::tx::balance_before_fee;
 use crate::ledger::views::ApplyView;
 use crate::transaction::ParsedTx;
 use std::sync::Arc;
@@ -61,11 +62,15 @@ impl TxHandler for TrustSetHandler {
 
             view.update(Arc::new(tl));
         } else {
-            // Reserve check — sender must afford one more owned object
+            // Reserve check uses the pre-fee balance, matching rippled's
+            // reserve-creating transactor convention.
             let sender_keylet_chk = keylet::account(&tx.account);
             if let Some(sender_sle) = view.peek(&sender_keylet_chk) {
                 let balance = sender_sle.balance_xrp().unwrap_or(0);
-                if let Err(ter) = check_reserve(balance, sender_sle.owner_count(), 1, view.fees()) {
+                let pre_fee_balance = balance_before_fee(balance, tx.fee);
+                if let Err(ter) =
+                    check_reserve(pre_fee_balance, sender_sle.owner_count(), 1, view.fees())
+                {
                     return ter;
                 }
             }
@@ -164,5 +169,15 @@ pub fn extract_iou_issuer(sle: &SLE, type_code: u16, field_code: u16) -> Option<
         Some(issuer)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::balance_before_fee;
+
+    #[test]
+    fn pre_fee_balance_restores_sender_balance_before_fee() {
+        assert_eq!(balance_before_fee(1_199_989, 12), 1_200_001);
     }
 }

@@ -1,0 +1,15 @@
+.git
+target
+target*
+debug-runs
+*.log
+*.out
+*.err
+*.tmp
+*.trace
+*.tar
+*.tar.gz
+.DS_Store
+cfg/cfg
+cfg/legacy-*.cfg
+PLAN_20260404.md

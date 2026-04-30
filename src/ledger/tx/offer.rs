@@ -1,6 +1,8 @@
 //! Offer — IMPLEMENTED
 
-use super::ApplyResult;
+use super::amm_step;
+use super::asset_flow::{apply_amount_delta, AssetDelta};
+use super::{load_existing_account, ApplyResult};
 use crate::ledger::directory;
 use crate::ledger::offer::{
     amount_exponent, amount_is_zero, amount_to_i128, rate_gte, scale_amount, subtract_amount,
@@ -8,6 +10,7 @@ use crate::ledger::offer::{
 };
 use crate::ledger::LedgerState;
 use crate::transaction::amount::{Amount, IouValue};
+use crate::transaction::serialize::PREFIX_TX_SIGN;
 use crate::transaction::ParsedTx;
 
 // ── Quality-based crossing arithmetic (rippled parity) ──────────────────────
@@ -157,14 +160,16 @@ fn load_trustline_for_offer_funds(
     if let Some(tl) = state.get_trustline(&key) {
         return Some(tl.clone());
     }
-    let raw = state.get_raw_owned(&key)?;
+    let raw = state
+        .get_raw_owned(&key)
+        .or_else(|| state.get_committed_raw_owned(&key))?;
     let tl = crate::ledger::RippleState::decode_from_sle(&raw)?;
     state.hydrate_trustline(tl.clone());
     Some(tl)
 }
 
 fn debug_offer_funding_enabled(seq: u32) -> bool {
-    std::env::var("XLEDGRS_DEBUG_OFFER_SEQS")
+    std::env::var("XLEDGRSV2BETA_DEBUG_OFFER_SEQS")
         .ok()
         .map(|value| {
             value
@@ -286,8 +291,8 @@ fn ceil_out_strict_via_quality(
     }
 
     let result_negative = (limit_iou.mantissa < 0) != (rate.mantissa < 0);
-    let result_mantissa_u128 =
-        (limit_iou.mantissa.unsigned_abs() as u128).saturating_mul(rate.mantissa.unsigned_abs() as u128);
+    let result_mantissa_u128 = (limit_iou.mantissa.unsigned_abs() as u128)
+        .saturating_mul(rate.mantissa.unsigned_abs() as u128);
     let result_exp = limit_iou.exponent + rate.exponent;
     let (mant_norm, exp_norm) = normalize_u128(result_mantissa_u128, result_exp, round_up);
     let new_in_iou = IouValue {
@@ -301,6 +306,174 @@ fn ceil_out_strict_via_quality(
 
     let new_in = iou_value_to_amount(&new_in_iou, offer_in);
     (new_in, limit_out.clone())
+}
+
+fn extract_additional_books_from_signing_payload(payload: &[u8]) -> Vec<[u8; 32]> {
+    if payload.len() < PREFIX_TX_SIGN.len() || payload[..PREFIX_TX_SIGN.len()] != PREFIX_TX_SIGN {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut pos = PREFIX_TX_SIGN.len();
+    while pos < payload.len() {
+        if payload[pos] == 0xE1 {
+            break;
+        }
+
+        let (tc, fc, header_end) = crate::ledger::meta::read_field_header(payload, pos);
+        if header_end > payload.len() {
+            break;
+        }
+        pos = header_end;
+
+        if tc == 19 && fc == 13 {
+            let (vl_len, vl_bytes) = crate::transaction::serialize::decode_length(&payload[pos..]);
+            if vl_bytes == 0 || pos + vl_bytes + vl_len > payload.len() {
+                break;
+            }
+            pos += vl_bytes;
+            let raw = &payload[pos..pos + vl_len];
+            for chunk in raw.chunks_exact(32) {
+                if let Ok(book) = chunk.try_into() {
+                    out.push(book);
+                }
+            }
+            pos += vl_len;
+            continue;
+        }
+
+        let next = crate::ledger::meta::skip_field_raw(payload, pos, tc);
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+
+    out
+}
+
+fn build_standing_offer(
+    tx: &ParsedTx,
+    offer_seq: u32,
+    remaining_pays: Amount,
+    remaining_gets: Amount,
+    book_directory: [u8; 32],
+    book_node: u64,
+    owner_node: u64,
+) -> crate::ledger::Offer {
+    let mut sle_flags: u32 = 0;
+    if (tx.flags & 0x00010000) != 0 {
+        sle_flags |= crate::ledger::offer::LSF_PASSIVE;
+    }
+    if (tx.flags & 0x00080000) != 0 {
+        sle_flags |= crate::ledger::offer::LSF_SELL;
+    }
+
+    crate::ledger::Offer {
+        account: tx.account,
+        sequence: offer_seq,
+        taker_pays: remaining_pays,
+        taker_gets: remaining_gets,
+        flags: sle_flags,
+        book_directory,
+        book_node,
+        owner_node,
+        expiration: tx.expiration,
+        domain_id: tx.domain_id,
+        additional_books: extract_additional_books_from_signing_payload(&tx.signing_payload),
+        previous_txn_id: [0u8; 32],
+        previous_txn_lgr_seq: 0,
+        raw_sle: None,
+    }
+}
+
+pub(crate) fn apply_validated_amm_offer_create(
+    state: &mut LedgerState,
+    tx: &ParsedTx,
+    close_time: u64,
+) -> Option<ApplyResult> {
+    let taker_pays = tx.taker_pays.as_ref()?;
+    let taker_gets = tx.taker_gets.as_ref()?;
+    if amount_is_zero(taker_pays) || amount_is_zero(taker_gets) {
+        return None;
+    }
+    if tx.flags != 0 {
+        return None;
+    }
+    if tx.offer_sequence.is_some() {
+        return None;
+    }
+    if tx
+        .expiration
+        .is_some_and(|expiration| close_time >= expiration as u64)
+    {
+        return None;
+    }
+
+    let asset_in = amm_step::issue_from_amount(taker_gets)?;
+    let asset_out = amm_step::issue_from_amount(taker_pays)?;
+    if asset_in == asset_out {
+        return None;
+    }
+    let funded_gets = offer_funded_input(state, &tx.account, taker_gets)?;
+
+    let pool = amm_step::load_amm_pool(state, &asset_in, &asset_out)?;
+    let quote = match amm_step::quote_exact_out(&pool, taker_pays) {
+        Some(exact_out) if amm_step::amount_leq(&exact_out.spent_in, &funded_gets)? => exact_out,
+        _ => amm_step::quote_exact_in(&pool, &funded_gets)?,
+    };
+    if !amm_step::amount_leq(&quote.delivered_out, taker_pays)? {
+        return None;
+    }
+    if amount_is_zero(&quote.spent_in) || amount_is_zero(&quote.delivered_out) {
+        return None;
+    }
+
+    amm_step::apply_swap_to_state(state, &pool, &quote, &tx.account, &tx.account);
+    Some(ApplyResult::Success)
+}
+
+fn offer_funded_input(
+    state: &mut LedgerState,
+    account: &[u8; 20],
+    amount: &Amount,
+) -> Option<Amount> {
+    match amount {
+        Amount::Xrp(requested) => {
+            let fees = crate::ledger::read_fees(state);
+            let acct = load_existing_account(state, account)?;
+            let reserve = fees.reserve + (acct.owner_count as u64 * fees.increment);
+            let available = acct.balance.saturating_sub(reserve);
+            if available == 0 {
+                return None;
+            }
+            Some(Amount::Xrp((*requested).min(available)))
+        }
+        Amount::Iou {
+            value,
+            currency,
+            issuer,
+        } => {
+            if account == issuer {
+                return Some(amount.clone());
+            }
+
+            let available = spendable_iou_funds_for_offer(state, account, issuer, currency);
+            if !available.is_positive() {
+                return None;
+            }
+            if compare_iou_values(&available, value) == std::cmp::Ordering::Less {
+                Some(Amount::Iou {
+                    value: available,
+                    currency: currency.clone(),
+                    issuer: *issuer,
+                })
+            } else {
+                Some(amount.clone())
+            }
+        }
+        Amount::Mpt(_) => None,
+    }
 }
 
 /// Apply an OfferCreate: attempt to cross against the opposite book,
@@ -359,11 +532,29 @@ pub(crate) fn apply_offer_create(
         }
         if let Some(old) = state.remove_offer(&cancel_key) {
             let old_offer_key = crate::ledger::offer::shamap_key(&old.account, old.sequence);
-            directory::dir_remove(state, &old.account, &old_offer_key.0);
+            let owner_root = directory::owner_dir_key(&old.account);
+            let _ = directory::dir_remove_root_page(
+                state,
+                &owner_root,
+                old.owner_node,
+                &old_offer_key.0,
+            ) || directory::dir_remove(state, &old.account, &old_offer_key.0);
             if old.book_directory != [0u8; 32] {
-                directory::dir_remove_root(
+                let _ = directory::dir_remove_root_page(
                     state,
                     &crate::ledger::Key(old.book_directory),
+                    old.book_node,
+                    &old_offer_key.0,
+                ) || directory::dir_remove_root(
+                    state,
+                    &crate::ledger::Key(old.book_directory),
+                    &old_offer_key.0,
+                );
+            }
+            for book_directory in &old.additional_books {
+                directory::dir_remove_root(
+                    state,
+                    &crate::ledger::Key(*book_directory),
                     &old_offer_key.0,
                 );
             }
@@ -379,9 +570,9 @@ pub(crate) fn apply_offer_create(
             // Rippled only rejects as unfunded when spendable XRP is zero.
             // The offer amount itself may exceed the current liquid balance.
             let fees = crate::ledger::read_fees(state);
-            let acct = state.get_account(&tx.account);
-            let balance = acct.map(|a| a.balance).unwrap_or(0);
-            let owner_count = acct.map(|a| a.owner_count).unwrap_or(0);
+            let acct = load_existing_account(state, &tx.account);
+            let balance = acct.as_ref().map(|a| a.balance).unwrap_or(0);
+            let owner_count = acct.as_ref().map(|a| a.owner_count).unwrap_or(0);
             let owner_delta = owner_count_deltas.get(&tx.account).copied().unwrap_or(0) as i64;
             let effective_owner_count = (owner_count as i64 + owner_delta).max(0) as u64;
             let reserve = fees.reserve + (effective_owner_count * fees.increment);
@@ -392,9 +583,7 @@ pub(crate) fn apply_offer_create(
             balance.saturating_add(released).saturating_sub(reserve) > 0
         }
         Amount::Iou {
-            currency,
-            issuer,
-            ..
+            currency, issuer, ..
         } => {
             if &tx.account == issuer {
                 true
@@ -429,8 +618,7 @@ pub(crate) fn apply_offer_create(
             {
                 let trustline =
                     load_trustline_for_offer_funds(state, &tx.account, issuer, currency);
-                let available =
-                    spendable_iou_funds_for_offer(state, &tx.account, issuer, currency);
+                let available = spendable_iou_funds_for_offer(state, &tx.account, issuer, currency);
                 if let Some(tl) = trustline {
                     let balance = tl.balance_for(&tx.account);
                     let opposite_limit = if tx.account == tl.low_account {
@@ -566,7 +754,11 @@ pub(crate) fn apply_offer_create(
         let is_sell = (tx.flags & TF_SELL) != 0;
         let ratio_receive = normalize_ratio(we_want_i, exp_want, they_give_i, exp_give);
         let ratio_pay = normalize_ratio(we_can_pay_i, exp_can_pay, they_want_i, exp_they_want);
-        let (mut fill_num, fill_den) = if is_sell { ratio_pay } else { min_ratio(ratio_receive, ratio_pay) };
+        let (mut fill_num, fill_den) = if is_sell {
+            ratio_pay
+        } else {
+            min_ratio(ratio_receive, ratio_pay)
+        };
         if fill_num > fill_den {
             fill_num = fill_den;
         }
@@ -627,10 +819,15 @@ pub(crate) fn apply_offer_create(
         }
 
         // Transfer assets between the two parties
-        transfer_amount(state, &tx.account, true, &filled_receive);
-        transfer_amount(state, &tx.account, false, &filled_pay);
-        transfer_amount(state, &book_offer.account, true, &filled_pay);
-        transfer_amount(state, &book_offer.account, false, &filled_receive);
+        apply_amount_delta(state, &tx.account, AssetDelta::Credit, &filled_receive);
+        apply_amount_delta(state, &tx.account, AssetDelta::Debit, &filled_pay);
+        apply_amount_delta(state, &book_offer.account, AssetDelta::Credit, &filled_pay);
+        apply_amount_delta(
+            state,
+            &book_offer.account,
+            AssetDelta::Debit,
+            &filled_receive,
+        );
 
         // Update the remaining want/give values.
         remaining_pays = subtract_amount(&remaining_pays, &filled_receive);
@@ -718,10 +915,21 @@ pub(crate) fn apply_offer_create(
         if let Some(removed) = state.remove_offer(key) {
             // Remove from owner and book directories
             let offer_key = crate::ledger::offer::shamap_key(&removed.account, removed.sequence);
-            let removed_owner = directory::dir_remove(state, &removed.account, &offer_key.0);
+            let owner_root = directory::owner_dir_key(&removed.account);
+            let removed_owner = directory::dir_remove_root_page(
+                state,
+                &owner_root,
+                removed.owner_node,
+                &offer_key.0,
+            ) || directory::dir_remove(state, &removed.account, &offer_key.0);
             *owner_count_deltas.entry(removed.account).or_insert(0) -= 1;
             if removed.book_directory != [0u8; 32] {
-                let removed_book = directory::dir_remove_root(
+                let removed_book = directory::dir_remove_root_page(
+                    state,
+                    &crate::ledger::Key(removed.book_directory),
+                    removed.book_node,
+                    &offer_key.0,
+                ) || directory::dir_remove_root(
                     state,
                     &crate::ledger::Key(removed.book_directory),
                     &offer_key.0,
@@ -746,6 +954,13 @@ pub(crate) fn apply_offer_create(
                     hex::encode_upper(removed.account),
                     removed.sequence,
                     owner_still_has_entry,
+                );
+            }
+            for book_directory in &removed.additional_books {
+                directory::dir_remove_root(
+                    state,
+                    &crate::ledger::Key(*book_directory),
+                    &offer_key.0,
                 );
             }
         }
@@ -793,37 +1008,21 @@ pub(crate) fn apply_offer_create(
         let offer_key = crate::ledger::offer::shamap_key(&tx.account, offer_seq);
         let owner_node = directory::dir_add(state, &tx.account, offer_key.0);
         let book_key = BookKey::from_amounts(&remaining_pays, &remaining_gets);
+        // rippled preserves the offer's original uRate for the standing
+        // remainder. Recomputing from partially-filled amounts moves the
+        // residual offer into the wrong quality directory.
         let book_quality = original_book_quality;
         let (book_directory, book_node) =
             directory::dir_add_book(state, &book_key, book_quality, offer_key.0);
-        // Translate transaction flags → ledger entry flags.
-        // rippled: OfferCreate.cpp sets SLE flags from tx flags:
-        //   tfPassive  (0x00010000) → lsfPassive (0x00010000)
-        //   tfSell     (0x00080000) → lsfSell    (0x00020000)
-        let mut sle_flags: u32 = 0;
-        if (tx.flags & 0x00010000) != 0 {
-            sle_flags |= crate::ledger::offer::LSF_PASSIVE;
-        }
-        if (tx.flags & 0x00080000) != 0 {
-            sle_flags |= crate::ledger::offer::LSF_SELL;
-        } // tfSell
-
-        let offer = crate::ledger::Offer {
-            account: tx.account,
-            sequence: offer_seq,
-            taker_pays: remaining_pays,
-            taker_gets: remaining_gets,
-            flags: sle_flags,
-            book_directory: book_directory.0,
+        let offer = build_standing_offer(
+            tx,
+            offer_seq,
+            remaining_pays,
+            remaining_gets,
+            book_directory.0,
             book_node,
             owner_node,
-            expiration: tx.expiration,
-            domain_id: None,
-            additional_books: Vec::new(),
-            previous_txn_id: [0u8; 32],
-            previous_txn_lgr_seq: 0,
-            raw_sle: None,
-        };
+        );
         state.insert_offer(offer);
         *owner_count_deltas.entry(tx.account).or_insert(0) += 1;
     }
@@ -838,7 +1037,7 @@ pub(crate) fn apply_offer_create(
         if delta == 0 {
             continue;
         }
-        if let Some(acct) = state.get_account(&account) {
+        if let Some(acct) = load_existing_account(state, &account) {
             let mut updated = acct.clone();
             updated.owner_count = if delta > 0 {
                 updated.owner_count.saturating_add(delta as u32)
@@ -850,55 +1049,6 @@ pub(crate) fn apply_offer_create(
     }
 
     ApplyResult::Success
-}
-
-/// Transfer an amount to/from an account.
-/// `receive = true` credits, `receive = false` debits.
-fn transfer_amount(state: &mut LedgerState, account: &[u8; 20], receive: bool, amount: &Amount) {
-    match amount {
-        Amount::Xrp(drops) => {
-            if let Some(acct) = state.get_account(account) {
-                let mut acct = acct.clone();
-                if receive {
-                    acct.balance = acct.balance.saturating_add(*drops);
-                } else {
-                    acct.balance = acct.balance.saturating_sub(*drops);
-                }
-                state.insert_account(acct);
-            }
-        }
-        Amount::Iou {
-            value,
-            currency,
-            issuer,
-        } => {
-            let key = crate::ledger::trustline::shamap_key(account, issuer, currency);
-            let mut tl = if let Some(existing) = state.get_trustline(&key) {
-                existing.clone()
-            } else if let Some(raw) = state.get_raw_owned(&key) {
-                // Trust line exists in NuDB but wasn't hydrated into typed map.
-                // Decode and hydrate before mutating to preserve existing fields
-                // (flags, limits, balances, PreviousTxnID, etc.).
-                if let Some(decoded) = crate::ledger::RippleState::decode_from_sle(&raw) {
-                    state.hydrate_trustline(decoded.clone());
-                    decoded
-                } else {
-                    crate::ledger::RippleState::new(account, issuer, currency.clone())
-                }
-            } else {
-                crate::ledger::RippleState::new(account, issuer, currency.clone())
-            };
-            if receive {
-                tl.transfer(issuer, value);
-            } else {
-                tl.transfer(account, value);
-            }
-            state.insert_trustline(tl);
-        }
-        Amount::Mpt(_) => {
-            // MPT amounts not yet supported for balance transfers
-        }
-    }
 }
 
 fn normalize_ratio(num: i128, num_exp: i32, den: i128, den_exp: i32) -> (i128, i128) {
@@ -956,8 +1106,21 @@ pub(crate) fn apply_offer_cancel(state: &mut LedgerState, tx: &ParsedTx) -> Appl
     };
 
     let key = crate::ledger::offer::shamap_key(&tx.account, target_seq);
+    if state.get_offer(&key).is_none() {
+        if let Some(raw) = state
+            .get_raw_owned(&key)
+            .or_else(|| state.get_committed_raw_owned(&key))
+        {
+            if let Some(decoded) = crate::ledger::Offer::decode_from_sle(&raw) {
+                state.hydrate_offer(decoded);
+            }
+        }
+    }
     if let Some(_removed) = state.remove_offer(&key) {
-        if !directory::dir_remove(state, &tx.account, &key.0) {
+        let owner_root = directory::owner_dir_key(&tx.account);
+        if !(directory::dir_remove_root_page(state, &owner_root, _removed.owner_node, &key.0)
+            || directory::dir_remove(state, &tx.account, &key.0))
+        {
             let owner_still_has_entry =
                 directory::owner_dir_contains_entry(state, &tx.account, &key.0);
             tracing::warn!(
@@ -967,14 +1130,104 @@ pub(crate) fn apply_offer_cancel(state: &mut LedgerState, tx: &ParsedTx) -> Appl
                 owner_still_has_entry,
             );
         }
-    }
+        if _removed.book_directory != [0u8; 32] {
+            if !(directory::dir_remove_root_page(
+                state,
+                &crate::ledger::Key(_removed.book_directory),
+                _removed.book_node,
+                &key.0,
+            ) || directory::dir_remove_root(
+                state,
+                &crate::ledger::Key(_removed.book_directory),
+                &key.0,
+            )) {
+                let owner_still_has_entry =
+                    directory::owner_dir_contains_entry(state, &tx.account, &key.0);
+                tracing::warn!(
+                    "offer cancel book-dir remove miss: account={} seq={} owner_has_entry={}",
+                    hex::encode_upper(tx.account),
+                    target_seq,
+                    owner_still_has_entry,
+                );
+            }
+        }
+        for book_directory in &_removed.additional_books {
+            directory::dir_remove_root(state, &crate::ledger::Key(*book_directory), &key.0);
+        }
 
-    if let Some(acct) = state.get_account(&tx.account) {
-        let mut updated = acct.clone();
-        updated.owner_count =
-            crate::ledger::directory::owner_dir_entry_count(state, &tx.account) as u32;
-        state.insert_account(updated);
+        if let Some(acct) = load_existing_account(state, &tx.account) {
+            let mut updated = acct.clone();
+            updated.owner_count = updated.owner_count.saturating_sub(1);
+            state.insert_account(updated);
+        }
     }
 
     ApplyResult::Success
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_additional_books_payload(books: &[[u8; 32]]) -> Vec<u8> {
+        let mut payload = PREFIX_TX_SIGN.to_vec();
+        crate::ledger::meta::write_field_header_pub(&mut payload, 19, 13);
+        let mut raw = Vec::with_capacity(books.len() * 32);
+        for book in books {
+            raw.extend_from_slice(book);
+        }
+        crate::transaction::serialize::encode_length(raw.len(), &mut payload);
+        payload.extend_from_slice(&raw);
+        payload.push(0xE1);
+        payload
+    }
+
+    #[test]
+    fn extracts_additional_books_from_signing_payload() {
+        let books = [[0x11; 32], [0x22; 32]];
+        let payload = build_additional_books_payload(&books);
+
+        assert_eq!(
+            extract_additional_books_from_signing_payload(&payload),
+            books
+        );
+    }
+
+    #[test]
+    fn standing_remainder_uses_original_offer_quality() {
+        let original_pays = Amount::Xrp(20);
+        let original_gets = Amount::Xrp(10);
+        let remaining_pays = Amount::Xrp(15);
+        let remaining_gets = Amount::Xrp(10);
+
+        let original_quality = directory::offer_quality(&original_gets, &original_pays);
+        let recomputed_quality = directory::offer_quality(&remaining_gets, &remaining_pays);
+
+        assert_ne!(original_quality, recomputed_quality);
+        assert_eq!(
+            original_quality,
+            directory::offer_quality(&original_gets, &original_pays)
+        );
+    }
+
+    #[test]
+    fn build_standing_offer_preserves_tx_metadata() {
+        let books = [[0x33; 32]];
+        let tx = ParsedTx {
+            domain_id: Some([0x44; 32]),
+            signing_payload: build_additional_books_payload(&books),
+            ..ParsedTx::default()
+        };
+
+        let offer =
+            build_standing_offer(&tx, 42, Amount::Xrp(15), Amount::Xrp(10), [0x55; 32], 7, 9);
+
+        assert_eq!(offer.account, tx.account);
+        assert_eq!(offer.sequence, 42);
+        assert_eq!(offer.book_directory, [0x55; 32]);
+        assert_eq!(offer.book_node, 7);
+        assert_eq!(offer.owner_node, 9);
+        assert_eq!(offer.domain_id, Some([0x44; 32]));
+        assert_eq!(offer.additional_books, books);
+    }
 }

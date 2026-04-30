@@ -12,7 +12,7 @@ use crate::ledger::sle::SLE;
 use crate::ledger::Key;
 use std::sync::Arc;
 
-// ── LedgerHeader (minimal — will expand later) ─────────────────────────────
+// ── LedgerHeader fields used by the view stack ─────────────────────────────
 
 /// Ledger header fields needed by the view stack.
 #[derive(Debug, Clone, Default)]

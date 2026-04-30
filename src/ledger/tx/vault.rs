@@ -828,16 +828,6 @@ mod tests {
         // Check entry type
         assert_eq!(parsed.entry_type, LT_VAULT);
 
-        // List all fields for debugging
-        for f in &parsed.fields {
-            eprintln!(
-                "  field: type={} code={} len={}",
-                f.type_code,
-                f.field_code,
-                f.data.len()
-            );
-        }
-
         // Extract owner (ACCOUNT=8, field=2)
         let extracted_owner = vault_sle_owner(&raw);
         assert_eq!(extracted_owner, Some(owner), "should extract sfOwner");

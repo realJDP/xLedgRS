@@ -80,7 +80,7 @@ pub fn install_pid_guard_if_needed(
     if let Some(pid) = read_pid(&files.pid_file)? {
         if process_is_running(pid) {
             bail!(
-                "xledgrs is already running with pid {} (pid file {})",
+                "xLedgRSv2Beta is already running with pid {} (pid file {})",
                 pid,
                 files.pid_file.display()
             );
@@ -135,7 +135,7 @@ fn start_process(files: &ControlFiles) -> Result<()> {
     if let Some(pid) = read_pid(&files.pid_file)? {
         if process_is_running(pid) {
             bail!(
-                "xledgrs is already running with pid {} (pid file {})",
+                "xLedgRSv2Beta is already running with pid {} (pid file {})",
                 pid,
                 files.pid_file.display()
             );
@@ -157,7 +157,7 @@ fn start_process(files: &ControlFiles) -> Result<()> {
         .try_clone()
         .with_context(|| format!("failed to clone log handle {}", files.log_file.display()))?;
     let mut command =
-        Command::new(std::env::current_exe().context("failed to locate xledgrs executable")?);
+        Command::new(std::env::current_exe().context("failed to locate xLedgRSv2Beta executable")?);
     command
         .args(filtered_child_args())
         .arg("--daemon-child")
@@ -175,21 +175,21 @@ fn start_process(files: &ControlFiles) -> Result<()> {
 
     let mut child = command
         .spawn()
-        .context("failed to spawn detached xledgrs")?;
+        .context("failed to spawn detached xLedgRSv2Beta")?;
     std::thread::sleep(Duration::from_millis(500));
     if let Some(status) = child
         .try_wait()
-        .context("failed to poll detached xledgrs")?
+        .context("failed to poll detached xLedgRSv2Beta")?
     {
         bail!(
-            "xledgrs exited early with status {}. Check {}",
+            "xLedgRSv2Beta exited early with status {}. Check {}",
             status,
             files.log_file.display()
         );
     }
 
     println!(
-        "started xledgrs (pid {})\nlog: {}\npid: {}",
+        "started xLedgRSv2Beta (pid {})\nlog: {}\npid: {}",
         child.id(),
         files.log_file.display(),
         files.pid_file.display()
@@ -200,7 +200,7 @@ fn start_process(files: &ControlFiles) -> Result<()> {
 fn stop_process(files: &ControlFiles) -> Result<()> {
     let Some(pid) = read_pid(&files.pid_file)? else {
         println!(
-            "xledgrs is not running (no pid file at {})",
+            "xLedgRSv2Beta is not running (no pid file at {})",
             files.pid_file.display()
         );
         return Ok(());
@@ -209,26 +209,26 @@ fn stop_process(files: &ControlFiles) -> Result<()> {
     if !process_is_running(pid) {
         let _ = fs::remove_file(&files.pid_file);
         println!(
-            "removed stale pid file {}; xledgrs is not running",
+            "removed stale pid file {}; xLedgRSv2Beta is not running",
             files.pid_file.display()
         );
         return Ok(());
     }
 
     signal_process(pid, libc::SIGTERM)
-        .with_context(|| format!("failed to signal xledgrs pid {}", pid))?;
+        .with_context(|| format!("failed to signal xLedgRSv2Beta pid {}", pid))?;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if !process_is_running(pid) {
             let _ = fs::remove_file(&files.pid_file);
-            println!("stopped xledgrs (pid {})", pid);
+            println!("stopped xLedgRSv2Beta (pid {})", pid);
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
     bail!(
-        "xledgrs pid {} did not stop within 15 seconds; check {}",
+        "xLedgRSv2Beta pid {} did not stop within 15 seconds; check {}",
         pid,
         files.log_file.display()
     );
@@ -238,7 +238,7 @@ fn print_status(files: &ControlFiles) -> Result<()> {
     match read_pid(&files.pid_file)? {
         Some(pid) if process_is_running(pid) => {
             println!(
-                "xledgrs is running (pid {})\nlog: {}\npid: {}",
+                "xLedgRSv2Beta is running (pid {})\nlog: {}\npid: {}",
                 pid,
                 files.log_file.display(),
                 files.pid_file.display()
@@ -246,13 +246,13 @@ fn print_status(files: &ControlFiles) -> Result<()> {
         }
         Some(_) => {
             println!(
-                "xledgrs is not running; stale pid file at {}",
+                "xLedgRSv2Beta is not running; stale pid file at {}",
                 files.pid_file.display()
             );
         }
         None => {
             println!(
-                "xledgrs is not running (no pid file at {})",
+                "xLedgRSv2Beta is not running (no pid file at {})",
                 files.pid_file.display()
             );
         }
@@ -342,26 +342,26 @@ mod tests {
     #[test]
     fn resolve_control_files_prefers_data_dir() {
         let files = resolve_control_files(
-            "xledgrs",
-            Some(Path::new("/tmp/config/xledgrs.cfg")),
+            "xLedgRSv2Beta",
+            Some(Path::new("/tmp/config/xLedgRSv2Beta.cfg")),
             Some(Path::new("/tmp/data")),
             None,
             None,
         );
-        assert_eq!(files.pid_file, PathBuf::from("/tmp/data/xledgrs.pid"));
-        assert_eq!(files.log_file, PathBuf::from("/tmp/data/xledgrs.log"));
+        assert_eq!(files.pid_file, PathBuf::from("/tmp/data/xLedgRSv2Beta.pid"));
+        assert_eq!(files.log_file, PathBuf::from("/tmp/data/xLedgRSv2Beta.log"));
     }
 
     #[test]
     fn filtered_child_args_removes_process_control_flags() {
         let args = vec![
-            OsString::from("xledgrs"),
+            OsString::from("xLedgRSv2Beta"),
             OsString::from("--start"),
             OsString::from("--config"),
             OsString::from("node.cfg"),
-            OsString::from("--pid-file=/tmp/xledgrs.pid"),
+            OsString::from("--pid-file=/tmp/xLedgRSv2Beta.pid"),
             OsString::from("--log-file"),
-            OsString::from("/tmp/xledgrs.log"),
+            OsString::from("/tmp/xLedgRSv2Beta.log"),
             OsString::from("--peer-addr"),
             OsString::from("0.0.0.0:51235"),
         ];

@@ -202,12 +202,7 @@ impl AccountRoot {
             out.extend_from_slice(rk);
         }
 
-        // type=16 (UInt8): TickSize field=8 → extended (0x10_u4 << 4 | 0x08) = but type 16 field 8 → 0x00...
-        // Type code 16 requires extended type encoding because the top nibble
-        // cannot encode values >= 16 directly.
-        // For type >= 16: first byte = (0 << 4) | field = field, then type as next byte
-        // Wait, the encoding is: top=0 means type extended. So byte = (0 << 4) | field_code, then type_code byte.
-        // TickSize: type=16, field=8 → byte = 0x08, then 0x10 (16)
+        // TickSize is UInt8 field 8; type code 16 uses extended type encoding.
         if self.tick_size > 0 {
             out.push(0x08); // field=8, type extended
             out.push(16); // type=16 (UInt8)

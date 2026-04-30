@@ -1,4 +1,4 @@
-//! gRPC service layer for xLedgRS.
+//! gRPC service layer for xLedgRSv2Beta.
 //!
 //! This exposes the binary ledger RPC surface plus a local extension service
 //! for server information and transaction submission convenience.
@@ -14,7 +14,7 @@ pub mod pb {
     tonic::include_proto!("org.xrpl.rpc.v1");
 }
 
-use pb::xledgrs_server::{Xledgrs, XledgrsServer};
+use pb::x_ledg_r_sv2_beta_server::{XLedgRSv2Beta, XLedgRSv2BetaServer};
 use pb::xrp_ledger_api_service_server::{XrpLedgerApiService, XrpLedgerApiServiceServer};
 
 pub struct GrpcRuntime {
@@ -28,7 +28,7 @@ impl GrpcRuntime {
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let grpc_service = GrpcService { node, local_addr };
-        let service = XledgrsServer::new(grpc_service.clone());
+        let service = XLedgRSv2BetaServer::new(grpc_service.clone());
         let api_service = XrpLedgerApiServiceServer::new(grpc_service);
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         let join = tokio::spawn(async move {
@@ -696,7 +696,7 @@ impl XrpLedgerApiService for GrpcService {
 }
 
 #[tonic::async_trait]
-impl Xledgrs for GrpcService {
+impl XLedgRSv2Beta for GrpcService {
     async fn get_server_info(
         &self,
         _request: Request<pb::GetServerInfoRequest>,

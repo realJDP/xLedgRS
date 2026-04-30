@@ -12,9 +12,9 @@
 //! **Open**: Collecting transactions into the open ledger.
 //! **Establish**: Validators exchange proposals (tx set hashes) and converge.
 //!   - Positions held by >50% of UNL are adopted each round.
-//!   - Threshold starts at 50%, rises to 65%, then 70%, then 80%.
+//!   - Adoption thresholds rise by elapsed establish time: 50%, 65%, 70%, 95%.
 //! **Accepted**: Consensus reached on a tx set. Apply transactions.
-//! **Validated**: 80%+ of UNL sent matching validations — ledger is final.
+//! **Validated**: observed validation quorum on the configured UNL.
 
 pub mod dispute;
 pub mod manifest;

@@ -1,7 +1,7 @@
 //! Peer connection state machine.
 //!
 //! Tracks the lifecycle of a single peer connection without doing any I/O.
-//! The actual TLS stream and tokio wiring plugs in later — this layer only
+//! The actual TLS stream and Tokio wiring are provided by the outer runtime; this layer
 //! decides what is valid at each stage and what transitions are allowed.
 //!
 //! # State diagram

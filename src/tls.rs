@@ -36,7 +36,7 @@ impl TlsConfig {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
 
         // Generate a self-signed certificate
-        let cert_gen = rcgen::generate_simple_self_signed(vec!["xledgrs".to_string()])?;
+        let cert_gen = rcgen::generate_simple_self_signed(vec!["xLedgRSv2Beta".to_string()])?;
         let cert_der = CertificateDer::from(cert_gen.serialize_der()?);
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             cert_gen.serialize_private_key_der(),
@@ -95,7 +95,7 @@ impl OpenSslConfig {
         builder.set_serial_number(&serial)?;
 
         let mut name = openssl::x509::X509NameBuilder::new()?;
-        name.append_entry_by_text("CN", "xledgrs")?;
+        name.append_entry_by_text("CN", "xLedgRSv2Beta")?;
         let name = name.build();
         builder.set_subject_name(&name)?;
         builder.set_issuer_name(&name)?;

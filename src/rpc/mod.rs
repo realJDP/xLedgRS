@@ -1,7 +1,7 @@
-//! JSON-RPC API for rippled-compatible request/response handling.
+//! JSON-RPC and WebSocket APIs for supported rippled-compatible requests.
 //!
-//! Implements the standard rippled RPC surface so existing tools
-//! (xrpl.js, xrpl-py, Xumm, etc.) work without modification.
+//! Unsupported methods and transaction types return explicit errors rather than
+//! silently claiming full rippled coverage.
 //!
 //! Each method lives in its own submodule. This file provides the dispatcher
 //! that routes incoming requests to the appropriate handler.

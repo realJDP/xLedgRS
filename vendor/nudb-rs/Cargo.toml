@@ -1,0 +1,10 @@
+[package]
+name = "nudb"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust implementation of NuDB — a write-once, hash-indexed key-value store"
+license = "MIT"
+repository = "https://github.com/realJDP/nudb-rs"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh64"] }

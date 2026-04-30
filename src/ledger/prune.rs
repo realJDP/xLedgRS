@@ -309,6 +309,31 @@ mod tests {
     use super::*;
     use crate::ledger::node_store::MemNodeStore;
 
+    fn valid_leaf(data: &[u8], key_byte: u8) -> ([u8; 32], Vec<u8>) {
+        let mut node = data.to_vec();
+        node.extend_from_slice(&[key_byte; 32]);
+
+        let mut prefixed = Vec::with_capacity(4 + node.len());
+        prefixed.extend_from_slice(b"MLN\0");
+        prefixed.extend_from_slice(&node);
+
+        (crate::crypto::sha512_first_half(&prefixed), node)
+    }
+
+    fn valid_inner(children: &[[u8; 32]]) -> ([u8; 32], Vec<u8>) {
+        let mut node = vec![0u8; 16 * 32];
+        for (slot, child) in children.iter().enumerate() {
+            let offset = slot * 32;
+            node[offset..offset + 32].copy_from_slice(child);
+        }
+
+        let mut prefixed = Vec::with_capacity(4 + node.len());
+        prefixed.extend_from_slice(b"MIN\0");
+        prefixed.extend_from_slice(&node);
+
+        (crate::crypto::sha512_first_half(&prefixed), node)
+    }
+
     #[test]
     fn test_compact_empty() {
         let source = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
@@ -321,8 +346,8 @@ mod tests {
     #[test]
     fn test_compact_single_leaf() {
         let source = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
-        let hash = [0xAA; 32];
-        source.store(&hash, b"leaf data").unwrap();
+        let (hash, data) = valid_leaf(b"leaf data", 0xAA);
+        source.store(&hash, &data).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let result = compact_nodestore(&source, hash, &tmp.path().join("out")).unwrap();
         assert_eq!(result.leaf_nodes, 1);
@@ -334,16 +359,13 @@ mod tests {
         let source = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
 
         // Create two leaf nodes
-        let leaf1_hash = [0x11; 32];
-        let leaf2_hash = [0x22; 32];
-        source.store(&leaf1_hash, b"leaf1").unwrap();
-        source.store(&leaf2_hash, b"leaf2").unwrap();
+        let (leaf1_hash, leaf1_data) = valid_leaf(b"leaf1", 0x11);
+        let (leaf2_hash, leaf2_data) = valid_leaf(b"leaf2", 0x22);
+        source.store(&leaf1_hash, &leaf1_data).unwrap();
+        source.store(&leaf2_hash, &leaf2_data).unwrap();
 
         // Create inner node pointing to both leaves (slots 0 and 1)
-        let mut inner_data = vec![0u8; 16 * 32];
-        inner_data[0..32].copy_from_slice(&leaf1_hash);
-        inner_data[32..64].copy_from_slice(&leaf2_hash);
-        let root_hash = [0xFF; 32];
+        let (root_hash, inner_data) = valid_inner(&[leaf1_hash, leaf2_hash]);
         source.store(&root_hash, &inner_data).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -373,13 +395,10 @@ mod tests {
     #[test]
     fn test_compact_deduplicates_repeated_child_hashes() {
         let source = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
-        let leaf_hash = [0x55; 32];
-        source.store(&leaf_hash, b"leaf").unwrap();
+        let (leaf_hash, leaf_data) = valid_leaf(b"leaf", 0x55);
+        source.store(&leaf_hash, &leaf_data).unwrap();
 
-        let mut root_data = vec![0u8; 16 * 32];
-        root_data[0..32].copy_from_slice(&leaf_hash);
-        root_data[32..64].copy_from_slice(&leaf_hash);
-        let root_hash = [0x66; 32];
+        let (root_hash, root_data) = valid_inner(&[leaf_hash, leaf_hash]);
         source.store(&root_hash, &root_data).unwrap();
 
         let tmp = tempfile::tempdir().unwrap();

@@ -702,6 +702,7 @@ pub struct DirtyState {
     pub deleted_tickets: HashSet<Key>,
     pub dirty_offers: HashSet<Key>,
     pub deleted_offers: HashSet<Key>,
+    pub dirty_nft_offers: HashSet<Key>,
     pub dirty_directories: HashSet<Key>,
     pub deleted_directories: HashSet<Key>,
     pub dirty_raw: HashSet<Key>,
@@ -756,6 +757,7 @@ struct TxSnapshot {
     deleted_tickets_snap: HashSet<Key>,
     dirty_offers_snap: HashSet<Key>,
     deleted_offers_snap: HashSet<Key>,
+    dirty_nft_offers_snap: HashSet<Key>,
     dirty_directories_snap: HashSet<Key>,
     deleted_directories_snap: HashSet<Key>,
     dirty_raw_snap: HashSet<Key>,
@@ -827,10 +829,12 @@ pub struct LedgerState {
     deleted_tickets: HashSet<Key>,
     dirty_offers: HashSet<Key>,
     deleted_offers: HashSet<Key>,
+    dirty_nft_offers: HashSet<Key>,
     dirty_directories: HashSet<Key>,
     deleted_directories: HashSet<Key>,
     dirty_raw: HashSet<Key>,
     deleted_raw: HashSet<Key>,
+    previous_txn_only_touches: HashSet<Key>,
     tx_journal: Option<TxJournal>,
     tx_snapshot: Option<TxSnapshot>,
     /// When true, insert_raw/remove_raw skip per-entry storage writes
@@ -886,10 +890,12 @@ impl LedgerState {
             deleted_tickets: HashSet::new(),
             dirty_offers: HashSet::new(),
             deleted_offers: HashSet::new(),
+            dirty_nft_offers: HashSet::new(),
             dirty_directories: HashSet::new(),
             deleted_directories: HashSet::new(),
             dirty_raw: HashSet::new(),
             deleted_raw: HashSet::new(),
+            previous_txn_only_touches: HashSet::new(),
             tx_journal: None,
             tx_snapshot: None,
             defer_storage: false,
@@ -1040,10 +1046,12 @@ impl LedgerState {
             deleted_tickets: HashSet::new(),
             dirty_offers: HashSet::new(),
             deleted_offers: HashSet::new(),
+            dirty_nft_offers: HashSet::new(),
             dirty_directories: HashSet::new(),
             deleted_directories: HashSet::new(),
             dirty_raw: HashSet::new(),
             deleted_raw: HashSet::new(),
+            previous_txn_only_touches: HashSet::new(),
             tx_journal: None,
             tx_snapshot: None,
             // Dry runs should never write through to the shared backend.
@@ -1265,6 +1273,7 @@ impl LedgerState {
     /// Begin a new transaction scope.  Initialises both the raw journal
     /// (for metadata generation) and a typed snapshot (for rollback).
     pub fn begin_tx(&mut self) {
+        self.previous_txn_only_touches.clear();
         // Raw journal (same as begin_tx_journal)
         self.tx_journal = Some(TxJournal {
             order: Vec::new(),
@@ -1291,6 +1300,7 @@ impl LedgerState {
             deleted_tickets_snap: self.deleted_tickets.clone(),
             dirty_offers_snap: self.dirty_offers.clone(),
             deleted_offers_snap: self.deleted_offers.clone(),
+            dirty_nft_offers_snap: self.dirty_nft_offers.clone(),
             dirty_directories_snap: self.dirty_directories.clone(),
             deleted_directories_snap: self.deleted_directories.clone(),
             dirty_raw_snap: self.dirty_raw.clone(),
@@ -1311,6 +1321,7 @@ impl LedgerState {
     /// are rolled back.  Dirty-tracking sets are restored to their
     /// begin_tx checkpoint.
     pub fn discard_tx(&mut self) {
+        self.previous_txn_only_touches.clear();
         // 1. Restore raw SHAMap entries from journal
         if let Some(journal) = self.tx_journal.take() {
             // Walk in reverse order so that if the same key was touched
@@ -1370,6 +1381,7 @@ impl LedgerState {
             self.deleted_tickets = snap.deleted_tickets_snap;
             self.dirty_offers = snap.dirty_offers_snap;
             self.deleted_offers = snap.deleted_offers_snap;
+            self.dirty_nft_offers = snap.dirty_nft_offers_snap;
             self.dirty_directories = snap.dirty_directories_snap;
             self.deleted_directories = snap.deleted_directories_snap;
             self.dirty_raw = snap.dirty_raw_snap;
@@ -1531,6 +1543,17 @@ impl LedgerState {
         self.dirty_accounts.insert(account.account_id);
         self.deleted_accounts.remove(&account.account_id);
         self.accounts.insert(account.account_id, account);
+    }
+
+    /// Mark an object as intentionally modified when rippled would only
+    /// thread PreviousTxnID/PreviousTxnLgrSeq onto it.
+    pub fn force_previous_txn_touch(&mut self, key: &Key) {
+        self.record_preimage(key);
+        self.previous_txn_only_touches.insert(*key);
+    }
+
+    pub fn is_forced_previous_txn_touch(&self, key: &Key) -> bool {
+        self.previous_txn_only_touches.contains(key)
     }
 
     /// Hydrate an account from storage — populates typed collection only.
@@ -2310,17 +2333,20 @@ impl LedgerState {
     pub fn insert_nft_offer(&mut self, off: NFTokenOffer) {
         let key = off.key();
         self.insert_raw(key, off.to_sle_binary());
+        self.dirty_nft_offers.remove(&key);
         self.nft_offers.insert(key, off);
     }
 
     pub fn hydrate_nft_offer(&mut self, off: NFTokenOffer) {
         let key = off.key();
+        self.dirty_nft_offers.insert(key);
         self.nft_offers.insert(key, off);
     }
 
     pub fn remove_nft_offer(&mut self, key: &Key) -> Option<NFTokenOffer> {
         if self.nft_offers.contains_key(key) {
             let off = self.nft_offers.remove(key).unwrap();
+            self.dirty_nft_offers.remove(key);
             self.remove_raw(key);
             Some(off)
         } else {
@@ -2572,6 +2598,7 @@ impl LedgerState {
         let deleted_tickets = std::mem::take(&mut self.deleted_tickets);
         let dirty_offers = std::mem::take(&mut self.dirty_offers);
         let deleted_offers = std::mem::take(&mut self.deleted_offers);
+        let dirty_nft_offers = std::mem::take(&mut self.dirty_nft_offers);
         let dirty_directories = std::mem::take(&mut self.dirty_directories);
         let deleted_directories = std::mem::take(&mut self.deleted_directories);
         let mut dirty_raw = std::mem::take(&mut self.dirty_raw);
@@ -2595,6 +2622,7 @@ impl LedgerState {
         deleted_raw.extend(deleted_tickets.iter().copied());
         dirty_raw.extend(dirty_offers.iter().copied());
         deleted_raw.extend(deleted_offers.iter().copied());
+        dirty_raw.extend(dirty_nft_offers.iter().copied());
         dirty_raw.extend(dirty_directories.iter().copied());
         deleted_raw.extend(deleted_directories.iter().copied());
 
@@ -2617,6 +2645,7 @@ impl LedgerState {
             deleted_tickets,
             dirty_offers,
             deleted_offers,
+            dirty_nft_offers,
             dirty_directories,
             deleted_directories,
             dirty_raw,
@@ -2660,6 +2689,8 @@ impl LedgerState {
             .extend(result.dirty_offers.iter().copied());
         self.deleted_offers
             .extend(result.deleted_offers.iter().copied());
+        self.dirty_nft_offers
+            .extend(result.dirty_nft_offers.iter().copied());
         self.dirty_directories
             .extend(result.dirty_directories.iter().copied());
         self.deleted_directories
@@ -2734,6 +2765,9 @@ impl LedgerState {
         }
         for k in self.offers.keys() {
             self.dirty_offers.insert(*k);
+        }
+        for k in self.nft_offers.keys() {
+            self.dirty_nft_offers.insert(*k);
         }
         for k in self.directories.keys() {
             self.dirty_directories.insert(*k);
@@ -2994,15 +3028,40 @@ impl LedgerState {
         deleted.extend(self.deleted_tickets.iter().copied());
         dirty.extend(self.dirty_offers.iter().copied());
         deleted.extend(self.deleted_offers.iter().copied());
+        dirty.extend(self.dirty_nft_offers.iter().copied());
         dirty.extend(self.dirty_directories.iter().copied());
         deleted.extend(self.deleted_directories.iter().copied());
 
         (dirty, deleted)
     }
 
+    fn typed_entry_is_dirty(&self, entry: &TypedEntry) -> bool {
+        match entry {
+            TypedEntry::Account(account_id, _) => self.dirty_accounts.contains(account_id),
+            TypedEntry::Trustline(key, _) => self.dirty_trustlines.contains(key),
+            TypedEntry::Check(key, _) => self.dirty_checks.contains(key),
+            TypedEntry::DepositPreauth(key, _) => self.dirty_deposit_preauths.contains(key),
+            TypedEntry::Did(key, _) => self.dirty_dids.contains(key),
+            TypedEntry::Escrow(key, _) => self.dirty_escrows.contains(key),
+            TypedEntry::PayChannel(key, _) => self.dirty_paychans.contains(key),
+            TypedEntry::Ticket(key, _) => self.dirty_tickets.contains(key),
+            TypedEntry::NFToken(_, _) => false,
+            TypedEntry::NFTokenOffer(key, _) => self.dirty_nft_offers.contains(key),
+            TypedEntry::Offer(key, _) => self.dirty_offers.contains(key),
+            TypedEntry::Directory(key, _) => self.dirty_directories.contains(key),
+        }
+    }
+
     fn current_overlay_bytes(&self, key: &Key) -> Option<Vec<u8>> {
         if self.deleted_raw.contains(key) {
             return None;
+        }
+        if let Some(typed) = self.lookup_typed_entry(key) {
+            if self.typed_entry_is_dirty(&typed) {
+                if let Some(data) = Self::serialize_typed_entry(&typed) {
+                    return Some(data);
+                }
+            }
         }
         if let Some(data) = self.state_map.get_if_loaded(key) {
             return Some(data.to_vec());
@@ -3064,7 +3123,9 @@ impl LedgerState {
             Self::apply_current_overlay_to_snapshot(&mut snapshot, self);
             snapshot
         } else {
-            self.state_map.snapshot()
+            let mut snapshot = self.state_map.snapshot();
+            Self::apply_current_overlay_to_snapshot(&mut snapshot, self);
+            snapshot
         }
     }
 
@@ -3160,11 +3221,44 @@ impl LedgerState {
         (dirty.into_iter().collect(), deleted.into_iter().collect())
     }
 
+    fn has_typed_overlay_changes(&self) -> bool {
+        !self.dirty_accounts.is_empty()
+            || !self.deleted_accounts.is_empty()
+            || !self.dirty_trustlines.is_empty()
+            || !self.deleted_trustlines.is_empty()
+            || !self.dirty_checks.is_empty()
+            || !self.deleted_checks.is_empty()
+            || !self.dirty_deposit_preauths.is_empty()
+            || !self.deleted_deposit_preauths.is_empty()
+            || !self.dirty_dids.is_empty()
+            || !self.deleted_dids.is_empty()
+            || !self.dirty_escrows.is_empty()
+            || !self.deleted_escrows.is_empty()
+            || !self.dirty_paychans.is_empty()
+            || !self.deleted_paychans.is_empty()
+            || !self.dirty_tickets.is_empty()
+            || !self.deleted_tickets.is_empty()
+            || !self.dirty_offers.is_empty()
+            || !self.deleted_offers.is_empty()
+            || !self.dirty_nft_offers.is_empty()
+            || !self.dirty_directories.is_empty()
+            || !self.deleted_directories.is_empty()
+    }
+
     /// Root hash of the account-state SHAMap.
     pub fn state_hash(&mut self) -> [u8; 32] {
-        if self.defer_storage || !self.dirty_raw.is_empty() || !self.deleted_raw.is_empty() {
+        if self.defer_storage
+            || !self.dirty_raw.is_empty()
+            || !self.deleted_raw.is_empty()
+            || self.has_typed_overlay_changes()
+        {
             if let Some(hash) = self.overlay_state_hash_from_nudb() {
                 return hash;
+            }
+            if self.sparse_map.is_none() {
+                let mut snapshot = self.state_map.snapshot();
+                Self::apply_current_overlay_to_snapshot(&mut snapshot, self);
+                return snapshot.root_hash();
             }
             if let Some(ref mut sparse) = self.sparse_map {
                 return sparse.root_hash();
@@ -3540,6 +3634,66 @@ mod tests {
         assert_eq!(overlay_hash, expected_hash);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn state_hash_applies_typed_overlay_without_nudb() {
+        let mut state = LedgerState::new();
+        let original = make_account(0x51, 1000, 1);
+        let key = account::shamap_key(&original.account_id);
+
+        state.insert_account(original.clone());
+        state.dirty_accounts.clear();
+
+        let base_hash = state.state_hash();
+
+        let mut updated = original.clone();
+        updated.balance = 2500;
+        updated.sequence = 2;
+        state.accounts.insert(updated.account_id, updated.clone());
+        state.dirty_accounts.insert(updated.account_id);
+
+        let mut expected = state.state_map.snapshot();
+        expected.insert(key, updated.to_sle_binary());
+
+        assert_eq!(state.state_hash(), expected.root_hash());
+        assert_ne!(state.state_hash(), base_hash);
+    }
+
+    #[test]
+    fn state_hash_applies_typed_nft_offer_overlay_without_nudb() {
+        use crate::ledger::nftoken::NFTokenOffer;
+        use crate::transaction::amount::Amount;
+
+        let mut state = LedgerState::new();
+        let offer = NFTokenOffer {
+            account: [0x61; 20],
+            sequence: 9,
+            nftoken_id: [0xA7; 32],
+            amount: Amount::Xrp(25),
+            destination: None,
+            expiration: None,
+            flags: 0x0001,
+            owner_node: 0,
+            nft_offer_node: 0,
+            previous_txn_id: [0; 32],
+            previous_txn_lgrseq: 0,
+            raw_sle: None,
+        };
+        let key = offer.key();
+
+        let base_hash = state.state_hash();
+        state.hydrate_nft_offer(offer.clone());
+
+        let (dirty, deleted) = state.typed_overlay_keys_for_diagnostics();
+        assert!(dirty.contains(&key));
+        assert!(deleted.is_empty());
+
+        let mut expected = state.state_map.snapshot();
+        expected.insert(key, offer.to_sle_binary());
+
+        assert_eq!(state.state_hash(), expected.root_hash());
+        assert_ne!(state.state_hash(), base_hash);
     }
 
     #[test]

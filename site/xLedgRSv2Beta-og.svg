@@ -1,0 +1,28 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="630" fill="#09111D"/>
+  <rect x="36" y="36" width="1128" height="558" rx="36" fill="url(#panel)"/>
+  <circle cx="1082" cy="122" r="148" fill="#0E6FFF" fill-opacity="0.16"/>
+  <circle cx="1082" cy="122" r="92" fill="#0E6FFF" fill-opacity="0.14"/>
+  <circle cx="80" cy="568" r="180" fill="#0E6FFF" fill-opacity="0.12"/>
+  <rect x="92" y="120" width="176" height="176" rx="38" fill="#0D1220" stroke="#4FA6FF" stroke-width="8"/>
+  <rect x="116" y="144" width="48" height="48" rx="10" fill="#4FA6FF"/>
+  <rect x="188" y="150" width="56" height="12" rx="6" fill="#BBD8FF"/>
+  <rect x="188" y="172" width="44" height="12" rx="6" fill="#7DB7FF"/>
+  <rect x="116" y="220" width="128" height="16" rx="8" fill="#4FA6FF"/>
+  <rect x="116" y="250" width="80" height="16" rx="8" fill="#7DB7FF"/>
+  <path d="M220 264L256 300" stroke="#9BE15D" stroke-width="16" stroke-linecap="round"/>
+  <path d="M256 264L220 300" stroke="#9BE15D" stroke-width="16" stroke-linecap="round"/>
+  <text x="324" y="194" fill="#F7FBFF" font-family="Inter, SF Pro Display, Segoe UI, Arial, sans-serif" font-size="76" font-weight="800">xLedgRSv2Beta</text>
+  <text x="324" y="254" fill="#9FC2E9" font-family="Inter, SF Pro Display, Segoe UI, Arial, sans-serif" font-size="34" font-weight="600">XRPL node implementation in Rust</text>
+  <text x="92" y="388" fill="#F7FBFF" font-family="Inter, SF Pro Display, Segoe UI, Arial, sans-serif" font-size="56" font-weight="760">rippled-compatible surfaces.</text>
+  <text x="92" y="456" fill="#F7FBFF" font-family="Inter, SF Pro Display, Segoe UI, Arial, sans-serif" font-size="56" font-weight="760">Rust-native safety and operations.</text>
+  <rect x="92" y="504" width="286" height="52" rx="26" fill="#10243B" stroke="#24486E"/>
+  <text x="122" y="538" fill="#7DB7FF" font-family="Inter, SF Pro Display, Segoe UI, Arial, sans-serif" font-size="24" font-weight="700">JSON-RPC • WebSocket • gRPC</text>
+  <text x="946" y="544" fill="#DCEBFF" font-family="Inter, SF Pro Display, Segoe UI, Arial, sans-serif" font-size="28" font-weight="700" text-anchor="end">xLedgRSv2Beta.com</text>
+  <defs>
+    <linearGradient id="panel" x1="36" y1="36" x2="1164" y2="594" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#102339"/>
+      <stop offset="1" stop-color="#0A1626"/>
+    </linearGradient>
+  </defs>
+</svg>

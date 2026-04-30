@@ -95,12 +95,7 @@ impl Node {
             Some(fs) if !fs.running.load(std::sync::atomic::Ordering::Relaxed) => {
                 Some("ledger follower is not running")
             }
-            Some(fs)
-                if fs
-                    .hash_matches
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == 0 =>
-            {
+            Some(fs) if fs.hash_matches.load(std::sync::atomic::Ordering::Relaxed) == 0 => {
                 Some("waiting for first post-sync follower hash match")
             }
             Some(_) => None,

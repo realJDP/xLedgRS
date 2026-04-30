@@ -16,7 +16,13 @@ fn install_rustls_provider() {
 #[command(
     name = "xledgrs",
     about = "XRP Ledger node implemented in Rust",
-    version
+    version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nrelease: xLedgRSv2Beta",
+        "\npackage: ",
+        env!("CARGO_PKG_NAME")
+    )
 )]
 struct Args {
     /// Address to listen for peer connections
@@ -51,7 +57,7 @@ struct Args {
     #[arg(long)]
     data_dir: Option<String>,
 
-    /// Path to config file (supports xLedgRS TOML and xrpld-style cfg)
+    /// Path to config file (supports xLedgRSv2Beta TOML and xrpld-style cfg)
     #[arg(long)]
     config: Option<String>,
 
@@ -183,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
             path.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "xledgrs".to_string());
+        .unwrap_or_else(|| "xLedgRSv2Beta".to_string());
     let control_request = process_control::ControlRequest {
         start: args.start,
         stop: args.stop,
@@ -586,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
         rpc_addr  = %config.rpc_addr,
         grpc_addr = ?grpc_addr,
         max_peers = config.max_peers,
-        "xledgrs starting"
+        "xLedgRSv2Beta starting"
     );
 
     // Dump object mode

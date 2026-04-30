@@ -15,6 +15,7 @@
 //! Max entries per page: 32 (dirNodeMaxEntries in rippled Protocol.h).
 
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::crypto::sha512_first_half;
 use crate::ledger::offer::BookKey;
@@ -107,11 +108,47 @@ fn amount_is_zero(amount: &Amount) -> bool {
     }
 }
 
-fn load_directory_fresh(state: &LedgerState, key: &Key) -> Option<DirectoryNode> {
+pub(crate) fn load_directory_fresh(state: &LedgerState, key: &Key) -> Option<DirectoryNode> {
     state
         .get_raw_owned(key)
+        .or_else(|| state.get_committed_raw_owned(key))
         .and_then(|raw| DirectoryNode::decode(&raw, key.0).ok())
         .or_else(|| state.get_directory(key).cloned())
+}
+
+pub(crate) fn is_debug_directory_root(root: &[u8; 32]) -> bool {
+    configured_debug_directory_root().is_some_and(|debug_root| debug_root == *root)
+}
+
+pub(crate) fn is_debug_directory_key(key: &Key) -> bool {
+    is_debug_directory_root(&key.0)
+}
+
+pub(crate) fn directory_matches_debug_root(dir: &DirectoryNode) -> bool {
+    is_debug_directory_root(&dir.root_index)
+}
+
+pub(crate) fn debug_directory_summary(dir: &DirectoryNode) -> String {
+    format!(
+        "dir_key={} root={} next={} prev={} indexes={} owner={} rate={}",
+        hex::encode_upper(dir.key),
+        hex::encode_upper(dir.root_index),
+        dir.index_next,
+        dir.index_previous,
+        dir.indexes.len(),
+        dir.owner
+            .map(hex::encode_upper)
+            .unwrap_or_else(|| "none".to_string()),
+        dir.exchange_rate
+            .map(|rate| rate.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    )
+}
+
+fn configured_debug_directory_root() -> Option<[u8; 32]> {
+    let value = std::env::var("XLEDGRSV2BETA_DEBUG_DIRECTORY_ROOT").ok()?;
+    let bytes = hex::decode(value.trim()).ok()?;
+    bytes.try_into().ok()
 }
 
 /// Compute the SHAMap key for a directory page (page > 0).
@@ -1136,9 +1173,28 @@ pub fn dir_remove(state: &mut LedgerState, owner: &[u8; 20], entry_key: &[u8; 32
 
 /// Remove an entry from a directory when the root key is already known.
 pub fn dir_remove_root(state: &mut LedgerState, root_key: &Key, entry_key: &[u8; 32]) -> bool {
+    let trace_root = is_debug_directory_root(&root_key.0);
     // Verify the directory exists
     if load_directory_fresh(state, root_key).is_none() {
+        if trace_root {
+            info!(
+                "dir-trace dir_remove_root phase=missing_root root={} entry={}",
+                hex::encode_upper(root_key.0),
+                hex::encode_upper(entry_key),
+            );
+        }
         return false;
+    }
+
+    if trace_root {
+        if let Some(root) = load_directory_fresh(state, root_key) {
+            info!(
+                "dir-trace dir_remove_root phase=start root={} entry={} {}",
+                hex::encode_upper(root_key.0),
+                hex::encode_upper(entry_key),
+                debug_directory_summary(&root),
+            );
+        }
     }
 
     // Search starting from root (page 0), then follow index_next
@@ -1150,86 +1206,216 @@ pub fn dir_remove_root(state: &mut LedgerState, root_key: &Key, entry_key: &[u8;
             None => return false,
         };
 
-        if let Some(idx) = page.indexes.iter().position(|k| k == entry_key) {
-            // Found it — remove from this page
-            let mut updated = page.clone();
-            updated.indexes.remove(idx);
-            updated.raw_sle = None;
+        if trace_root {
+            info!(
+                "dir-trace dir_remove_root phase=visit root={} page={} page_num={} {}",
+                hex::encode_upper(root_key.0),
+                hex::encode_upper(pk.0),
+                current_page_num,
+                debug_directory_summary(&page),
+            );
+        }
 
-            if !updated.indexes.is_empty() {
-                // Page still has entries, just update it
-                state.insert_directory(updated);
-                return true;
-            }
-
-            // Page is now empty
-            if current_page_num == 0 {
-                // Root page is empty
-                let next = page.index_next;
-                let prev = page.index_previous;
-
-                if next == 0 && prev == 0 {
-                    // Only page — delete the entire directory.
-                    state.remove_directory_any(&pk);
-                    return true;
-                }
-
-                // Root is empty but other pages exist — keep root (rippled keepRoot behavior)
-                // Clean up trailing empty pages if needed
-                if next == prev && next != 0 {
-                    let last_key = page_key(&root_key.0, next);
-                    if let Some(last) = load_directory_fresh(state, &last_key) {
-                        if last.indexes.is_empty() {
-                            updated.index_next = 0;
-                            updated.index_previous = 0;
-                            updated.raw_sle = None;
-                            state.insert_directory(updated);
-                            state.remove_directory_any(&last_key);
-                            return true;
-                        }
-                    }
-                }
-
-                state.insert_directory(updated);
-                return true;
-            }
-
-            // Non-root page is empty — unlink and delete it
-            let prev_page_num = page.index_previous;
-            let next_page_num = page.index_next;
-
-            // Update previous page's next pointer
-            let prev_key = page_key(&root_key.0, prev_page_num);
-            if let Some(prev_page) = load_directory_fresh(state, &prev_key) {
-                let mut prev_updated = prev_page;
-                prev_updated.index_next = next_page_num;
-                prev_updated.raw_sle = None;
-                state.insert_directory(prev_updated);
-            }
-
-            // Update next page's previous pointer
-            // `next_page_num == 0` points back to the root page.
-            let next_key = page_key(&root_key.0, next_page_num);
-            if let Some(next_page) = load_directory_fresh(state, &next_key) {
-                let mut next_updated = next_page;
-                next_updated.index_previous = prev_page_num;
-                next_updated.raw_sle = None;
-                state.insert_directory(next_updated);
-            }
-
-            // Delete the empty page
-            state.remove_directory_any(&pk);
-
-            return true;
+        if page.indexes.iter().any(|k| k == entry_key) {
+            return dir_remove_loaded_page(
+                state,
+                root_key,
+                current_page_num,
+                page,
+                entry_key,
+                trace_root,
+            );
         }
 
         // Not on this page — follow the chain
         if page.index_next == 0 || page.index_next == current_page_num {
             // Reached end of chain
+            if trace_root {
+                info!(
+                    "dir-trace dir_remove_root phase=not_found root={} final_page={} page_num={} entry={}",
+                    hex::encode_upper(root_key.0),
+                    hex::encode_upper(pk.0),
+                    current_page_num,
+                    hex::encode_upper(entry_key),
+                );
+            }
             return false;
         }
         current_page_num = page.index_next;
     }
+}
+
+/// Remove an entry from a known directory page.
+///
+/// Offer SLEs carry `sfOwnerNode` and `sfBookNode`; rippled passes those page
+/// hints into `dirRemove` rather than scanning from the root. This avoids
+/// deleting a duplicate/stale entry from the wrong page when directory pages
+/// are sparse or partially hydrated.
+pub fn dir_remove_root_page(
+    state: &mut LedgerState,
+    root_key: &Key,
+    page_num: u64,
+    entry_key: &[u8; 32],
+) -> bool {
+    let trace_root = is_debug_directory_root(&root_key.0);
+    if page_num == 0 && load_directory_fresh(state, root_key).is_none() {
+        if trace_root {
+            info!(
+                "dir-trace dir_remove_root_page phase=missing_root root={} page_num={} entry={}",
+                hex::encode_upper(root_key.0),
+                page_num,
+                hex::encode_upper(entry_key),
+            );
+        }
+        return false;
+    }
+
+    let pk = page_key(&root_key.0, page_num);
+    let Some(page) = load_directory_fresh(state, &pk) else {
+        if trace_root {
+            info!(
+                "dir-trace dir_remove_root_page phase=missing_page root={} page={} page_num={} entry={}",
+                hex::encode_upper(root_key.0),
+                hex::encode_upper(pk.0),
+                page_num,
+                hex::encode_upper(entry_key),
+            );
+        }
+        return false;
+    };
+
+    dir_remove_loaded_page(state, root_key, page_num, page, entry_key, trace_root)
+}
+
+fn dir_remove_loaded_page(
+    state: &mut LedgerState,
+    root_key: &Key,
+    page_num: u64,
+    page: DirectoryNode,
+    entry_key: &[u8; 32],
+    trace_root: bool,
+) -> bool {
+    let pk = page_key(&root_key.0, page_num);
+    let Some(idx) = page.indexes.iter().position(|k| k == entry_key) else {
+        if trace_root {
+            info!(
+                "dir-trace dir_remove_loaded_page phase=not_found root={} page={} page_num={} entry={}",
+                hex::encode_upper(root_key.0),
+                hex::encode_upper(pk.0),
+                page_num,
+                hex::encode_upper(entry_key),
+            );
+        }
+        return false;
+    };
+
+    let mut updated = page.clone();
+    updated.indexes.remove(idx);
+    updated.raw_sle = None;
+
+    if !updated.indexes.is_empty() {
+        // Rippled unlinks empty pages, but it does not compact surviving
+        // entries into the previous page. Keep the touched page in place.
+        if trace_root {
+            info!(
+                "dir-trace dir_remove_loaded_page phase=keep_nonempty root={} page={} removed_idx={} before_indexes={} after_indexes={}",
+                hex::encode_upper(root_key.0),
+                hex::encode_upper(pk.0),
+                idx,
+                page.indexes.len(),
+                updated.indexes.len(),
+            );
+        }
+        state.insert_directory(updated);
+        return true;
+    }
+
+    if page_num == 0 {
+        let next = page.index_next;
+        let prev = page.index_previous;
+
+        if next == 0 && prev == 0 {
+            if trace_root {
+                info!(
+                    "dir-trace dir_remove_loaded_page phase=delete_entire_directory root={} page={} entry={}",
+                    hex::encode_upper(root_key.0),
+                    hex::encode_upper(pk.0),
+                    hex::encode_upper(entry_key),
+                );
+            }
+            state.remove_directory_any(&pk);
+            return true;
+        }
+
+        // Root is empty but other pages exist: keep root (rippled keepRoot behavior).
+        if next == prev && next != 0 {
+            let last_key = page_key(&root_key.0, next);
+            if let Some(last) = load_directory_fresh(state, &last_key) {
+                if last.indexes.is_empty() {
+                    updated.index_next = 0;
+                    updated.index_previous = 0;
+                    updated.raw_sle = None;
+                    if trace_root {
+                        info!(
+                            "dir-trace dir_remove_loaded_page phase=prune_trailing_empty_last root={} page={} last_page={} last_page_num={}",
+                            hex::encode_upper(root_key.0),
+                            hex::encode_upper(pk.0),
+                            hex::encode_upper(last_key.0),
+                            next,
+                        );
+                    }
+                    state.insert_directory(updated);
+                    state.remove_directory_any(&last_key);
+                    return true;
+                }
+            }
+        }
+
+        if trace_root {
+            info!(
+                "dir-trace dir_remove_loaded_page phase=keep_empty_root root={} page={} next={} prev={}",
+                hex::encode_upper(root_key.0),
+                hex::encode_upper(pk.0),
+                next,
+                prev,
+            );
+        }
+        state.insert_directory(updated);
+        return true;
+    }
+
+    let prev_page_num = page.index_previous;
+    let next_page_num = page.index_next;
+
+    let prev_key = page_key(&root_key.0, prev_page_num);
+    if let Some(prev_page) = load_directory_fresh(state, &prev_key) {
+        let mut prev_updated = prev_page;
+        prev_updated.index_next = next_page_num;
+        prev_updated.raw_sle = None;
+        state.insert_directory(prev_updated);
+    }
+
+    // `next_page_num == 0` points back to the root page.
+    let next_key = page_key(&root_key.0, next_page_num);
+    if let Some(next_page) = load_directory_fresh(state, &next_key) {
+        let mut next_updated = next_page;
+        next_updated.index_previous = prev_page_num;
+        next_updated.raw_sle = None;
+        state.insert_directory(next_updated);
+    }
+
+    if trace_root {
+        info!(
+            "dir-trace dir_remove_loaded_page phase=delete_empty_nonroot root={} page={} prev_page={} next_page={}",
+            hex::encode_upper(root_key.0),
+            hex::encode_upper(pk.0),
+            prev_page_num,
+            next_page_num,
+        );
+    }
+    state.remove_directory_any(&pk);
+
+    true
 }
 
 /// Count total entries across an account's owner directory pages.
@@ -1288,21 +1474,30 @@ pub fn owner_dir_contains_entry(
     owner: &[u8; 20],
     entry_key: &[u8; 32],
 ) -> bool {
+    owner_dir_page_for_entry(state, owner, entry_key).is_some()
+}
+
+/// Return the owner-directory page number containing a specific entry key.
+pub fn owner_dir_page_for_entry(
+    state: &LedgerState,
+    owner: &[u8; 20],
+    entry_key: &[u8; 32],
+) -> Option<u64> {
     let root_key = owner_dir_key(owner);
     let Some(_) = load_directory_fresh(state, &root_key) else {
-        return false;
+        return None;
     };
     let mut current_page_num: u64 = 0;
     loop {
         let pk = page_key(&root_key.0, current_page_num);
         let Some(page) = load_directory_fresh(state, &pk) else {
-            return false;
+            return None;
         };
         if page.indexes.iter().any(|k| k == entry_key) {
-            return true;
+            return Some(current_page_num);
         }
         if page.index_next == 0 || page.index_next == current_page_num {
-            return false;
+            return None;
         }
         current_page_num = page.index_next;
     }
@@ -1482,5 +1677,105 @@ mod tests {
     fn test_dir_remove_no_directory() {
         let mut state = LedgerState::new();
         assert!(!dir_remove(&mut state, &acct(1), &entry(1)));
+    }
+
+    #[test]
+    fn test_dir_remove_keeps_first_overflow_page_when_root_stays_nonempty() {
+        let mut state = LedgerState::new();
+        let owner = acct(1);
+
+        for i in 0..33u8 {
+            dir_add(&mut state, &owner, entry(i));
+        }
+
+        let root_key = owner_dir_key(&owner);
+        let page1_key = page_key(&root_key.0, 1);
+        assert!(state.get_directory(&page1_key).is_some());
+
+        assert!(dir_remove(&mut state, &owner, &entry(0)));
+
+        let root = state.get_directory(&root_key).unwrap();
+        let page1 = state.get_directory(&page1_key).unwrap();
+        assert_eq!(root.indexes.len(), 31);
+        assert_eq!(root.index_next, 1);
+        assert_eq!(root.index_previous, 1);
+        assert!(!root.indexes.contains(&entry(32)));
+        assert_eq!(page1.indexes, vec![entry(32)]);
+        assert_eq!(owner_dir_entry_count(&state, &owner), 32);
+    }
+
+    #[test]
+    fn test_dir_remove_keeps_page_one_and_page_two_linked_after_root_removals() {
+        let mut state = LedgerState::new();
+        let owner = acct(1);
+
+        for i in 0..65u8 {
+            dir_add(&mut state, &owner, entry(i));
+        }
+
+        let root_key = owner_dir_key(&owner);
+        let page1_key = page_key(&root_key.0, 1);
+        let page2_key = page_key(&root_key.0, 2);
+        assert!(state.get_directory(&page1_key).is_some());
+        assert!(state.get_directory(&page2_key).is_some());
+
+        for i in 32..39u8 {
+            assert!(dir_remove(&mut state, &owner, &entry(i)));
+        }
+
+        for i in 0..25u8 {
+            assert!(dir_remove(&mut state, &owner, &entry(i)));
+        }
+
+        let root = state.get_directory(&root_key).unwrap();
+        let page1 = state.get_directory(&page1_key).unwrap();
+        let page2 = state.get_directory(&page2_key).unwrap();
+        assert_eq!(root.index_next, 1);
+        assert_eq!(root.index_previous, 2);
+        assert_eq!(root.indexes.len(), 7);
+        assert_eq!(page1.index_previous, 0);
+        assert_eq!(page1.index_next, 2);
+        assert_eq!(page1.indexes.len(), 25);
+        assert_eq!(page2.index_previous, 1);
+        assert_eq!(page2.index_next, 0);
+        assert_eq!(page2.indexes.len(), 1);
+        assert!(state.get_directory(&page1_key).is_some());
+        assert_eq!(owner_dir_entry_count(&state, &owner), 33);
+    }
+
+    #[test]
+    fn test_dir_remove_keeps_deep_non_root_page_uncompacted_when_previous_has_space() {
+        let mut state = LedgerState::new();
+        let owner = acct(1);
+
+        for i in 0..66u8 {
+            dir_add(&mut state, &owner, entry(i));
+        }
+
+        let root_key = owner_dir_key(&owner);
+        let page1_key = page_key(&root_key.0, 1);
+        let page2_key = page_key(&root_key.0, 2);
+        assert!(state.get_directory(&page1_key).is_some());
+        assert!(state.get_directory(&page2_key).is_some());
+
+        for i in 32..63u8 {
+            assert!(dir_remove(&mut state, &owner, &entry(i)));
+        }
+
+        assert!(dir_remove(&mut state, &owner, &entry(64)));
+
+        let root = state.get_directory(&root_key).unwrap();
+        let page1 = state.get_directory(&page1_key).unwrap();
+        let page2 = state.get_directory(&page2_key).unwrap();
+        assert_eq!(root.index_next, 1);
+        assert_eq!(root.index_previous, 2);
+        assert_eq!(root.indexes.len(), 32);
+        assert_eq!(page1.index_previous, 0);
+        assert_eq!(page1.index_next, 2);
+        assert_eq!(page1.indexes, vec![entry(63)]);
+        assert_eq!(page2.index_previous, 1);
+        assert_eq!(page2.index_next, 0);
+        assert_eq!(page2.indexes, vec![entry(65)]);
+        assert_eq!(owner_dir_entry_count(&state, &owner), 34);
     }
 }

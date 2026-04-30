@@ -1,6 +1,6 @@
 //! Resource/load tracking for peer addresses and long-lived consumers.
 //!
-//! xledgrs keeps a rippled-shaped manager that owns decaying penalties,
+//! xLedgRSv2Beta keeps a rippled-shaped manager that owns decaying penalties,
 //! temporary blocks, consumer gossip, and runtime consumer identities instead
 //! of rebuilding peer identity ad hoc at each call site.
 

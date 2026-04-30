@@ -267,7 +267,9 @@ impl SyncCoordinator {
         request_cookie: Option<u32>,
         imported_count: usize,
     ) -> ObjectResponseHandling {
-        let accepted = self.peer.accept_object_response(ledger_hash, request_cookie)
+        let accepted = self
+            .peer
+            .accept_object_response(ledger_hash, request_cookie)
             || self.peer.accept_useful_stale_object_response(
                 ledger_hash,
                 request_cookie,

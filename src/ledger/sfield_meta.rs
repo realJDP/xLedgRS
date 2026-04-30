@@ -39,6 +39,18 @@ pub fn should_meta(type_code: u16, field_code: u16, context: u8) -> bool {
     (field_meta_flags(type_code, field_code) & context) != 0
 }
 
+#[inline]
+fn should_meta_with_value(type_code: u16, field_code: u16, context: u8, data: &[u8]) -> bool {
+    let flags = field_meta_flags(type_code, field_code);
+    if flags & context == 0 {
+        return false;
+    }
+    if flags & SMD_ALWAYS != 0 {
+        return true;
+    }
+    !crate::ledger::meta::field_data_is_default(data)
+}
+
 /// Filter fields for CreatedNode NewFields.
 /// Include fields with sMD_Create | sMD_Always that are non-default.
 pub fn filter_for_created(
@@ -46,7 +58,9 @@ pub fn filter_for_created(
 ) -> Vec<crate::ledger::meta::ParsedField> {
     fields
         .iter()
-        .filter(|f| should_meta(f.type_code, f.field_code, SMD_CREATE | SMD_ALWAYS))
+        .filter(|f| {
+            should_meta_with_value(f.type_code, f.field_code, SMD_CREATE | SMD_ALWAYS, &f.data)
+        })
         .cloned()
         .collect()
 }
@@ -58,7 +72,14 @@ pub fn filter_for_modified_final(
 ) -> Vec<crate::ledger::meta::ParsedField> {
     fields
         .iter()
-        .filter(|f| should_meta(f.type_code, f.field_code, SMD_ALWAYS | SMD_CHANGE_NEW))
+        .filter(|f| {
+            should_meta_with_value(
+                f.type_code,
+                f.field_code,
+                SMD_ALWAYS | SMD_CHANGE_NEW,
+                &f.data,
+            )
+        })
         .cloned()
         .collect()
 }
@@ -70,7 +91,7 @@ pub fn filter_for_modified_previous(
 ) -> Vec<crate::ledger::meta::ParsedField> {
     fields
         .iter()
-        .filter(|f| should_meta(f.type_code, f.field_code, SMD_CHANGE_ORIG))
+        .filter(|f| should_meta_with_value(f.type_code, f.field_code, SMD_CHANGE_ORIG, &f.data))
         .cloned()
         .collect()
 }
@@ -82,7 +103,14 @@ pub fn filter_for_deleted_final(
 ) -> Vec<crate::ledger::meta::ParsedField> {
     fields
         .iter()
-        .filter(|f| should_meta(f.type_code, f.field_code, SMD_ALWAYS | SMD_DELETE_FINAL))
+        .filter(|f| {
+            should_meta_with_value(
+                f.type_code,
+                f.field_code,
+                SMD_ALWAYS | SMD_DELETE_FINAL,
+                &f.data,
+            )
+        })
         .cloned()
         .collect()
 }
@@ -122,5 +150,27 @@ mod tests {
         assert!(should_meta(6, 2, SMD_CHANGE_NEW));
         assert!(should_meta(6, 2, SMD_CHANGE_ORIG));
         assert!(should_meta(6, 2, SMD_DELETE_FINAL));
+    }
+
+    #[test]
+    fn test_defaultish_values_are_suppressed_where_possible() {
+        use crate::ledger::meta::ParsedField;
+
+        let defaultish = ParsedField {
+            type_code: 3,
+            field_code: 4,
+            data: vec![0; 8],
+        };
+        let non_default = ParsedField {
+            type_code: 3,
+            field_code: 4,
+            data: vec![0, 0, 0, 0, 0, 0, 0, 1],
+        };
+
+        assert_eq!(filter_for_created(&[non_default.clone()]).len(), 1);
+        assert!(filter_for_created(&[defaultish.clone()]).is_empty());
+        assert!(filter_for_modified_final(&[defaultish.clone()]).is_empty());
+        assert!(filter_for_modified_previous(&[defaultish.clone()]).is_empty());
+        assert!(filter_for_deleted_final(&[defaultish]).is_empty());
     }
 }

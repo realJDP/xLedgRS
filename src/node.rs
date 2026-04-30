@@ -315,7 +315,7 @@ pub struct Node {
     /// Message dedup — separate from SharedState to avoid lock contention.
     /// SHA-256 of payload → true if seen. Cleared periodically.
     msg_dedup: Arc<std::sync::Mutex<(std::collections::HashSet<[u8; 32]>, std::time::Instant)>>,
-    /// Debug log file for sync diagnostics (separate from main xledgrs.log).
+    /// Debug log file for sync diagnostics (separate from main xLedgRSv2Beta.log).
     debug_log: Arc<std::sync::Mutex<Option<std::fs::File>>>,
     /// Lock-free RPC snapshot — updated atomically, read instantly by server_info.
     rpc_snapshot: arc_swap::ArcSwap<crate::rpc::RpcSnapshot>,
@@ -1227,12 +1227,7 @@ mod tests {
             (123, Some(fixed_hash), "fixed-target reacquire"),
         );
         assert_eq!(
-            crate::sync_bootstrap::choose_sync_kickstart_target(
-                None,
-                456,
-                Some(latest_hash),
-                None,
-            ),
+            crate::sync_bootstrap::choose_sync_kickstart_target(None, 456, Some(latest_hash), None,),
             (456, Some(latest_hash), "no syncer yet"),
         );
         assert_eq!(
@@ -1256,17 +1251,11 @@ mod tests {
     #[test]
     fn test_choose_reachable_seq_only_target_uses_peer_latest_when_local_is_stale() {
         assert_eq!(
-            crate::sync_bootstrap::choose_reachable_seq_only_target(
-                100,
-                &[(150, 200), (180, 250)],
-            ),
+            crate::sync_bootstrap::choose_reachable_seq_only_target(100, &[(150, 200), (180, 250)],),
             Some(250),
         );
         assert_eq!(
-            crate::sync_bootstrap::choose_reachable_seq_only_target(
-                190,
-                &[(150, 200), (180, 250)],
-            ),
+            crate::sync_bootstrap::choose_reachable_seq_only_target(190, &[(150, 200), (180, 250)],),
             None,
         );
         assert_eq!(
@@ -1325,9 +1314,15 @@ mod tests {
 
     #[test]
     fn test_should_prefer_history_latest_only_after_completed_sync_without_resume_header() {
-        assert!(crate::sync_bootstrap::should_prefer_history_latest(true, false));
-        assert!(!crate::sync_bootstrap::should_prefer_history_latest(true, true));
-        assert!(!crate::sync_bootstrap::should_prefer_history_latest(false, false));
+        assert!(crate::sync_bootstrap::should_prefer_history_latest(
+            true, false
+        ));
+        assert!(!crate::sync_bootstrap::should_prefer_history_latest(
+            true, true
+        ));
+        assert!(!crate::sync_bootstrap::should_prefer_history_latest(
+            false, false
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Peerfinder-style bootcache/livecache and slot-manager support.
 //!
-//! xledgrs keeps durable peer discovery state together with manager-owned
+//! xLedgRSv2Beta keeps durable peer discovery state together with manager-owned
 //! slot lifecycle, redirect handling, endpoint exchange, and autoconnect
 //! ordering instead of a blind FIFO of remembered endpoints.
 

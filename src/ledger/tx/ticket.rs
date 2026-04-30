@@ -23,10 +23,11 @@ pub(crate) fn apply_ticket_create(
         },
     };
 
-    // TicketCreate consumes the transaction's Sequence first, then reserves
-    // the following sequence numbers as tickets.
+    // TicketCreate reserves from the current account Sequence after the
+    // transaction machinery has consumed either the Sequence or Ticket.
+    let first_ticket_seq = new_sender.sequence;
     for i in 0..count {
-        let ticket_seq = tx.sequence + 1 + i;
+        let ticket_seq = first_ticket_seq.saturating_add(i);
         let ticket_key = crate::ledger::ticket::shamap_key(&tx.account, ticket_seq);
         let owner_node = directory::dir_add(state, &tx.account, ticket_key.0);
         let ticket = crate::ledger::Ticket {
@@ -40,10 +41,9 @@ pub(crate) fn apply_ticket_create(
         state.insert_ticket(ticket);
         new_sender.owner_count += 1;
     }
-    // apply_tx already consumed the tx Sequence itself (+1). TicketCreate must
-    // also skip over the newly reserved ticket range so the next usable
-    // Sequence is old_seq + 1 + count.
-    new_sender.sequence = new_sender.sequence.saturating_add(count);
+    // TicketCreate is the only transaction that advances account Sequence by
+    // more than the consumed sequence proxy.
+    new_sender.sequence = first_ticket_seq.saturating_add(count);
     new_sender.ticket_count = new_sender.ticket_count.saturating_add(count);
 
     ApplyResult::Success

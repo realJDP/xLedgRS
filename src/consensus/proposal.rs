@@ -32,7 +32,7 @@ impl Proposal {
     ///         || previousLedger (32 bytes) || position/txSetHash (32 bytes)
     ///
     /// Note: rippled computes SHA-512-Half of this payload in signingHash(), then passes
-    /// that digest to signDigest(). In xLedgRS, sign() in keys.rs does SHA-512-Half
+    /// that digest to signDigest(). In xLedgRSv2Beta, sign() in keys.rs does SHA-512-Half
     /// internally, so this method returns the raw pre-hash payload.
     pub fn signing_bytes(&self) -> Vec<u8> {
         // Hash prefix for proposals: "PRP\0" = 0x50525000

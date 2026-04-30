@@ -1,4 +1,4 @@
-//! Transactor — three-stage transaction application pipeline matching rippled.
+//! Legacy view-stack transactor modeled after rippled's three-stage pipeline.
 //!
 //! Every transaction goes through:
 //!   1. **preflight** — format validation, signature check (no state access)
@@ -9,7 +9,8 @@
 //! PreviousTxnID threading, and metadata generation. Individual tx types
 //! implement the `TxHandler` trait for type-specific logic.
 //!
-//! Matches rippled's Transactor base class.
+//! Runtime close uses `ledger::close` / `ledger::tx`; unsupported legacy paths
+//! fail explicitly without claiming full parity.
 
 use crate::ledger::apply_view_impl::{AffectedNodeInfo, ApplyViewImpl};
 use crate::ledger::keylet;

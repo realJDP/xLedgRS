@@ -93,7 +93,12 @@ fn directory_neighbor_keys_from_raw(
 
     let dir = crate::ledger::directory::DirectoryNode::decode(raw, key.0).ok()?;
     let mut out = Vec::with_capacity(3);
-    out.push(crate::ledger::Key(dir.root_index));
+    if dir.root_index != key.0 {
+        out.push(crate::ledger::Key(dir.root_index));
+    }
+    if dir.exchange_rate.is_none() && dir.root_index != key.0 {
+        return Some(out);
+    }
     if dir.index_next != 0 {
         out.push(crate::ledger::directory::page_key(
             &dir.root_index,
@@ -127,6 +132,27 @@ fn directory_index_keys_from_raw(
         out.push(crate::ledger::Key(index));
     }
     Some(out)
+}
+
+fn directory_member_frontier_keys_from_raw(
+    key: crate::ledger::Key,
+    raw: &[u8],
+) -> Option<Vec<crate::ledger::Key>> {
+    if raw.len() < 3 || raw[0] != 0x11 {
+        return None;
+    }
+    let sle_type = u16::from_be_bytes([raw[1], raw[2]]);
+    if sle_type != 0x0064 {
+        return None;
+    }
+
+    let dir = crate::ledger::directory::DirectoryNode::decode(raw, key.0).ok()?;
+    Some(
+        dir.indexes
+            .into_iter()
+            .map(crate::ledger::Key)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn parsed_field_bytes<'a>(
@@ -227,13 +253,6 @@ fn add_book_related_scope(
     if let Some(page) = book_page.filter(|page| *page != 0) {
         keys.insert(crate::ledger::directory::page_key(&book_directory, page));
     }
-
-    let mut root = book_directory;
-    root[24..32].copy_from_slice(&0u64.to_be_bytes());
-    keys.insert(crate::ledger::Key(root));
-    if let Some(page) = book_page.filter(|page| *page != 0) {
-        keys.insert(crate::ledger::directory::page_key(&root, page));
-    }
 }
 
 fn related_scope_keys_from_raw_with_mode(
@@ -254,11 +273,7 @@ fn related_scope_keys_from_raw_with_mode(
         add_account_related_scope(&mut out, owner, parsed_field_u64(&parsed, 3, 4));
     }
     if let Some(destination) = parsed_field_account(&parsed, 8, 3) {
-        add_account_related_scope(
-            &mut out,
-            destination,
-            parsed_field_u64(&parsed, 3, 9),
-        );
+        add_account_related_scope(&mut out, destination, parsed_field_u64(&parsed, 3, 9));
     }
 
     match parsed.entry_type {
@@ -277,14 +292,17 @@ fn related_scope_keys_from_raw_with_mode(
                 add_account_related_scope(&mut out, account, parsed_field_u64(&parsed, 3, 4));
             }
             if let Some(book_directory) = parsed_field_hash256(&parsed, 5, 16) {
-                add_book_related_scope(
-                    &mut out,
-                    book_directory,
-                    parsed_field_u64(&parsed, 3, 3),
-                );
+                add_book_related_scope(&mut out, book_directory, parsed_field_u64(&parsed, 3, 3));
             }
             for book in parsed_field_vector256(&parsed, 19, 13) {
                 add_book_related_scope(&mut out, book, None);
+            }
+            if let Some(data) = parsed_field_bytes(&parsed, 15, 13) {
+                for (book, book_node) in
+                    crate::ledger::offer::additional_book_entries_from_payload(data)
+                {
+                    add_book_related_scope(&mut out, book, Some(book_node));
+                }
             }
             if let Some(offer) = crate::ledger::offer::Offer::decode_from_sle(raw) {
                 for book in offer.additional_books {
@@ -328,10 +346,7 @@ fn related_scope_keys_from_raw_with_mode(
     out.into_iter().collect()
 }
 
-fn related_scope_keys_from_raw(
-    key: crate::ledger::Key,
-    raw: &[u8],
-) -> Vec<crate::ledger::Key> {
+fn related_scope_keys_from_raw(key: crate::ledger::Key, raw: &[u8]) -> Vec<crate::ledger::Key> {
     related_scope_keys_from_raw_with_mode(key, raw, false)
 }
 
@@ -340,6 +355,328 @@ fn authoritative_related_scope_keys_from_raw(
     raw: &[u8],
 ) -> Vec<crate::ledger::Key> {
     related_scope_keys_from_raw_with_mode(key, raw, true)
+}
+
+fn expand_prestate_with_related_scope_lookup<F>(
+    prestate: &mut std::collections::HashMap<[u8; 32], Vec<u8>>,
+    seed_keys: &[[u8; 32]],
+    max_additional: usize,
+    mut lookup: F,
+) -> usize
+where
+    F: FnMut(crate::ledger::Key) -> Option<Vec<u8>>,
+{
+    if max_additional == 0 {
+        return 0;
+    }
+
+    const DEBUG_OFFER_BOOK_PAGE_OFFER: &str =
+        "B9018891600FDADF5B4B09F9DF48EDE98DF14B2C45EC98FBA206360C01AB6E93";
+    const DEBUG_OFFER_BOOK_PAGE_DIR: &str =
+        "37AAC93D336021AE94310D0430FFA090F7137C97D473488C4A06CAD84040D000";
+
+    let mut frontier = std::collections::VecDeque::<[u8; 32]>::new();
+    let mut seen = std::collections::HashSet::<[u8; 32]>::new();
+    for key in seed_keys {
+        if seen.insert(*key) {
+            frontier.push_back(*key);
+        }
+    }
+
+    let mut added = 0usize;
+    while let Some(key_bytes) = frontier.pop_front() {
+        let key = crate::ledger::Key(key_bytes);
+        let key_hex = hex::encode_upper(key_bytes);
+        let Some(raw) = prestate.get(&key_bytes).cloned().or_else(|| {
+            let looked_up = lookup(key);
+            if key_hex == DEBUG_OFFER_BOOK_PAGE_OFFER || key_hex == DEBUG_OFFER_BOOK_PAGE_DIR {
+                info!(
+                    "forensic: prestate related-scope lookup key={} source=lookup hit={}",
+                    key_hex,
+                    looked_up.is_some(),
+                );
+            }
+            looked_up
+        }) else {
+            if key_hex == DEBUG_OFFER_BOOK_PAGE_OFFER || key_hex == DEBUG_OFFER_BOOK_PAGE_DIR {
+                info!(
+                    "forensic: prestate related-scope key={} missing from prestate and lookup",
+                    key_hex,
+                );
+            }
+            continue;
+        };
+
+        if key_hex == DEBUG_OFFER_BOOK_PAGE_OFFER || key_hex == DEBUG_OFFER_BOOK_PAGE_DIR {
+            info!(
+                "forensic: prestate related-scope visiting key={} present_in_prestate={}",
+                key_hex,
+                prestate.contains_key(&key_bytes),
+            );
+        }
+
+        for related in authoritative_related_scope_keys_from_raw(key, &raw) {
+            let related_hex = hex::encode_upper(related.0);
+            if key_hex == DEBUG_OFFER_BOOK_PAGE_OFFER || related_hex == DEBUG_OFFER_BOOK_PAGE_DIR {
+                info!(
+                    "forensic: prestate related-scope edge from={} to={} already_present={}",
+                    key_hex,
+                    related_hex,
+                    prestate.contains_key(&related.0),
+                );
+            }
+            if prestate.contains_key(&related.0) {
+                if seen.insert(related.0) {
+                    frontier.push_back(related.0);
+                }
+                continue;
+            }
+            if added >= max_additional {
+                return added;
+            }
+            let Some(related_raw) = lookup(related) else {
+                if key_hex == DEBUG_OFFER_BOOK_PAGE_OFFER
+                    || related_hex == DEBUG_OFFER_BOOK_PAGE_DIR
+                {
+                    info!(
+                        "forensic: prestate related-scope lookup miss from={} to={}",
+                        key_hex, related_hex,
+                    );
+                }
+                continue;
+            };
+            if key_hex == DEBUG_OFFER_BOOK_PAGE_OFFER || related_hex == DEBUG_OFFER_BOOK_PAGE_DIR {
+                info!(
+                    "forensic: prestate related-scope inserted key={} from={}",
+                    related_hex, key_hex,
+                );
+            }
+            prestate.insert(related.0, related_raw);
+            added += 1;
+            if seen.insert(related.0) {
+                frontier.push_back(related.0);
+            }
+        }
+    }
+
+    added
+}
+
+fn add_authoritative_hop_account_scope(
+    delta: &mut std::collections::BTreeSet<crate::ledger::Key>,
+    account: [u8; 20],
+    owner_page: Option<u64>,
+) {
+    let account_key = crate::ledger::account::shamap_key(&account);
+    delta.insert(account_key);
+
+    let owner_root = crate::ledger::directory::owner_dir_key(&account);
+    delta.insert(owner_root);
+
+    if let Some(page) = owner_page.filter(|page| *page != 0) {
+        let owner_page_key = crate::ledger::directory::page_key(&owner_root.0, page);
+        delta.insert(owner_page_key);
+    }
+}
+
+fn add_authoritative_hop_account_frontier(
+    next_frontier: &mut std::collections::BTreeSet<crate::ledger::Key>,
+    account: [u8; 20],
+    owner_page: Option<u64>,
+) {
+    let owner_root = crate::ledger::directory::owner_dir_key(&account);
+    next_frontier.insert(owner_root);
+
+    if let Some(page) = owner_page.filter(|page| *page != 0) {
+        let owner_page_key = crate::ledger::directory::page_key(&owner_root.0, page);
+        next_frontier.insert(owner_page_key);
+    }
+}
+
+fn add_authoritative_hop_book_scope(
+    delta: &mut std::collections::BTreeSet<crate::ledger::Key>,
+    book_directory: [u8; 32],
+    book_page: Option<u64>,
+) {
+    if book_directory == [0u8; 32] {
+        return;
+    }
+
+    let book_dir_key = crate::ledger::Key(book_directory);
+    delta.insert(book_dir_key);
+
+    if let Some(page) = book_page.filter(|page| *page != 0) {
+        let book_page_key = crate::ledger::directory::page_key(&book_directory, page);
+        delta.insert(book_page_key);
+    }
+}
+
+fn add_authoritative_hop_book_frontier(
+    next_frontier: &mut std::collections::BTreeSet<crate::ledger::Key>,
+    book_directory: [u8; 32],
+    book_page: Option<u64>,
+) {
+    if book_directory == [0u8; 32] {
+        return;
+    }
+
+    let book_dir_key = crate::ledger::Key(book_directory);
+    next_frontier.insert(book_dir_key);
+
+    if let Some(page) = book_page.filter(|page| *page != 0) {
+        let book_page_key = crate::ledger::directory::page_key(&book_directory, page);
+        next_frontier.insert(book_page_key);
+    }
+}
+
+pub(crate) fn collect_authoritative_hop_scope_from_raw(
+    key: crate::ledger::Key,
+    raw: &[u8],
+) -> (
+    std::collections::BTreeSet<crate::ledger::Key>,
+    std::collections::BTreeSet<crate::ledger::Key>,
+) {
+    let mut delta = std::collections::BTreeSet::new();
+    let mut next_frontier = std::collections::BTreeSet::new();
+
+    let Some(parsed) = crate::ledger::meta::parse_sle(raw) else {
+        return (delta, next_frontier);
+    };
+
+    match parsed.entry_type {
+        0x0064 => {
+            let dir = crate::ledger::directory::DirectoryNode::decode(raw, key.0).ok();
+            if let Some(owner) = parsed_field_account(&parsed, 8, 2) {
+                add_authoritative_hop_account_scope(
+                    &mut delta,
+                    owner,
+                    parsed_field_u64(&parsed, 3, 4),
+                );
+                add_authoritative_hop_account_frontier(
+                    &mut next_frontier,
+                    owner,
+                    parsed_field_u64(&parsed, 3, 4),
+                );
+            }
+            let recurse_directory_chain = match dir.as_ref() {
+                Some(dir) if dir.exchange_rate.is_none() => dir.root_index == key.0,
+                Some(_) => true,
+                None => false,
+            };
+            if recurse_directory_chain {
+                if let Some(neighbors) = directory_neighbor_keys_from_raw(key, raw) {
+                    for neighbor in neighbors {
+                        delta.insert(neighbor);
+                        next_frontier.insert(neighbor);
+                    }
+                }
+            }
+            if let Some(indexes) = directory_index_keys_from_raw(key, raw) {
+                delta.extend(indexes);
+            }
+            if let Some(indexes) = directory_member_frontier_keys_from_raw(key, raw) {
+                next_frontier.extend(indexes);
+            }
+        }
+        0x006f => {
+            if let Some(account) = parsed_field_account(&parsed, 8, 1) {
+                let owner_page = parsed_field_u64(&parsed, 3, 4);
+                add_authoritative_hop_account_scope(&mut delta, account, owner_page);
+                add_authoritative_hop_account_frontier(&mut next_frontier, account, owner_page);
+            }
+            if let Some(book_directory) = parsed_field_hash256(&parsed, 5, 16) {
+                let book_page = parsed_field_u64(&parsed, 3, 3);
+                add_authoritative_hop_book_scope(&mut delta, book_directory, book_page);
+                add_authoritative_hop_book_frontier(&mut next_frontier, book_directory, book_page);
+            }
+            for book in parsed_field_vector256(&parsed, 19, 13) {
+                add_authoritative_hop_book_scope(&mut delta, book, None);
+                add_authoritative_hop_book_frontier(&mut next_frontier, book, None);
+            }
+            if let Some(data) = parsed_field_bytes(&parsed, 15, 13) {
+                for (book, book_node) in
+                    crate::ledger::offer::additional_book_entries_from_payload(data)
+                {
+                    add_authoritative_hop_book_scope(&mut delta, book, Some(book_node));
+                    add_authoritative_hop_book_frontier(&mut next_frontier, book, Some(book_node));
+                }
+            }
+            if let Some(offer) = crate::ledger::offer::Offer::decode_from_sle(raw) {
+                for book in offer.additional_books {
+                    add_authoritative_hop_book_scope(&mut delta, book, None);
+                    add_authoritative_hop_book_frontier(&mut next_frontier, book, None);
+                }
+            }
+        }
+        0x0072 => {
+            if let Some(trustline) = crate::ledger::trustline::RippleState::decode_from_sle(raw) {
+                add_authoritative_hop_account_scope(
+                    &mut delta,
+                    trustline.low_account,
+                    Some(trustline.low_node),
+                );
+                add_authoritative_hop_account_frontier(
+                    &mut next_frontier,
+                    trustline.low_account,
+                    Some(trustline.low_node),
+                );
+                add_authoritative_hop_account_scope(
+                    &mut delta,
+                    trustline.high_account,
+                    Some(trustline.high_node),
+                );
+                add_authoritative_hop_account_frontier(
+                    &mut next_frontier,
+                    trustline.high_account,
+                    Some(trustline.high_node),
+                );
+            } else {
+                if let Some(low_account) = parsed_amount_issuer(&parsed, 6, 6) {
+                    let low_page = parsed_field_u64(&parsed, 3, 7);
+                    add_authoritative_hop_account_scope(&mut delta, low_account, low_page);
+                    add_authoritative_hop_account_frontier(
+                        &mut next_frontier,
+                        low_account,
+                        low_page,
+                    );
+                }
+                if let Some(high_account) = parsed_amount_issuer(&parsed, 6, 7) {
+                    let high_page = parsed_field_u64(&parsed, 3, 8);
+                    add_authoritative_hop_account_scope(&mut delta, high_account, high_page);
+                    add_authoritative_hop_account_frontier(
+                        &mut next_frontier,
+                        high_account,
+                        high_page,
+                    );
+                }
+            }
+        }
+        _ => {
+            if let Some(account) = parsed_field_account(&parsed, 8, 1) {
+                let owner_page = parsed_field_u64(&parsed, 3, 4);
+                add_authoritative_hop_account_scope(&mut delta, account, owner_page);
+                add_authoritative_hop_account_frontier(&mut next_frontier, account, owner_page);
+            }
+            if let Some(owner) = parsed_field_account(&parsed, 8, 2) {
+                let owner_page = parsed_field_u64(&parsed, 3, 4);
+                add_authoritative_hop_account_scope(&mut delta, owner, owner_page);
+                add_authoritative_hop_account_frontier(&mut next_frontier, owner, owner_page);
+            }
+            if let Some(destination) = parsed_field_account(&parsed, 8, 3) {
+                let destination_page = parsed_field_u64(&parsed, 3, 9);
+                add_authoritative_hop_account_scope(&mut delta, destination, destination_page);
+                add_authoritative_hop_account_frontier(
+                    &mut next_frontier,
+                    destination,
+                    destination_page,
+                );
+            }
+        }
+    }
+
+    delta.remove(&key);
+    next_frontier.retain(|candidate| delta.contains(candidate));
+    (delta, next_frontier)
 }
 
 fn raw_from_directory_scope_sources(
@@ -405,6 +742,90 @@ fn expand_authoritative_directory_scope_with_sources(
             }
         }
     }
+}
+
+fn seed_authoritative_directory_scope_with_sources(
+    state: &crate::ledger::LedgerState,
+    extra_raw_sources: &[&std::collections::HashMap<[u8; 32], Vec<u8>>],
+    keys: &mut std::collections::BTreeSet<crate::ledger::Key>,
+) {
+    let seed_keys: Vec<crate::ledger::Key> = keys.iter().copied().collect();
+    let mut added = std::collections::BTreeSet::new();
+
+    for key in seed_keys {
+        let Some(raw) = raw_from_directory_scope_sources(state, extra_raw_sources, &key) else {
+            continue;
+        };
+        added.extend(authoritative_related_scope_keys_from_raw(key, &raw));
+    }
+
+    keys.extend(added);
+}
+
+fn collect_authoritative_second_hop_delta_ordered_with_sources(
+    state: &crate::ledger::LedgerState,
+    extra_raw_sources: &[&std::collections::HashMap<[u8; 32], Vec<u8>>],
+    known_keys: &std::collections::BTreeSet<crate::ledger::Key>,
+    frontier_keys: &[crate::ledger::Key],
+    max_extra: usize,
+) -> (Vec<[u8; 32]>, Vec<crate::ledger::Key>, usize) {
+    let mut discovered_delta = std::collections::BTreeSet::new();
+    let mut discovered_delta_order = Vec::new();
+    let mut discovered_frontier = std::collections::BTreeSet::new();
+    let mut discovered_frontier_order = Vec::new();
+
+    for key in frontier_keys {
+        let Some(raw) = raw_from_directory_scope_sources(state, extra_raw_sources, key) else {
+            continue;
+        };
+        let (related_delta, related_frontier) =
+            collect_authoritative_hop_scope_from_raw(*key, &raw);
+        for related in related_delta {
+            if !known_keys.contains(&related) && discovered_delta.insert(related) {
+                discovered_delta_order.push(related);
+            }
+        }
+        for frontier in related_frontier {
+            if !known_keys.contains(&frontier) && discovered_frontier.insert(frontier) {
+                discovered_frontier_order.push(frontier);
+            }
+        }
+    }
+
+    let discovered = discovered_delta_order.len();
+    let capped_order: Vec<crate::ledger::Key> =
+        discovered_delta_order.into_iter().take(max_extra).collect();
+    let capped_keys: std::collections::BTreeSet<crate::ledger::Key> =
+        capped_order.iter().copied().collect();
+    let next_frontier = discovered_frontier_order
+        .into_iter()
+        .filter(|key| capped_keys.contains(key))
+        .collect();
+    let delta = capped_order.into_iter().map(|key| key.0).collect();
+    (delta, next_frontier, discovered)
+}
+
+fn collect_authoritative_second_hop_delta_with_sources(
+    state: &crate::ledger::LedgerState,
+    extra_raw_sources: &[&std::collections::HashMap<[u8; 32], Vec<u8>>],
+    known_keys: &std::collections::BTreeSet<crate::ledger::Key>,
+    frontier_keys: &std::collections::BTreeSet<crate::ledger::Key>,
+    max_extra: usize,
+) -> (
+    Vec<[u8; 32]>,
+    std::collections::BTreeSet<crate::ledger::Key>,
+    usize,
+) {
+    let frontier_order: Vec<crate::ledger::Key> = frontier_keys.iter().copied().collect();
+    let (delta, next_frontier, discovered) =
+        collect_authoritative_second_hop_delta_ordered_with_sources(
+            state,
+            extra_raw_sources,
+            known_keys,
+            &frontier_order,
+            max_extra,
+        );
+    (delta, next_frontier.into_iter().collect(), discovered)
 }
 
 fn expand_directory_neighborhoods(
@@ -659,6 +1080,37 @@ fn build_directory_sle_from_fields_with_state(
     let nftoken_id = as_hash256(find_field(fields, 5, 10));
     let domain_id = as_hash256(find_field(fields, 5, 34));
 
+    if taker_pays_currency.is_none()
+        || taker_pays_issuer.is_none()
+        || taker_gets_currency.is_none()
+        || taker_gets_issuer.is_none()
+        || owner.is_none()
+        || exchange_rate.is_none()
+    {
+        if let Some(raw) = state.get_raw_owned(key) {
+            if let Ok(existing_dir) = crate::ledger::DirectoryNode::decode(&raw, key.0) {
+                if owner.is_none() {
+                    owner = existing_dir.owner;
+                }
+                if exchange_rate.is_none() {
+                    exchange_rate = existing_dir.exchange_rate;
+                }
+                if taker_pays_currency.is_none() {
+                    taker_pays_currency = existing_dir.taker_pays_currency;
+                }
+                if taker_pays_issuer.is_none() {
+                    taker_pays_issuer = existing_dir.taker_pays_issuer;
+                }
+                if taker_gets_currency.is_none() {
+                    taker_gets_currency = existing_dir.taker_gets_currency;
+                }
+                if taker_gets_issuer.is_none() {
+                    taker_gets_issuer = existing_dir.taker_gets_issuer;
+                }
+            }
+        }
+    }
+
     if (taker_pays_currency.is_none()
         || taker_pays_issuer.is_none()
         || taker_gets_currency.is_none()
@@ -806,7 +1258,9 @@ fn build_offer_sle_from_fields(
         owner_node: as_u64(find_field(fields, 3, 4)).unwrap_or(0),
         expiration: as_u32(find_field(fields, 2, 10)),
         domain_id: as_hash256(find_field(fields, 5, 34)),
-        additional_books: as_vector256(find_field(fields, 19, 13)),
+        additional_books: find_field(fields, 15, 13)
+            .map(crate::ledger::offer::additional_book_directories_from_payload)
+            .unwrap_or_default(),
         previous_txn_id: prev_txn_id.unwrap_or([0u8; 32]),
         previous_txn_lgr_seq: prev_txn_lgrseq.unwrap_or(0),
         raw_sle: None,
@@ -992,6 +1446,7 @@ struct MetadataPatchStats {
     missing_modified_keys: Vec<crate::ledger::Key>,
     created_override_miss_keys: Vec<crate::ledger::Key>,
     incomplete_book_dir_keys: Vec<crate::ledger::Key>,
+    non_metadata_authoritative_touch_keys: Vec<crate::ledger::Key>,
     aborted: bool,
 }
 
@@ -999,8 +1454,9 @@ struct MetadataPatchStats {
 fn apply_metadata_patches(
     meta_with_hashes: &[([u8; 32], Vec<u8>)],
     ledger_seq: u32,
-    created_overrides: &std::collections::HashMap<crate::ledger::Key, Vec<u8>>,
+    created_overrides: &std::collections::HashMap<crate::ledger::Key, RpcLedgerEntryFetch>,
     modified_dir_overrides: &std::collections::HashMap<crate::ledger::Key, Vec<u8>>,
+    per_tx_local_touched: &[crate::ledger::close::TxLocalTouched],
     state: &mut crate::ledger::LedgerState,
 ) -> MetadataPatchStats {
     let fix_previous_txn_id_enabled = crate::ledger::fix_previous_txn_id_enabled(state);
@@ -1015,10 +1471,12 @@ fn apply_metadata_patches(
             .unwrap_or(false)
     };
     fn watch_directory_key(key: &[u8; 32]) -> bool {
-        let k = hex::encode_upper(key);
-        k == "28516E970A801B5AE4C34A5A5F7BB8A63263E481504D85066F61BBE1A3AC1123"
-            || k == "C78241CA86D8FD33D7930F713AE3A89D7CE23C52BB46E39526E627CCF5964E32"
-            || k == "6065A06AFD2A13DE1A5F389523C4B4E96FEE17950D4078C12183CCA79542A434"
+        let Ok(keys) = std::env::var("XLEDGRSV2BETA_WATCH_DIRECTORY_KEYS") else {
+            return false;
+        };
+        let target = hex::encode_upper(key);
+        keys.split(',')
+            .any(|key| key.trim().eq_ignore_ascii_case(&target))
     }
     fn field_vector256(fields: &[crate::ledger::meta::ParsedField]) -> Vec<[u8; 32]> {
         fields
@@ -1047,8 +1505,10 @@ fn apply_metadata_patches(
         let _ = entry_type;
         out
     }
-    const BYTE_DIFF_LEDGER_SEQ: u32 = 103483090;
-    let byte_diff_mode = ledger_seq == BYTE_DIFF_LEDGER_SEQ;
+    let byte_diff_mode = std::env::var("XLEDGRSV2BETA_BYTE_DIFF_LEDGER_SEQ")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        == Some(ledger_seq);
     let mut applied = 0usize;
     let mut missing_modified = 0usize;
     let mut missing_modified_keys = std::collections::BTreeSet::<crate::ledger::Key>::new();
@@ -1057,6 +1517,8 @@ fn apply_metadata_patches(
     let mut created_override_miss_keys: std::collections::HashSet<crate::ledger::Key> =
         std::collections::HashSet::new();
     let mut incomplete_book_dir_keys: Vec<crate::ledger::Key> = Vec::new();
+    let mut non_metadata_authoritative_touch_keys =
+        std::collections::BTreeSet::<crate::ledger::Key>::new();
     let mut created_seen: std::collections::HashMap<
         [u8; 32],
         Vec<crate::ledger::meta::ParsedField>,
@@ -1068,6 +1530,10 @@ fn apply_metadata_patches(
         all_meta.push((idx.unwrap_or(u32::MAX), *tx_hash, nodes));
     }
     all_meta.sort_by_key(|(idx, _, _)| *idx);
+    let created_keys_referenced_later =
+        crate::ledger::close::collect_created_keys_referenced_later_from_sorted_meta(
+            all_meta.iter().map(|(_, _, nodes)| nodes.as_slice()),
+        );
     if byte_diff_mode {
         info!(
             "BYTE DIFF seq={}: txs_with_meta={} sorted_meta_entries={}",
@@ -1078,6 +1544,32 @@ fn apply_metadata_patches(
     }
     for (_tx_index, tx_hash, nodes) in &all_meta {
         let mut tx_ops: Vec<(crate::ledger::Key, u16, Option<Vec<u8>>, bool)> = Vec::new();
+        let tx_metadata_keys: std::collections::HashSet<crate::ledger::Key> = nodes
+            .iter()
+            .map(|node| crate::ledger::Key(node.ledger_index))
+            .collect();
+        let local_touched: &[(crate::ledger::Key, Option<Vec<u8>>)] = per_tx_local_touched
+            .iter()
+            .find(|tx| tx.tx_id == *tx_hash)
+            .map(|tx| tx.touched.as_slice())
+            .unwrap_or(&[]);
+        let local_before: std::collections::HashMap<crate::ledger::Key, Option<Vec<u8>>> =
+            local_touched
+                .iter()
+                .map(|(key, before)| (*key, before.clone()))
+                .collect();
+        for (key, before) in local_touched {
+            if tx_metadata_keys.contains(key) {
+                continue;
+            }
+            crate::ledger::close::restore_validated_replay_before(state, key, before.as_ref());
+        }
+        state.begin_tx_journal();
+        let mut pending_created_not_found_cleanup: Vec<(
+            crate::ledger::Key,
+            u16,
+            Vec<crate::ledger::meta::ParsedField>,
+        )> = Vec::new();
         let mut tx_book_dirs: std::collections::HashMap<
             [u8; 32],
             ([u8; 20], [u8; 20], [u8; 20], [u8; 20]),
@@ -1104,9 +1596,67 @@ fn apply_metadata_patches(
                 }
             }
         }
+        let mut dir_index_deltas: std::collections::HashMap<
+            crate::ledger::Key,
+            crate::ledger::close::DirectoryIndexDelta,
+        > = std::collections::HashMap::new();
+        for node in nodes {
+            let mut directory_pages = std::collections::BTreeSet::new();
+            directory_pages.extend(crate::ledger::close::owner_directory_pages_from_fields(
+                node.entry_type,
+                &node.fields,
+            ));
+            if let Some(offer_pages) = crate::ledger::close::offer_directory_pages(node) {
+                directory_pages.extend(offer_pages);
+            }
+            match node.action {
+                crate::ledger::meta::Action::Created => {
+                    for page in directory_pages {
+                        dir_index_deltas
+                            .entry(page)
+                            .or_default()
+                            .add
+                            .insert(node.ledger_index);
+                    }
+                }
+                crate::ledger::meta::Action::Deleted => {
+                    for page in directory_pages {
+                        dir_index_deltas
+                            .entry(page)
+                            .or_default()
+                            .remove
+                            .insert(node.ledger_index);
+                    }
+                }
+                crate::ledger::meta::Action::Modified => {
+                    if let Some((before_pages, after_pages)) =
+                        crate::ledger::close::modified_offer_directory_pages(node)
+                    {
+                        for before in &before_pages {
+                            if !after_pages.iter().any(|page| page == before) {
+                                dir_index_deltas
+                                    .entry(*before)
+                                    .or_default()
+                                    .remove
+                                    .insert(node.ledger_index);
+                            }
+                        }
+                        for after in &after_pages {
+                            if !before_pages.iter().any(|page| page == after) {
+                                dir_index_deltas
+                                    .entry(*after)
+                                    .or_default()
+                                    .add
+                                    .insert(node.ledger_index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for node in nodes {
             let key = crate::ledger::Key(node.ledger_index);
-            if ledger_seq == 103483090
+            if byte_diff_mode
                 && node.entry_type == 0x0064
                 && watch_directory_key(&node.ledger_index)
             {
@@ -1136,24 +1686,81 @@ fn apply_metadata_patches(
                     let norm_fields = normalize_directory_fields(node.entry_type, &node.fields);
                     let related_offer_book =
                         related_offer_book_for_directory_node(node, &tx_book_dirs);
-                    let sle = if let Some(override_sle) = created_overrides.get(&key).cloned() {
-                        created_override_hits += 1;
-                        override_sle
-                    } else {
-                        created_override_misses += 1;
-                        if byte_diff_mode {
-                            warn!(
-                                "BYTE DIFF seq={}: CREATE override-miss key={} type={:04X} fields={} field_ids={:?} tx_hash={}",
-                                ledger_seq,
-                                hex::encode_upper(key.0),
-                                node.entry_type,
-                                node.fields.len(),
-                                field_id_list(&node.fields),
-                                hex::encode_upper(tx_hash),
-                            );
+                    let allow_created_override = !created_keys_referenced_later.contains(&key);
+                    let sle = if allow_created_override {
+                        match created_overrides
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or(RpcLedgerEntryFetch::Unavailable)
+                        {
+                            RpcLedgerEntryFetch::Found(override_sle) => {
+                                created_override_hits += 1;
+                                override_sle
+                            }
+                            RpcLedgerEntryFetch::NotFound => {
+                                created_override_misses += 1;
+                                created_override_miss_keys.insert(key);
+                                pending_created_not_found_cleanup.push((
+                                    key,
+                                    node.entry_type,
+                                    node.fields.clone(),
+                                ));
+                                if byte_diff_mode {
+                                    warn!(
+                                        "BYTE DIFF seq={}: CREATE authoritative-not-found key={} type={:04X} fields={} field_ids={:?} tx_hash={}",
+                                        ledger_seq,
+                                        hex::encode_upper(key.0),
+                                        node.entry_type,
+                                        node.fields.len(),
+                                        field_id_list(&node.fields),
+                                        hex::encode_upper(tx_hash),
+                                    );
+                                }
+                                tx_ops.push((key, node.entry_type, None, false));
+                                continue;
+                            }
+                            RpcLedgerEntryFetch::Unavailable => {
+                                created_override_misses += 1;
+                                if byte_diff_mode {
+                                    warn!(
+                                        "BYTE DIFF seq={}: CREATE override-miss key={} type={:04X} fields={} field_ids={:?} tx_hash={}",
+                                        ledger_seq,
+                                        hex::encode_upper(key.0),
+                                        node.entry_type,
+                                        node.fields.len(),
+                                        field_id_list(&node.fields),
+                                        hex::encode_upper(tx_hash),
+                                    );
+                                }
+                                created_override_miss_keys.insert(key);
+                                let sle = build_created_sle_with_state(
+                                    &state,
+                                    &key,
+                                    node.entry_type,
+                                    &norm_fields,
+                                    related_offer_book,
+                                    new_ptid,
+                                    new_ptseq,
+                                );
+                                if node.entry_type == 0x0064 {
+                                    let sle = crate::ledger::close::apply_directory_book_context(
+                                        &key,
+                                        sle,
+                                        related_offer_book,
+                                    );
+                                    crate::ledger::close::apply_directory_index_delta(
+                                        &key,
+                                        sle,
+                                        &node.fields,
+                                        dir_index_deltas.get(&key),
+                                    )
+                                } else {
+                                    sle
+                                }
+                            }
                         }
-                        created_override_miss_keys.insert(key);
-                        build_created_sle_with_state(
+                    } else {
+                        let sle = build_created_sle_with_state(
                             &state,
                             &key,
                             node.entry_type,
@@ -1161,7 +1768,22 @@ fn apply_metadata_patches(
                             related_offer_book,
                             new_ptid,
                             new_ptseq,
-                        )
+                        );
+                        if node.entry_type == 0x0064 {
+                            let sle = crate::ledger::close::apply_directory_book_context(
+                                &key,
+                                sle,
+                                related_offer_book,
+                            );
+                            crate::ledger::close::apply_directory_index_delta(
+                                &key,
+                                sle,
+                                &node.fields,
+                                dir_index_deltas.get(&key),
+                            )
+                        } else {
+                            sle
+                        }
                     };
                     if byte_diff_mode {
                         info!(
@@ -1210,6 +1832,8 @@ fn apply_metadata_patches(
                     tx_ops.push((key, node.entry_type, Some(sle), true));
                 }
                 crate::ledger::meta::Action::Modified => {
+                    let related_offer_book =
+                        related_offer_book_for_directory_node(node, &tx_book_dirs);
                     if let Some(override_sle) = modified_dir_overrides.get(&key).cloned() {
                         if byte_diff_mode {
                             info!(
@@ -1225,7 +1849,11 @@ fn apply_metadata_patches(
                         continue;
                     }
                     let norm_fields = normalize_directory_fields(node.entry_type, &node.fields);
-                    let existing = state.get_raw_owned(&key);
+                    let existing = local_before
+                        .get(&key)
+                        .cloned()
+                        .flatten()
+                        .or_else(|| state.get_raw_owned(&key));
                     let created_earlier_in_ledger = created_seen.contains_key(&node.ledger_index);
                     if node.entry_type == 0x0064 {
                         let has_indexes = node
@@ -1234,9 +1862,7 @@ fn apply_metadata_patches(
                             .any(|f| f.type_code == 19 && f.field_code == 1);
                         if !has_indexes {
                             if let Some(override_sle) = modified_dir_overrides.get(&key).cloned() {
-                                if ledger_seq == 103483090
-                                    && watch_directory_key(&node.ledger_index)
-                                {
+                                if byte_diff_mode && watch_directory_key(&node.ledger_index) {
                                     info!(
                                         "DIR WATCH seq={} action=Modified key={} source=override sle_len={} tx_hash={}",
                                         ledger_seq,
@@ -1247,9 +1873,7 @@ fn apply_metadata_patches(
                                 }
                                 tx_ops.push((key, node.entry_type, Some(override_sle), false));
                                 continue;
-                            } else if ledger_seq == 103483090
-                                && watch_directory_key(&node.ledger_index)
-                            {
+                            } else if byte_diff_mode && watch_directory_key(&node.ledger_index) {
                                 warn!(
                                     "DIR WATCH seq={} action=Modified key={} source=patch_fallback reason=no_override tx_hash={}",
                                     ledger_seq,
@@ -1273,8 +1897,6 @@ fn apply_metadata_patches(
                         .collect();
                     let final_sle = if let Some(e) = existing {
                         if created_earlier_in_ledger {
-                            let related_offer_book =
-                                related_offer_book_for_directory_node(node, &tx_book_dirs);
                             // Merge type-17 fields from creation context into
                             // modification FinalFields so book directory fields
                             // aren't lost when the modification doesn't repeat them.
@@ -1436,6 +2058,21 @@ fn apply_metadata_patches(
                         }
                         continue;
                     };
+                    let final_sle = if node.entry_type == 0x0064 {
+                        let final_sle = crate::ledger::close::apply_directory_book_context(
+                            &key,
+                            final_sle,
+                            related_offer_book,
+                        );
+                        crate::ledger::close::apply_directory_index_delta(
+                            &key,
+                            final_sle,
+                            &node.fields,
+                            dir_index_deltas.get(&key),
+                        )
+                    } else {
+                        final_sle
+                    };
                     // Block incomplete book DirectoryNodes from entering state.
                     if node.entry_type == 0x0064 {
                         match crate::ledger::DirectoryNode::decode(&final_sle, key.0) {
@@ -1482,6 +2119,13 @@ fn apply_metadata_patches(
                             hex::encode_upper(&tx_hash[..8]),
                         );
                     }
+                    crate::ledger::close::remove_directory_entries_for_deleted_sle(
+                        state,
+                        key,
+                        node.entry_type,
+                        &node.fields,
+                        &tx_metadata_keys,
+                    );
                     tx_ops.push((key, node.entry_type, None, false));
                 }
             }
@@ -1504,6 +2148,31 @@ fn apply_metadata_patches(
             }
             applied += 1;
         }
+        for (key, entry_type, fields) in pending_created_not_found_cleanup {
+            crate::ledger::close::remove_directory_entries_for_deleted_sle(
+                state,
+                key,
+                entry_type,
+                &fields,
+                &tx_metadata_keys,
+            );
+        }
+        let authoritative_touched: Vec<(crate::ledger::Key, Option<Vec<u8>>)> = state
+            .take_tx_journal()
+            .into_iter()
+            .filter(|(key, before)| before.as_ref() != state.get_raw_owned(key).as_ref())
+            .collect();
+        for (key, _) in &authoritative_touched {
+            if !tx_metadata_keys.contains(key) {
+                non_metadata_authoritative_touch_keys.insert(*key);
+            }
+        }
+        crate::ledger::close::stamp_touched_previous_fields(
+            state,
+            &authoritative_touched,
+            tx_hash,
+            ledger_seq,
+        );
     }
     if byte_diff_mode {
         info!(
@@ -1527,8 +2196,29 @@ fn apply_metadata_patches(
         missing_modified_keys: missing_modified_keys.into_iter().collect(),
         created_override_miss_keys: created_override_miss_keys.into_iter().collect(),
         incomplete_book_dir_keys,
+        non_metadata_authoritative_touch_keys: non_metadata_authoritative_touch_keys
+            .into_iter()
+            .collect(),
         aborted: false,
     }
+}
+
+pub fn apply_metadata_patches_for_replay(
+    meta_with_hashes: &[([u8; 32], Vec<u8>)],
+    ledger_seq: u32,
+    created_overrides: &std::collections::HashMap<crate::ledger::Key, RpcLedgerEntryFetch>,
+    modified_dir_overrides: &std::collections::HashMap<crate::ledger::Key, Vec<u8>>,
+    per_tx_local_touched: &[crate::ledger::close::TxLocalTouched],
+    state: &mut crate::ledger::LedgerState,
+) {
+    let _ = apply_metadata_patches(
+        meta_with_hashes,
+        ledger_seq,
+        created_overrides,
+        modified_dir_overrides,
+        per_tx_local_touched,
+        state,
+    );
 }
 
 fn prune_engine_only_transients(
@@ -1590,20 +2280,33 @@ async fn fetch_created_sle_overrides(
     rpc_port: u16,
     ledger_seq: u32,
     meta_with_hashes: &[([u8; 32], Vec<u8>)],
-) -> std::collections::HashMap<crate::ledger::Key, Vec<u8>> {
+) -> std::collections::HashMap<crate::ledger::Key, RpcLedgerEntryFetch> {
     const OVERRIDE_FETCH_TIMEOUT_SECS: u64 = 5;
     const OVERRIDE_RETRY_TIMEOUT_SECS: u64 = 8;
     const OVERRIDE_RETRY_ATTEMPTS: usize = 3;
     let mut created_keys = std::collections::BTreeSet::new();
+    let mut all_meta: Vec<(u32, Vec<crate::ledger::meta::AffectedNode>)> = Vec::new();
     for (_tx_hash, meta_blob) in meta_with_hashes {
-        let nodes =
-            match std::panic::catch_unwind(|| crate::ledger::meta::parse_metadata(meta_blob)) {
-                Ok(nodes) => nodes,
-                Err(_) => continue,
-            };
+        let (idx, nodes) = match std::panic::catch_unwind(|| {
+            crate::ledger::meta::parse_metadata_with_index(meta_blob)
+        }) {
+            Ok((idx, nodes)) => (idx.unwrap_or(u32::MAX), nodes),
+            Err(_) => continue,
+        };
+        all_meta.push((idx, nodes));
+    }
+    all_meta.sort_by_key(|(idx, _)| *idx);
+    let created_keys_referenced_later =
+        crate::ledger::close::collect_created_keys_referenced_later_from_sorted_meta(
+            all_meta.iter().map(|(_, nodes)| nodes.as_slice()),
+        );
+    for (_idx, nodes) in all_meta {
         for node in nodes {
             if node.action == crate::ledger::meta::Action::Created {
-                created_keys.insert(crate::ledger::Key(node.ledger_index));
+                let key = crate::ledger::Key(node.ledger_index);
+                if !created_keys_referenced_later.contains(&key) {
+                    created_keys.insert(key);
+                }
             }
         }
     }
@@ -1621,17 +2324,16 @@ async fn fetch_created_sle_overrides(
             );
             let fetched = tokio::time::timeout(
                 std::time::Duration::from_secs(OVERRIDE_FETCH_TIMEOUT_SECS),
-                fetch_sle_binary(&host, rpc_port, &req),
+                fetch_sle_binary_status(&host, rpc_port, &req),
             )
             .await
-            .ok()
-            .flatten();
+            .unwrap_or(RpcLedgerEntryFetch::Unavailable);
             (key, fetched)
         });
     }
     while let Some(res) = join_set.join_next().await {
-        if let Ok((key, Some(data))) = res {
-            out.insert(key, data);
+        if let Ok((key, fetched)) = res {
+            out.insert(key, fetched);
         }
     }
     // Retry misses with longer timeout and multiple attempts.
@@ -1640,7 +2342,12 @@ async fn fetch_created_sle_overrides(
     let misses: Vec<crate::ledger::Key> = created_keys
         .iter()
         .copied()
-        .filter(|k| !out.contains_key(k))
+        .filter(|k| {
+            !matches!(
+                out.get(k),
+                Some(RpcLedgerEntryFetch::Found(_)) | Some(RpcLedgerEntryFetch::NotFound)
+            )
+        })
         .collect();
     let mut retry_set = tokio::task::JoinSet::new();
     let mut i = 0usize;
@@ -1655,16 +2362,15 @@ async fn fetch_created_sle_overrides(
                     hex::encode(key.0),
                     ledger_seq
                 );
-                let mut fetched: Option<Vec<u8>> = None;
+                let mut fetched = RpcLedgerEntryFetch::Unavailable;
                 for _ in 0..OVERRIDE_RETRY_ATTEMPTS {
                     fetched = tokio::time::timeout(
                         std::time::Duration::from_secs(OVERRIDE_RETRY_TIMEOUT_SECS),
-                        fetch_sle_binary(&host, rpc_port, &req),
+                        fetch_sle_binary_status(&host, rpc_port, &req),
                     )
                     .await
-                    .ok()
-                    .flatten();
-                    if fetched.is_some() {
+                    .unwrap_or(RpcLedgerEntryFetch::Unavailable);
+                    if !matches!(fetched, RpcLedgerEntryFetch::Unavailable) {
                         break;
                     }
                 }
@@ -1672,18 +2378,23 @@ async fn fetch_created_sle_overrides(
             });
         }
         if let Some(joined) = retry_set.join_next().await {
-            if let Ok((key, Some(data))) = joined {
-                out.insert(key, data);
+            if let Ok((key, fetched)) = joined {
+                out.insert(key, fetched);
             }
         }
     }
     info!(
-        "follower: created overrides fetched {}/{} for ledger {} via {}:{} ({}s initial timeout, {} retry timeout x{} attempts)",
-        out.len(),
+        "follower: created overrides fetched {}/{} for ledger {} via {}:{} (not_found={} {}s initial timeout, {} retry timeout x{} attempts)",
+        out.values()
+            .filter(|status| matches!(status, RpcLedgerEntryFetch::Found(_)))
+            .count(),
         total_created,
         ledger_seq,
         rpc_host,
         rpc_port,
+        out.values()
+            .filter(|status| matches!(status, RpcLedgerEntryFetch::NotFound))
+            .count(),
         OVERRIDE_FETCH_TIMEOUT_SECS,
         OVERRIDE_RETRY_TIMEOUT_SECS,
         OVERRIDE_RETRY_ATTEMPTS,
@@ -1691,19 +2402,13 @@ async fn fetch_created_sle_overrides(
     out
 }
 
-async fn fetch_modified_directory_overrides(
+async fn fetch_modified_overrides(
     rpc_host: &str,
     rpc_port: u16,
     ledger_seq: u32,
     meta_with_hashes: &[([u8; 32], Vec<u8>)],
 ) -> std::collections::HashMap<crate::ledger::Key, Vec<u8>> {
     const OVERRIDE_FETCH_TIMEOUT_SECS: u64 = 5;
-    fn watch_directory_key(key: &[u8; 32]) -> bool {
-        let k = hex::encode_upper(key);
-        k == "28516E970A801B5AE4C34A5A5F7BB8A63263E481504D85066F61BBE1A3AC1123"
-            || k == "C78241CA86D8FD33D7930F713AE3A89D7CE23C52BB46E39526E627CCF5964E32"
-            || k == "6065A06AFD2A13DE1A5F389523C4B4E96FEE17950D4078C12183CCA79542A434"
-    }
     let mut keys = std::collections::BTreeSet::new();
     for (_tx_hash, meta_blob) in meta_with_hashes {
         let nodes =
@@ -1712,38 +2417,12 @@ async fn fetch_modified_directory_overrides(
                 Err(_) => continue,
             };
         for node in nodes {
-            if node.entry_type != 0x0064 || node.action != crate::ledger::meta::Action::Modified {
-                continue;
-            }
-            let has_indexes = node
-                .fields
-                .iter()
-                .any(|f| f.type_code == 19 && f.field_code == 1);
-            if !has_indexes {
+            if node.action == crate::ledger::meta::Action::Modified {
                 keys.insert(crate::ledger::Key(node.ledger_index));
             }
         }
     }
     let total = keys.len();
-    if ledger_seq == 103483090 {
-        let watch: Vec<String> = keys
-            .iter()
-            .filter(|k| watch_directory_key(&k.0))
-            .map(|k| hex::encode_upper(k.0))
-            .collect();
-        info!(
-            "follower: modified DirectoryNode overrides candidates={} watch_hits={} seq={}",
-            total,
-            watch.len(),
-            ledger_seq
-        );
-        if !watch.is_empty() {
-            info!(
-                "follower: modified DirectoryNode watch candidates={:?}",
-                watch
-            );
-        }
-    }
     let mut out = std::collections::HashMap::new();
     let mut join_set = tokio::task::JoinSet::new();
     for key in keys {
@@ -1770,7 +2449,7 @@ async fn fetch_modified_directory_overrides(
         }
     }
     info!(
-        "follower: modified DirectoryNode overrides fetched {}/{} for ledger {} via {}:{} ({}s timeout each)",
+        "follower: modified overrides fetched {}/{} for ledger {} via {}:{} ({}s timeout each)",
         out.len(),
         total,
         ledger_seq,
@@ -1778,104 +2457,175 @@ async fn fetch_modified_directory_overrides(
         rpc_port,
         OVERRIDE_FETCH_TIMEOUT_SECS,
     );
-    if ledger_seq == 103483090 {
-        let watch_fetched = out.keys().filter(|k| watch_directory_key(&k.0)).count();
-        info!(
-            "follower: modified DirectoryNode watch fetched={}/3 for seq={}",
-            watch_fetched, ledger_seq
-        );
-    }
     out
 }
 
-async fn fetch_multi_modified_overrides(
-    rpc_host: &str,
-    rpc_port: u16,
-    ledger_seq: u32,
+fn collect_auxiliary_non_metadata_touched_keys(
     meta_with_hashes: &[([u8; 32], Vec<u8>)],
-) -> std::collections::HashMap<crate::ledger::Key, Vec<u8>> {
-    const OVERRIDE_FETCH_TIMEOUT_SECS: u64 = 5;
-    let mut key_counts: std::collections::HashMap<crate::ledger::Key, usize> =
-        std::collections::HashMap::new();
-    for (_tx_hash, meta_blob) in meta_with_hashes {
+    per_tx_local_touched: &[crate::ledger::close::TxLocalTouched],
+) -> Vec<crate::ledger::Key> {
+    let local_by_tx: std::collections::HashMap<[u8; 32], &[(crate::ledger::Key, Option<Vec<u8>>)]> =
+        per_tx_local_touched
+            .iter()
+            .map(|tx| (tx.tx_id, tx.touched.as_slice()))
+            .collect();
+
+    let mut out = std::collections::BTreeSet::new();
+    for (tx_hash, meta_blob) in meta_with_hashes {
         let nodes =
             match std::panic::catch_unwind(|| crate::ledger::meta::parse_metadata(meta_blob)) {
                 Ok(nodes) => nodes,
                 Err(_) => continue,
             };
-        for node in nodes {
-            if node.action == crate::ledger::meta::Action::Modified {
-                let key = crate::ledger::Key(node.ledger_index);
-                *key_counts.entry(key).or_insert(0) += 1;
+        let metadata_keys: std::collections::HashSet<crate::ledger::Key> = nodes
+            .iter()
+            .map(|node| crate::ledger::Key(node.ledger_index))
+            .collect();
+        let Some(local_touched) = local_by_tx.get(tx_hash) else {
+            continue;
+        };
+        for (key, _) in *local_touched {
+            if !metadata_keys.contains(key) {
+                out.insert(*key);
             }
         }
     }
-    let keys: Vec<crate::ledger::Key> = key_counts
-        .iter()
-        .filter_map(|(k, c)| if *c > 1 { Some(*k) } else { None })
-        .collect();
-    let total = keys.len();
-    let mut out = std::collections::HashMap::new();
-    let mut join_set = tokio::task::JoinSet::new();
-    for key in keys {
-        let host = rpc_host.to_string();
-        join_set.spawn(async move {
-            let req = format!(
-                r#"{{"method":"ledger_entry","params":[{{"index":"{}","ledger_index":{},"binary":true}}]}}"#,
-                hex::encode(key.0),
-                ledger_seq
-            );
-            let fetched = tokio::time::timeout(
-                std::time::Duration::from_secs(OVERRIDE_FETCH_TIMEOUT_SECS),
-                fetch_sle_binary(&host, rpc_port, &req),
-            )
-            .await
-            .ok()
-            .flatten();
-            (key, fetched)
-        });
-    }
-    while let Some(res) = join_set.join_next().await {
-        if let Ok((key, Some(data))) = res {
-            out.insert(key, data);
+    out.into_iter().collect()
+}
+
+fn collect_auxiliary_non_metadata_touch_sources(
+    meta_with_hashes: &[([u8; 32], Vec<u8>)],
+    per_tx_local_touched: &[crate::ledger::close::TxLocalTouched],
+) -> std::collections::HashMap<crate::ledger::Key, Vec<(u32, [u8; 32])>> {
+    let local_by_tx: std::collections::HashMap<[u8; 32], &crate::ledger::close::TxLocalTouched> =
+        per_tx_local_touched
+            .iter()
+            .map(|tx| (tx.tx_id, tx))
+            .collect();
+
+    let mut out = std::collections::HashMap::<crate::ledger::Key, Vec<(u32, [u8; 32])>>::new();
+    for (tx_hash, meta_blob) in meta_with_hashes {
+        let nodes =
+            match std::panic::catch_unwind(|| crate::ledger::meta::parse_metadata(meta_blob)) {
+                Ok(nodes) => nodes,
+                Err(_) => continue,
+            };
+        let metadata_keys: std::collections::HashSet<crate::ledger::Key> = nodes
+            .iter()
+            .map(|node| crate::ledger::Key(node.ledger_index))
+            .collect();
+        let Some(local_touched) = local_by_tx.get(tx_hash) else {
+            continue;
+        };
+        for (key, _) in &local_touched.touched {
+            if !metadata_keys.contains(key) {
+                out.entry(*key)
+                    .or_default()
+                    .push((local_touched.tx_index, local_touched.tx_id));
+            }
         }
     }
+    out
+}
+
+async fn fetch_auxiliary_touched_overrides(
+    rpc_host: &str,
+    rpc_port: u16,
+    ledger_seq: u32,
+    keys: &[crate::ledger::Key],
+) -> std::collections::HashMap<crate::ledger::Key, RpcLedgerEntryFetch> {
+    use tokio::task::JoinSet;
+    const AUX_TIMEOUT_SECS: u64 = 6;
+    const AUX_CONCURRENCY: usize = 16;
+
+    let mut out = std::collections::HashMap::new();
+    if keys.is_empty() {
+        return out;
+    }
+
+    let mut tasks = JoinSet::new();
+    let mut i = 0usize;
+    while i < keys.len() || !tasks.is_empty() {
+        while i < keys.len() && tasks.len() < AUX_CONCURRENCY {
+            let key = keys[i];
+            i += 1;
+            let host = rpc_host.to_string();
+            tasks.spawn(async move {
+                let req = format!(
+                    r#"{{"method":"ledger_entry","params":[{{"index":"{}","ledger_index":{},"binary":true}}]}}"#,
+                    hex::encode(key.0),
+                    ledger_seq
+                );
+                let fetched = tokio::time::timeout(
+                    std::time::Duration::from_secs(AUX_TIMEOUT_SECS),
+                    fetch_sle_binary_status(&host, rpc_port, &req),
+                )
+                .await
+                .unwrap_or(RpcLedgerEntryFetch::Unavailable);
+                (key, fetched)
+            });
+        }
+
+        if let Some(joined) = tasks.join_next().await {
+            if let Ok((key, fetched)) = joined {
+                out.insert(key, fetched);
+            }
+        }
+    }
+
     info!(
-        "follower: multi-modified overrides fetched {}/{} for ledger {} via {}:{}",
-        out.len(),
-        total,
+        "follower: auxiliary overrides fetched {}/{} for ledger {} via {}:{} (not_found={} unavailable={} {}s timeout each)",
+        out.values()
+            .filter(|status| matches!(status, RpcLedgerEntryFetch::Found(_)))
+            .count(),
+        keys.len(),
         ledger_seq,
         rpc_host,
         rpc_port,
+        out.values()
+            .filter(|status| matches!(status, RpcLedgerEntryFetch::NotFound))
+            .count(),
+        out.values()
+            .filter(|status| matches!(status, RpcLedgerEntryFetch::Unavailable))
+            .count(),
+        AUX_TIMEOUT_SECS,
     );
     out
+}
+
+fn collect_created_same_ledger_keys_from_nodes(
+    tx_nodes: &[Vec<crate::ledger::meta::AffectedNode>],
+) -> std::collections::BTreeSet<crate::ledger::Key> {
+    tx_nodes
+        .iter()
+        .flat_map(|nodes| nodes.iter())
+        .filter(|node| node.action == crate::ledger::meta::Action::Created)
+        .map(|node| crate::ledger::Key(node.ledger_index))
+        .collect()
 }
 
 fn collect_missing_modified_base_keys_from_nodes(
     state: &crate::ledger::LedgerState,
     tx_nodes: &[Vec<crate::ledger::meta::AffectedNode>],
 ) -> Vec<crate::ledger::Key> {
-    let mut created_seen = std::collections::BTreeSet::<[u8; 32]>::new();
+    let created_same_ledger = collect_created_same_ledger_keys_from_nodes(tx_nodes);
     let mut missing = std::collections::BTreeSet::<crate::ledger::Key>::new();
 
     for nodes in tx_nodes {
         for node in nodes {
             match node.action {
-                crate::ledger::meta::Action::Created => {
-                    created_seen.insert(node.ledger_index);
-                }
-                crate::ledger::meta::Action::Modified => {
-                    if created_seen.contains(&node.ledger_index) {
+                crate::ledger::meta::Action::Created => {}
+                crate::ledger::meta::Action::Modified | crate::ledger::meta::Action::Deleted => {
+                    let key = crate::ledger::Key(node.ledger_index);
+                    if created_same_ledger.contains(&key) {
                         continue;
                     }
-                    let key = crate::ledger::Key(node.ledger_index);
                     if state.get_raw_owned(&key).is_none()
                         && state.get_committed_raw_owned(&key).is_none()
                     {
                         missing.insert(key);
                     }
                 }
-                crate::ledger::meta::Action::Deleted => {}
             }
         }
     }
@@ -1899,6 +2649,189 @@ fn collect_missing_modified_base_keys(
     collect_missing_modified_base_keys_from_nodes(state, &parsed)
 }
 
+fn modified_base_needs_typed_hydration(
+    state: &crate::ledger::LedgerState,
+    entry_type: u16,
+    key: &crate::ledger::Key,
+    raw: &[u8],
+) -> bool {
+    match entry_type {
+        0x0061 => crate::ledger::AccountRoot::decode(raw)
+            .ok()
+            .map(|acct| state.get_account(&acct.account_id).is_none())
+            .unwrap_or(true),
+        0x0064 => state.get_directory(key).is_none(),
+        0x006f => state.get_offer(key).is_none(),
+        0x0072 => state.get_trustline(key).is_none(),
+        _ => false,
+    }
+}
+
+fn hydrate_present_modified_base_keys_from_nodes(
+    state: &mut crate::ledger::LedgerState,
+    tx_nodes: &[Vec<crate::ledger::meta::AffectedNode>],
+) -> usize {
+    let created_same_ledger = collect_created_same_ledger_keys_from_nodes(tx_nodes);
+    let mut hydrated = 0usize;
+    let mut seen = std::collections::BTreeSet::<crate::ledger::Key>::new();
+
+    for nodes in tx_nodes {
+        for node in nodes {
+            match node.action {
+                crate::ledger::meta::Action::Created => {}
+                crate::ledger::meta::Action::Modified | crate::ledger::meta::Action::Deleted => {
+                    let key = crate::ledger::Key(node.ledger_index);
+                    if created_same_ledger.contains(&key) {
+                        continue;
+                    }
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let Some(raw) = state
+                        .get_raw_owned(&key)
+                        .or_else(|| state.get_committed_raw_owned(&key))
+                    else {
+                        continue;
+                    };
+                    if modified_base_needs_typed_hydration(state, node.entry_type, &key, &raw) {
+                        sync_typed(state, node.entry_type, &key, &raw);
+                        hydrated += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    hydrated
+}
+
+fn hydrate_present_modified_base_keys(
+    state: &mut crate::ledger::LedgerState,
+    meta_with_hashes: &[([u8; 32], Vec<u8>)],
+) -> usize {
+    let mut parsed = Vec::with_capacity(meta_with_hashes.len());
+    for (_tx_hash, meta_blob) in meta_with_hashes {
+        let nodes =
+            match std::panic::catch_unwind(|| crate::ledger::meta::parse_metadata(meta_blob)) {
+                Ok(nodes) => nodes,
+                Err(_) => continue,
+            };
+        parsed.push(nodes);
+    }
+    hydrate_present_modified_base_keys_from_nodes(state, &parsed)
+}
+
+fn insert_replay_prerequisite_account(
+    keys: &mut std::collections::BTreeSet<crate::ledger::Key>,
+    account: &[u8; 20],
+) {
+    keys.insert(crate::ledger::account::shamap_key(account));
+}
+
+fn insert_replay_prerequisite_trustline(
+    keys: &mut std::collections::BTreeSet<crate::ledger::Key>,
+    account: &[u8; 20],
+    issuer: &[u8; 20],
+    currency: &crate::transaction::amount::Currency,
+) {
+    if account != issuer {
+        keys.insert(crate::ledger::trustline::shamap_key(
+            account, issuer, currency,
+        ));
+    }
+}
+
+fn collect_payment_replay_prerequisite_keys(
+    parsed: &crate::transaction::ParsedTx,
+    keys: &mut std::collections::BTreeSet<crate::ledger::Key>,
+) {
+    if let Some(destination) = parsed.destination {
+        insert_replay_prerequisite_account(keys, &destination);
+    }
+
+    if let Some(crate::transaction::Amount::Iou {
+        currency, issuer, ..
+    }) = parsed.amount.as_ref()
+    {
+        insert_replay_prerequisite_account(keys, issuer);
+        insert_replay_prerequisite_trustline(keys, &parsed.account, issuer, currency);
+        if let Some(destination) = parsed.destination {
+            insert_replay_prerequisite_trustline(keys, &destination, issuer, currency);
+        }
+    }
+
+    if let Some(crate::transaction::Amount::Iou {
+        currency, issuer, ..
+    }) = parsed.send_max.as_ref()
+    {
+        insert_replay_prerequisite_account(keys, issuer);
+        insert_replay_prerequisite_trustline(keys, &parsed.account, issuer, currency);
+    }
+
+    if let Some(crate::transaction::Amount::Iou {
+        currency, issuer, ..
+    }) = parsed.deliver_min.as_ref()
+    {
+        insert_replay_prerequisite_account(keys, issuer);
+        if let Some(destination) = parsed.destination {
+            insert_replay_prerequisite_trustline(keys, &destination, issuer, currency);
+        }
+    }
+
+    for path in &parsed.paths {
+        for step in path {
+            if let Some(account) = step.account {
+                insert_replay_prerequisite_account(keys, &account);
+                if let Some(issuer) = step.issuer {
+                    insert_replay_prerequisite_account(keys, &issuer);
+                    if let Some(currency_bytes) = step.currency {
+                        let currency = crate::transaction::amount::Currency {
+                            code: currency_bytes,
+                        };
+                        insert_replay_prerequisite_trustline(keys, &account, &issuer, &currency);
+                    }
+                }
+            } else if let Some(issuer) = step.issuer {
+                insert_replay_prerequisite_account(keys, &issuer);
+            }
+        }
+    }
+}
+
+fn collect_replay_prerequisite_keys_for_parsed(
+    parsed: &crate::transaction::ParsedTx,
+    keys: &mut std::collections::BTreeSet<crate::ledger::Key>,
+) {
+    match parsed.tx_type {
+        7 => {
+            if let Some(crate::transaction::Amount::Iou {
+                currency, issuer, ..
+            }) = parsed.taker_gets.as_ref()
+            {
+                insert_replay_prerequisite_trustline(keys, &parsed.account, issuer, currency);
+            }
+        }
+        8 => {
+            if let Some(target_seq) = parsed.offer_sequence {
+                keys.insert(crate::ledger::offer::shamap_key(
+                    &parsed.account,
+                    target_seq,
+                ));
+            }
+        }
+        0 => collect_payment_replay_prerequisite_keys(parsed, keys),
+        20 => {
+            if let Some(crate::transaction::Amount::Iou {
+                currency, issuer, ..
+            }) = parsed.limit_amount.as_ref()
+            {
+                insert_replay_prerequisite_trustline(keys, &parsed.account, issuer, currency);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_replay_prerequisite_keys(
     tx_blobs: &[(Vec<u8>, Vec<u8>)],
 ) -> std::collections::BTreeSet<crate::ledger::Key> {
@@ -1908,35 +2841,7 @@ fn collect_replay_prerequisite_keys(
         let Ok(parsed) = crate::transaction::parse_blob(blob) else {
             continue;
         };
-
-        match parsed.tx_type {
-            7 => {
-                if let Some(crate::transaction::Amount::Iou {
-                    currency, issuer, ..
-                }) = parsed.taker_gets.as_ref()
-                {
-                    if parsed.account != *issuer {
-                        keys.insert(crate::ledger::trustline::shamap_key(
-                            &parsed.account,
-                            issuer,
-                            currency,
-                        ));
-                    }
-                }
-            }
-            0 => {
-                let is_iou_amount =
-                    matches!(parsed.amount.as_ref(), Some(crate::transaction::Amount::Iou { .. }));
-                let use_ripple =
-                    !parsed.paths.is_empty() || parsed.send_max.is_some() || is_iou_amount;
-                if !use_ripple {
-                    if let Some(destination) = parsed.destination {
-                        keys.insert(crate::ledger::account::shamap_key(&destination));
-                    }
-                }
-            }
-            _ => {}
-        }
+        collect_replay_prerequisite_keys_for_parsed(&parsed, &mut keys);
     }
 
     keys
@@ -1945,11 +2850,35 @@ fn collect_replay_prerequisite_keys(
 fn collect_missing_replay_prerequisite_keys(
     state: &crate::ledger::LedgerState,
     tx_blobs: &[(Vec<u8>, Vec<u8>)],
+    meta_with_hashes: &[([u8; 32], Vec<u8>)],
 ) -> Vec<crate::ledger::Key> {
-    collect_replay_prerequisite_keys(tx_blobs)
-        .into_iter()
+    let mut parsed = Vec::with_capacity(meta_with_hashes.len());
+    for (_tx_hash, meta_blob) in meta_with_hashes {
+        let nodes =
+            match std::panic::catch_unwind(|| crate::ledger::meta::parse_metadata(meta_blob)) {
+                Ok(nodes) => nodes,
+                Err(_) => continue,
+            };
+        parsed.push(nodes);
+    }
+    let created_same_ledger = collect_created_same_ledger_keys_from_nodes(&parsed);
+    filter_missing_replay_prerequisite_keys(
+        state,
+        collect_replay_prerequisite_keys(tx_blobs),
+        &created_same_ledger,
+    )
+}
+
+fn filter_missing_replay_prerequisite_keys(
+    state: &crate::ledger::LedgerState,
+    keys: std::collections::BTreeSet<crate::ledger::Key>,
+    created_same_ledger: &std::collections::BTreeSet<crate::ledger::Key>,
+) -> Vec<crate::ledger::Key> {
+    keys.into_iter()
         .filter(|key| {
-            state.get_raw_owned(key).is_none() && state.get_committed_raw_owned(key).is_none()
+            !created_same_ledger.contains(key)
+                && state.get_raw_owned(key).is_none()
+                && state.get_committed_raw_owned(key).is_none()
         })
         .collect()
 }
@@ -2148,6 +3077,15 @@ fn request_resync_and_stop_follower(follower_state: &FollowerState) {
         .resync_requested
         .store(true, Ordering::SeqCst);
     stop_follower(follower_state);
+}
+
+fn should_attempt_authoritative_reconcile(
+    sync_complete: bool,
+    matched: bool,
+    first_post_sync_seq: Option<u32>,
+    seq: u32,
+) -> bool {
+    sync_complete && !matched && first_post_sync_seq != Some(seq)
 }
 
 fn try_flush_follow_state(state: &mut crate::ledger::LedgerState) -> std::io::Result<[u8; 32]> {
@@ -2850,14 +3788,15 @@ pub async fn run_follower(
                 .collect();
             let created_overrides =
                 fetch_created_sle_overrides(&rpc_host, rpc_port, seq, &meta_with_hashes).await;
-            let mut modified_overrides =
-                fetch_modified_directory_overrides(&rpc_host, rpc_port, seq, &meta_with_hashes)
-                    .await;
-            let multi_modified_overrides =
-                fetch_multi_modified_overrides(&rpc_host, rpc_port, seq, &meta_with_hashes).await;
-            modified_overrides.extend(multi_modified_overrides);
+            let modified_overrides =
+                fetch_modified_overrides(&rpc_host, rpc_port, seq, &meta_with_hashes).await;
             let metadata_deleted_keys = collect_deleted_metadata_keys(&meta_with_hashes);
             let meta_with_hashes_for_blocking = meta_with_hashes.clone();
+
+            let hydrated_present_modified_bases = {
+                let mut ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                hydrate_present_modified_base_keys(&mut ls, &meta_with_hashes)
+            };
 
             let missing_modified_base_keys = {
                 let ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2865,7 +3804,7 @@ pub async fn run_follower(
             };
             let missing_replay_prereq_keys = {
                 let ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
-                collect_missing_replay_prerequisite_keys(&ls, &blobs)
+                collect_missing_replay_prerequisite_keys(&ls, &blobs, &meta_with_hashes)
             };
             let mut preload_keys = std::collections::BTreeSet::<crate::ledger::Key>::new();
             preload_keys.extend(missing_modified_base_keys.iter().copied());
@@ -2889,13 +3828,44 @@ pub async fn run_follower(
                         }
                     }
                 }
+                let unresolved_preload_keys: Vec<String> = preload_keys
+                    .iter()
+                    .filter(|key| !authoritative_bases.contains_key(*key))
+                    .map(|key| {
+                        let source = match (
+                            missing_modified_base_keys.contains(key),
+                            missing_replay_prereq_keys.contains(key),
+                        ) {
+                            (true, true) => "modified+prereq",
+                            (true, false) => "modified",
+                            (false, true) => "prereq",
+                            (false, false) => "unknown",
+                        };
+                        format!("{}:{}", source, hex::encode_upper(key.0))
+                    })
+                    .collect();
                 info!(
-                    "follower: preloaded {}/{} replay prerequisite object(s) (modified_base={} extra_prereq={}) from authoritative ledger {} before replaying seq={}",
+                    "follower: preloaded {}/{} replay prerequisite object(s) (modified_base={} extra_prereq={} hydrated_local_base={}) from authoritative ledger {} before replaying seq={}",
                     authoritative_bases.len(),
                     preload_keys.len(),
                     missing_modified_base_keys.len(),
                     missing_replay_prereq_keys.len(),
+                    hydrated_present_modified_bases,
                     parent.sequence,
+                    seq,
+                );
+                if !unresolved_preload_keys.is_empty() {
+                    warn!(
+                        "follower: unresolved replay prerequisite keys for parent ledger {} before seq={}: {}",
+                        parent.sequence,
+                        seq,
+                        unresolved_preload_keys.join(", "),
+                    );
+                }
+            } else if hydrated_present_modified_bases > 0 {
+                info!(
+                    "follower: hydrated {} replay prerequisite object(s) from local raw state before replaying seq={}",
+                    hydrated_present_modified_bases,
                     seq,
                 );
             }
@@ -2918,6 +3888,8 @@ pub async fn run_follower(
             } else {
                 None
             };
+            let created_overrides_for_blocking = created_overrides.clone();
+            let modified_overrides_for_blocking = modified_overrides.clone();
 
             // Replay ledger + metadata patching on blocking thread to avoid
             // stalling the tokio executor (CPU-bound, holds std::sync::Mutex).
@@ -2984,8 +3956,13 @@ pub async fn run_follower(
                     };
 
                 let replay_t0 = std::time::Instant::now();
-                let mut rr = crate::ledger::close::replay_ledger(
-                    &parent_owned, &mut ls, blobs, &seq_header_owned, byte_diff_capture,
+                let mut rr = crate::ledger::close::replay_ledger_with_created_overrides(
+                    &parent_owned,
+                    &mut ls,
+                    blobs,
+                    &seq_header_owned,
+                    byte_diff_capture,
+                    Some(&created_overrides_for_blocking),
                 );
                 let replay_ms = replay_t0.elapsed().as_millis();
 
@@ -3007,8 +3984,9 @@ pub async fn run_follower(
                     let patched = apply_metadata_patches(
                         &meta_with_hashes_for_blocking,
                         seq,
-                        &created_overrides,
-                        &modified_overrides,
+                        &created_overrides_for_blocking,
+                        &modified_overrides_for_blocking,
+                        &rr.per_tx_local_touched,
                         &mut ls,
                     );
                     if patched.aborted {
@@ -3020,13 +3998,42 @@ pub async fn run_follower(
                         );
                     } else {
                         tracing::info!(
-                            "follower: metadata patches applied at seq={} patched={} missing_modified={} created_override_misses={} incomplete_book_dirs={}",
+                            "follower: metadata patches applied at seq={} patched={} missing_modified={} created_override_misses={} incomplete_book_dirs={} non_metadata_authoritative_touches={}",
                             seq,
                             patched.applied,
                             patched.missing_modified,
                             patched.created_override_miss_keys.len(),
                             patched.incomplete_book_dir_keys.len(),
+                            patched.non_metadata_authoritative_touch_keys.len(),
                         );
+                        if !patched.created_override_miss_keys.is_empty()
+                            && patched.created_override_miss_keys.len() <= 8
+                        {
+                            tracing::info!(
+                                "follower: created override miss keys at seq={}: {}",
+                                seq,
+                                patched
+                                    .created_override_miss_keys
+                                    .iter()
+                                    .map(|key| hex::encode_upper(key.0))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            );
+                        }
+                        if !patched.non_metadata_authoritative_touch_keys.is_empty()
+                            && patched.non_metadata_authoritative_touch_keys.len() <= 16
+                        {
+                            tracing::info!(
+                                "follower: non-metadata authoritative touch keys at seq={}: {}",
+                                seq,
+                                patched
+                                    .non_metadata_authoritative_touch_keys
+                                    .iter()
+                                    .map(|key| hex::encode_upper(key.0))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            );
+                        }
                     }
                     (patched, patch_t0.elapsed().as_millis())
                 };
@@ -3148,8 +4155,9 @@ pub async fn run_follower(
                 missing_modified_keys,
                 created_miss_keys,
                 incomplete_book_dirs,
+                non_metadata_authoritative_touch_keys,
                 prestate_captured,
-                pristine_base_snapshot,
+                mut pristine_base_snapshot,
                 post_state,
             ) = match blocking_result {
                 Ok(Ok((rr, p, pruned, _lock_wait, prestate, pristine_base, post))) => (
@@ -3160,6 +4168,7 @@ pub async fn run_follower(
                     p.missing_modified_keys,
                     p.created_override_miss_keys,
                     p.incomplete_book_dir_keys,
+                    p.non_metadata_authoritative_touch_keys,
                     prestate,
                     pristine_base,
                     post,
@@ -3371,11 +4380,126 @@ pub async fn run_follower(
                 }
             }
 
-            // compare_engine_touched_keys disabled — was causing OOM
-            // from concurrent RPC fan-out. Diagnostics complete (diffs=0).
-            // if seq == 103483090 {
-            //     compare_engine_touched_keys(...).await;
-            // }
+            if replay_result.header.account_hash != seq_account_hash {
+                let mut auxiliary_keys = std::collections::BTreeSet::<crate::ledger::Key>::new();
+                auxiliary_keys.extend(collect_auxiliary_non_metadata_touched_keys(
+                    &meta_with_hashes,
+                    &replay_result.per_tx_local_touched,
+                ));
+                auxiliary_keys.extend(non_metadata_authoritative_touch_keys.iter().copied());
+                let auxiliary_keys: Vec<crate::ledger::Key> = auxiliary_keys.into_iter().collect();
+                if !auxiliary_keys.is_empty() {
+                    let auxiliary_touch_sources = if auxiliary_keys.len() <= 12 {
+                        Some(collect_auxiliary_non_metadata_touch_sources(
+                            &meta_with_hashes,
+                            &replay_result.per_tx_local_touched,
+                        ))
+                    } else {
+                        None
+                    };
+                    let auxiliary_overrides = fetch_auxiliary_touched_overrides(
+                        &rpc_host,
+                        rpc_port,
+                        seq,
+                        &auxiliary_keys,
+                    )
+                    .await;
+                    let mut applied_auxiliary = 0usize;
+                    if auxiliary_overrides
+                        .values()
+                        .any(|status| !matches!(status, RpcLedgerEntryFetch::Unavailable))
+                    {
+                        let mut ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                        for (key, status) in &auxiliary_overrides {
+                            match status {
+                                RpcLedgerEntryFetch::Found(raw) => {
+                                    authoritative_repair_keys.insert(*key);
+                                    ls.clear_typed_entry_for_key(key);
+                                    ls.insert_raw(*key, raw.clone());
+                                    if let Some(sle) =
+                                        crate::ledger::sle::SLE::from_raw(*key, raw.clone())
+                                    {
+                                        sync_typed(&mut ls, sle.entry_type() as u16, key, raw);
+                                    }
+                                    applied_auxiliary += 1;
+                                }
+                                RpcLedgerEntryFetch::NotFound => {
+                                    authoritative_repair_keys.insert(*key);
+                                    ls.clear_typed_entry_for_key(key);
+                                    ls.remove_raw(key);
+                                    applied_auxiliary += 1;
+                                }
+                                RpcLedgerEntryFetch::Unavailable => {}
+                            }
+                        }
+                        if applied_auxiliary > 0 {
+                            replay_result.header.account_hash = match try_flush_follow_state(
+                                &mut ls,
+                            ) {
+                                Ok(hash) => hash,
+                                Err(e) => {
+                                    drop(ls);
+                                    error!(
+                                        "follower: failed to flush auxiliary touched-key repair at seq={}: {}",
+                                        seq, e
+                                    );
+                                    request_resync_and_stop_follower(&follower_state);
+                                    return;
+                                }
+                            };
+                            replay_result.header.hash = replay_result.header.compute_hash();
+                            info!(
+                                "follower: replaced {} auxiliary non-metadata touched key(s) with authoritative bytes at seq={}",
+                                applied_auxiliary,
+                                seq,
+                            );
+                            if auxiliary_keys.len() <= 12 {
+                                let details = auxiliary_keys
+                                    .iter()
+                                    .map(|key| {
+                                        let status = match auxiliary_overrides.get(key) {
+                                            Some(RpcLedgerEntryFetch::Found(_)) => "found",
+                                            Some(RpcLedgerEntryFetch::NotFound) => "not_found",
+                                            Some(RpcLedgerEntryFetch::Unavailable) => "unavailable",
+                                            None => "missing",
+                                        };
+                                        format!("{}:{status}", hex::encode_upper(key.0))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                info!(
+                                    "follower: auxiliary repair keys at seq={}: {}",
+                                    seq, details,
+                                );
+                                if let Some(sources) = &auxiliary_touch_sources {
+                                    for key in &auxiliary_keys {
+                                        let Some(entries) = sources.get(key) else {
+                                            continue;
+                                        };
+                                        let detail = entries
+                                            .iter()
+                                            .map(|(tx_index, tx_id)| {
+                                                format!(
+                                                    "tx_index={} tx_id={}",
+                                                    tx_index,
+                                                    hex::encode_upper(&tx_id[..8]),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        info!(
+                                            "follower: auxiliary repair provenance seq={} key={} {}",
+                                            seq,
+                                            hex::encode_upper(key.0),
+                                            detail,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             if unresolved_missing_modified > 0 {
                 error!(
@@ -3391,27 +4515,31 @@ pub async fn run_follower(
                 let ss = shared_state.read().await;
                 ss.sync_done
             };
-            if !sync_complete {
+            let hash_check_ready = sync_complete || first_post_sync_seq == Some(seq);
+            if !hash_check_ready {
                 replay_result.header.account_hash = seq_account_hash;
                 replay_result.header.hash = replay_result.header.compute_hash();
             } else if replay_result.header.account_hash != seq_account_hash {
-                // Reconcile disabled — was causing OOM via state_hash() snapshot.
-                // Engine parity fixes should make this unnecessary.
+                // Reconcile is intentionally disabled here because full
+                // state-hash snapshots are too expensive in the follower loop.
                 info!(
                     "follower: engine hash mismatch seq={} local={} network={} (reconcile disabled)",
                     seq,
                     hex::encode_upper(&replay_result.header.account_hash[..8]),
                     hex::encode_upper(&seq_account_hash[..8]),
                 );
-                // Meta reconcile disabled — state_hash() snapshot causes OOM
+                // Metadata repair is handled by the authoritative replay path.
             }
 
             let mut matched =
-                sync_complete && replay_result.header.account_hash == seq_account_hash;
+                !hash_check_ready || replay_result.header.account_hash == seq_account_hash;
             let mut repaired_from_pristine_authoritative = false;
 
-            // Hash diff diagnostic: log both hashes for every built ledger
-            if sync_complete && !matched {
+            // Hash diff diagnostic: log both hashes for every built ledger.
+            // Only run the heavyweight RPC reconcile path once sync is fully
+            // complete. The first post-sync mismatch is our forensic capture
+            // point; trying to reconcile there can stall bundle capture.
+            if hash_check_ready && !matched {
                 warn!(
                     "HASH DIFF seq={}: local={} network={} parent_used={}",
                     seq,
@@ -3419,7 +4547,14 @@ pub async fn run_follower(
                     hex::encode_upper(&seq_account_hash[..16]),
                     hex::encode_upper(&replay_result.header.parent_hash[..8]),
                 );
+            }
 
+            if should_attempt_authoritative_reconcile(
+                sync_complete,
+                matched,
+                first_post_sync_seq,
+                seq,
+            ) {
                 let repair_scope: Vec<crate::ledger::Key> = {
                     let mut keys = std::collections::BTreeSet::new();
                     keys.extend(post_state.iter().map(|(key, _)| crate::ledger::Key(*key)));
@@ -3437,21 +4572,16 @@ pub async fn run_follower(
                 let explicit_delete_keys = metadata_deleted_keys.clone();
 
                 if !repair_scope.is_empty() {
-                    let (
-                        upserted,
-                        removed,
-                        not_found,
-                        unavailable,
-                        authoritative_found,
-                    ) = reconcile_touched_keys_with_rpc(
-                        ledger_state.clone(),
-                        &repair_scope,
-                        &explicit_delete_keys,
-                        seq,
-                        &rpc_host,
-                        rpc_port,
-                    )
-                    .await;
+                    let (upserted, removed, not_found, unavailable, authoritative_found) =
+                        reconcile_touched_keys_with_rpc(
+                            ledger_state.clone(),
+                            &repair_scope,
+                            &explicit_delete_keys,
+                            seq,
+                            &rpc_host,
+                            rpc_port,
+                        )
+                        .await;
                     let mut repaired_hash = {
                         let mut ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
                         match try_flush_follow_state(&mut ls) {
@@ -3469,8 +4599,7 @@ pub async fn run_follower(
                     };
                     if repaired_hash != seq_account_hash {
                         let expanded_scope: Vec<crate::ledger::Key> = {
-                            let mut keys =
-                                std::collections::BTreeSet::<crate::ledger::Key>::new();
+                            let mut keys = std::collections::BTreeSet::<crate::ledger::Key>::new();
                             keys.extend(repair_scope.iter().copied());
                             let ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
                             let mut extra_sources: Vec<
@@ -3501,8 +4630,7 @@ pub async fn run_follower(
                             )
                             .await;
                             repaired_hash = {
-                                let mut ls =
-                                    ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
                                 match try_flush_follow_state(&mut ls) {
                                     Ok(hash) => hash,
                                     Err(e) => {
@@ -3576,12 +4704,12 @@ pub async fn run_follower(
             }
 
             let elapsed = tx_start.elapsed();
-            if matched {
+            if hash_check_ready && matched {
                 tx_engine_successes += 1;
             }
 
             // ── First-ledger diagnostic: prominent pass/fail after sync ──
-            if sync_complete && !first_hash_check_done {
+            if hash_check_ready && !first_hash_check_done {
                 first_hash_check_done = true;
                 if matched {
                     info!("========================================");
@@ -3604,7 +4732,7 @@ pub async fn run_follower(
                 }
             }
 
-            if sync_complete && first_post_sync_seq == Some(seq) {
+            if hash_check_ready && first_post_sync_seq == Some(seq) {
                 info!(
                     "follower first-post-sync replay: seq={} parent_used={} local_hash={} network_hash={} tx_applied={} tx_failed={} patched={} pruned_engine_only={}",
                     seq,
@@ -3619,7 +4747,7 @@ pub async fn run_follower(
             }
 
             let first_post_sync_mismatch =
-                sync_complete && !matched && first_post_sync_seq == Some(seq);
+                hash_check_ready && !matched && first_post_sync_seq == Some(seq);
             if first_post_sync_mismatch {
                 // Stop the follower before long forensic capture so the close-loop
                 // supervisor can see the degraded state immediately and avoid a
@@ -3630,7 +4758,16 @@ pub async fn run_follower(
                 stop_follower(&follower_state);
             }
 
-            if sync_complete && !matched {
+            if hash_check_ready && !matched {
+                if first_post_sync_seq == Some(seq) {
+                    info!(
+                        "forensic: preparing capture at seq={} tx_blobs_for_capture={} prestate_captured={} post_state_keys={}",
+                        seq,
+                        tx_blobs_for_capture.is_some(),
+                        prestate_captured.is_some(),
+                        post_state.len(),
+                    );
+                }
                 // Forensic capture: when this is the first ledger after the
                 // sync anchor (byte_diff_capture was true), dump everything
                 // required for offline `replay_fixture` iteration before
@@ -3638,7 +4775,139 @@ pub async fn run_follower(
                 if let (Some(blobs_saved), Some(prestate)) =
                     (tx_blobs_for_capture.clone(), prestate_captured.clone())
                 {
-                    let touched_raw: Vec<[u8; 32]> = post_state.iter().map(|(k, _)| *k).collect();
+                    let mut prestate = prestate;
+                    if first_post_sync_seq == Some(seq) {
+                        info!(
+                            "forensic: capture inputs ready at seq={} tx_blobs={} prestate_keys={}",
+                            seq,
+                            blobs_saved.len(),
+                            prestate.len(),
+                        );
+                    }
+                    let capture_scope: Vec<[u8; 32]> = {
+                        const FORENSIC_CAPTURE_SECOND_HOP_MAX_KEYS: usize = 16_000;
+                        // Deep owner/book neighborhoods can require more than
+                        // the second-hop cap before enrichment exhausts the frontier.
+                        const FORENSIC_CAPTURE_THIRD_HOP_MAX_KEYS: usize = 64_000;
+                        let mut keys = std::collections::BTreeSet::new();
+                        keys.extend(post_state.iter().map(|(key, _)| crate::ledger::Key(*key)));
+                        let ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                        let prestate_sources: Vec<&std::collections::HashMap<[u8; 32], Vec<u8>>> =
+                            prestate_captured.as_ref().into_iter().collect();
+                        seed_authoritative_directory_scope_with_sources(
+                            &ls,
+                            &prestate_sources,
+                            &mut keys,
+                        );
+                        let capture_frontier: Vec<crate::ledger::Key> =
+                            keys.iter().copied().collect();
+                        let (capture_second_hop, capture_next_frontier, capture_discovered) =
+                            collect_authoritative_second_hop_delta_ordered_with_sources(
+                                &ls,
+                                &prestate_sources,
+                                &keys,
+                                &capture_frontier,
+                                FORENSIC_CAPTURE_SECOND_HOP_MAX_KEYS,
+                            );
+                        if capture_discovered > capture_second_hop.len() {
+                            warn!(
+                                "forensic: capture second hop at seq={} discovered={} capped_to={}",
+                                seq,
+                                capture_discovered,
+                                capture_second_hop.len(),
+                            );
+                        }
+                        keys.extend(capture_second_hop.into_iter().map(crate::ledger::Key));
+                        if !capture_next_frontier.is_empty() {
+                            let known_after_second = keys.clone();
+                            let (
+                                capture_third_hop,
+                                _capture_third_frontier,
+                                capture_third_discovered,
+                            ) = collect_authoritative_second_hop_delta_ordered_with_sources(
+                                &ls,
+                                &prestate_sources,
+                                &known_after_second,
+                                &capture_next_frontier,
+                                FORENSIC_CAPTURE_THIRD_HOP_MAX_KEYS,
+                            );
+                            if capture_third_discovered > capture_third_hop.len() {
+                                warn!(
+                                    "forensic: capture third hop at seq={} discovered={} capped_to={}",
+                                    seq,
+                                    capture_third_discovered,
+                                    capture_third_hop.len(),
+                                );
+                            }
+                            keys.extend(capture_third_hop.into_iter().map(crate::ledger::Key));
+                        }
+                        if keys.len() > post_state.len().saturating_mul(256) {
+                            warn!(
+                                "forensic: capture scope expansion at seq={} grew too large (base={} expanded={}) — falling back to base touched keys",
+                                seq,
+                                post_state.len(),
+                                keys.len(),
+                            );
+                            keys.clear();
+                            keys.extend(post_state.iter().map(|(key, _)| crate::ledger::Key(*key)));
+                        }
+                        keys.into_iter().map(|key| key.0).collect()
+                    };
+                    if capture_scope.len() > post_state.len() {
+                        info!(
+                            "forensic: expanded capture scope at seq={} from {} to {} keys",
+                            seq,
+                            post_state.len(),
+                            capture_scope.len(),
+                        );
+                    }
+                    if first_post_sync_seq == Some(seq) {
+                        info!(
+                            "forensic: capture scope ready at seq={} keys={}",
+                            seq,
+                            capture_scope.len(),
+                        );
+                    }
+                    let prestate_before_scope_fill = prestate.len();
+                    if let Some(pristine_base) = pristine_base_snapshot.as_mut() {
+                        for key in &capture_scope {
+                            if prestate.contains_key(key) {
+                                continue;
+                            }
+                            let key = crate::ledger::Key(*key);
+                            if let Some(raw) = pristine_base.get(&key) {
+                                prestate.insert(key.0, raw);
+                            }
+                        }
+                    }
+                    if prestate.len() > prestate_before_scope_fill {
+                        info!(
+                            "forensic: expanded captured prestate at seq={} from {} to {} keys using pristine snapshot",
+                            seq,
+                            prestate_before_scope_fill,
+                            prestate.len(),
+                        );
+                    }
+                    let prestate_before_related_fill = prestate.len();
+                    if let Some(pristine_base) = pristine_base_snapshot.as_mut() {
+                        const FORENSIC_CAPTURE_PRISTINE_EDGE_MAX_ADDITIONAL: usize = 48_000;
+                        let mut related_seed_keys = capture_scope.clone();
+                        related_seed_keys.extend(prestate.keys().copied());
+                        let added = expand_prestate_with_related_scope_lookup(
+                            &mut prestate,
+                            &related_seed_keys,
+                            FORENSIC_CAPTURE_PRISTINE_EDGE_MAX_ADDITIONAL,
+                            |key| pristine_base.get(&key),
+                        );
+                        if added > 0 {
+                            info!(
+                                "forensic: expanded captured prestate via pristine related scope at seq={} from {} to {} keys",
+                                seq,
+                                prestate_before_related_fill,
+                                prestate.len(),
+                            );
+                        }
+                    }
                     let bundle_root = storage.data_dir().join("debug-runs");
                     let inputs = crate::ledger::forensic::CaptureInputs {
                         bundle_root,
@@ -3653,19 +4922,25 @@ pub async fn run_follower(
                         applied_count: replay_result.applied_count,
                         failed_count: replay_result.failed_count,
                         skipped_count: replay_result.skipped_count,
-                        touched_keys: touched_raw,
+                        touched_keys: capture_scope,
                         per_tx_attribution: std::mem::take(&mut replay_result.per_tx_attribution),
                         tx_blobs: blobs_saved,
                         prestate,
+                        created_overrides: created_overrides.clone(),
+                        modified_overrides: modified_overrides.clone(),
                         rpc_host: Some(rpc_host.clone()),
                         rpc_port,
                     };
-                    let forensic_delete_keys = metadata_deleted_keys.clone();
+                    if first_post_sync_seq == Some(seq) {
+                        info!("forensic: invoking bundle capture at seq={}", seq);
+                    }
                     match crate::ledger::forensic::capture_forensic_bundle(inputs).await {
                         Ok((path, rippled_ref, rippled_not_found, rippled_unavailable)) => {
                             info!("forensic: bundle written to {:?}", path);
                             // Inline comparison: post-state vs rippled reference
                             if !rippled_ref.is_empty() {
+                                let post_state_key_set: std::collections::BTreeSet<[u8; 32]> =
+                                    post_state.iter().map(|(key, _)| *key).collect();
                                 let mut matched_count = 0usize;
                                 let mut divergent = 0usize;
                                 let mut local_missing = 0usize;
@@ -3675,6 +4950,7 @@ pub async fn run_follower(
                                 let mut ref_unavailable = 0usize;
                                 let mut ref_unavailable_present = 0usize;
                                 let mut ref_unavailable_deleted = 0usize;
+                                let mut ref_only = 0usize;
                                 let mut authoritative_upserts: Vec<(crate::ledger::Key, Vec<u8>)> =
                                     Vec::new();
                                 let mut authoritative_deletes: Vec<crate::ledger::Key> = Vec::new();
@@ -3790,11 +5066,7 @@ pub async fn run_follower(
                                                 }
                                             }
                                         }
-                                        if forensic_delete_keys
-                                            .contains(&crate::ledger::Key(*key))
-                                        {
-                                            authoritative_deletes.push(crate::ledger::Key(*key));
-                                        }
+                                        authoritative_deletes.push(crate::ledger::Key(*key));
                                     } else {
                                         ref_unavailable += 1;
                                         match local_bytes {
@@ -3822,8 +5094,15 @@ pub async fn run_follower(
                                         }
                                     }
                                 }
+                                for (key, ref_bytes) in &rippled_ref {
+                                    if !post_state_key_set.contains(key) {
+                                        authoritative_upserts
+                                            .push((crate::ledger::Key(*key), ref_bytes.clone()));
+                                        ref_only += 1;
+                                    }
+                                }
                                 info!(
-                                    "FORENSIC COMPARISON: matched={} divergent={} local_missing={} not_in_ref={} (present={} deleted={}) ref_unavailable={} (present={} deleted={}) total={}",
+                                    "FORENSIC COMPARISON: matched={} divergent={} local_missing={} not_in_ref={} (present={} deleted={}) ref_unavailable={} (present={} deleted={}) ref_only={} total={}",
                                     matched_count,
                                     divergent,
                                     local_missing,
@@ -3833,6 +5112,7 @@ pub async fn run_follower(
                                     ref_unavailable,
                                     ref_unavailable_present,
                                     ref_unavailable_deleted,
+                                    ref_only,
                                     post_state.len(),
                                 );
                                 let local_upserts: Vec<(crate::ledger::Key, Vec<u8>)> = post_state
@@ -3862,8 +5142,7 @@ pub async fn run_follower(
                                     );
                                 }
                                 let authoritative_overlay_hash = if reference_complete {
-                                    let ls =
-                                        ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                                    let ls = ledger_state.lock().unwrap_or_else(|e| e.into_inner());
                                     ls.overlay_hash_from_entries_for_diagnostics(
                                         &authoritative_upserts,
                                         &authoritative_deletes,
@@ -3914,10 +5193,611 @@ pub async fn run_follower(
                                         authoritative_deletes.len(),
                                     );
                                     if reference_complete
+                                        && pristine_authoritative_hash != seq_account_hash
+                                        && !rippled_ref.is_empty()
+                                    {
+                                        const FORENSIC_SECOND_HOP_MAX_KEYS: usize = 20_000;
+                                        let (
+                                            second_hop_delta,
+                                            second_hop_frontier,
+                                            second_hop_discovered,
+                                        ) = {
+                                            let ls = ledger_state
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            let mut seed_keys = std::collections::BTreeSet::new();
+                                            let mut seed_frontier = Vec::new();
+                                            for (key, _) in &authoritative_upserts {
+                                                if seed_keys.insert(*key) {
+                                                    seed_frontier.push(*key);
+                                                }
+                                            }
+                                            let mut sources: Vec<
+                                                &std::collections::HashMap<[u8; 32], Vec<u8>>,
+                                            > = Vec::with_capacity(2);
+                                            if let Some(prestate_map) = prestate_captured.as_ref() {
+                                                sources.push(prestate_map);
+                                            }
+                                            sources.push(&rippled_ref);
+                                            collect_authoritative_second_hop_delta_ordered_with_sources(
+                                                &ls,
+                                                &sources,
+                                                &seed_keys,
+                                                &seed_frontier,
+                                                FORENSIC_SECOND_HOP_MAX_KEYS,
+                                            )
+                                        };
+                                        if second_hop_discovered > second_hop_delta.len() {
+                                            warn!(
+                                                "FORENSIC SECOND HOP SCOPE seq={}: frontier_keys={} discovered={} capped_to={}",
+                                                seq,
+                                                second_hop_frontier.len(),
+                                                second_hop_discovered,
+                                                second_hop_delta.len(),
+                                            );
+                                        } else {
+                                            info!(
+                                                "FORENSIC SECOND HOP SCOPE seq={}: frontier_keys={} discovered={} delta_keys={}",
+                                                seq,
+                                                second_hop_frontier.len(),
+                                                second_hop_discovered,
+                                                second_hop_delta.len(),
+                                            );
+                                        }
+                                        if !second_hop_delta.is_empty() {
+                                            match crate::ledger::forensic::fetch_rippled_reference(
+                                                &rpc_host,
+                                                rpc_port,
+                                                seq,
+                                                &second_hop_delta,
+                                            )
+                                            .await
+                                            {
+                                                Ok((
+                                                    second_hop_ref,
+                                                    second_hop_not_found,
+                                                    second_hop_unavailable,
+                                                )) => {
+                                                    let second_hop_found_count =
+                                                        second_hop_ref.len();
+                                                    let second_hop_not_found_count =
+                                                        second_hop_not_found.len();
+                                                    let second_hop_unavailable_count =
+                                                        second_hop_unavailable.len();
+                                                    if second_hop_not_found_count > 0 {
+                                                        let unresolved: Vec<String> =
+                                                            second_hop_not_found
+                                                                .iter()
+                                                                .take(64)
+                                                                .map(|key| hex::encode_upper(key))
+                                                                .collect();
+                                                        warn!(
+                                                            "FORENSIC SECOND HOP UNRESOLVED KEYS seq={}: count={} sample={:?}",
+                                                            seq,
+                                                            second_hop_not_found_count,
+                                                            unresolved,
+                                                        );
+                                                    }
+                                                    let second_hop_complete =
+                                                        second_hop_unavailable_count == 0;
+                                                    if !second_hop_complete {
+                                                        warn!(
+                                                            "FORENSIC SECOND HOP INCOMPLETE seq={}: unavailable_keys={}",
+                                                            seq,
+                                                            second_hop_unavailable_count,
+                                                        );
+                                                    }
+                                                    let mut authoritative_upsert_map: std::collections::BTreeMap<
+                                                        crate::ledger::Key,
+                                                        Vec<u8>,
+                                                    > = authoritative_upserts
+                                                        .iter()
+                                                        .cloned()
+                                                        .collect();
+                                                    let mut authoritative_delete_set: std::collections::BTreeSet<
+                                                        crate::ledger::Key,
+                                                    > = authoritative_deletes
+                                                        .iter()
+                                                        .copied()
+                                                        .collect();
+                                                    for (key, bytes) in second_hop_ref {
+                                                        let key = crate::ledger::Key(key);
+                                                        authoritative_delete_set.remove(&key);
+                                                        authoritative_upsert_map.insert(key, bytes);
+                                                    }
+                                                    for key in second_hop_not_found {
+                                                        let key = crate::ledger::Key(key);
+                                                        authoritative_upsert_map.remove(&key);
+                                                        authoritative_delete_set.insert(key);
+                                                    }
+                                                    let second_hop_upserts: Vec<(
+                                                        crate::ledger::Key,
+                                                        Vec<u8>,
+                                                    )> = authoritative_upsert_map
+                                                        .into_iter()
+                                                        .collect();
+                                                    let second_hop_deletes: Vec<
+                                                        crate::ledger::Key,
+                                                    > = authoritative_delete_set
+                                                        .into_iter()
+                                                        .collect();
+                                                    let second_hop_overlay_hash =
+                                                        if second_hop_complete {
+                                                            let ls = ledger_state
+                                                                .lock()
+                                                                .unwrap_or_else(|e| e.into_inner());
+                                                            ls.overlay_hash_from_entries_for_diagnostics(
+                                                                &second_hop_upserts,
+                                                                &second_hop_deletes,
+                                                            )
+                                                        } else {
+                                                            None
+                                                        };
+                                                    if let Some(root) = second_hop_overlay_hash {
+                                                        info!(
+                                                            "FORENSIC SECOND HOP ROOT CHECK seq={}: authoritative_overlay={} first_hop_authoritative={} local={} network={} fetched={} not_found={} unavailable={} upserts={} deletes={}",
+                                                            seq,
+                                                            hex::encode_upper(&root[..16]),
+                                                            hex::encode_upper(&pristine_authoritative_hash[..16]),
+                                                            hex::encode_upper(&replay_result.header.account_hash[..16]),
+                                                            hex::encode_upper(&seq_account_hash[..16]),
+                                                            second_hop_found_count,
+                                                            second_hop_not_found_count,
+                                                            second_hop_unavailable_count,
+                                                            second_hop_upserts.len(),
+                                                            second_hop_deletes.len(),
+                                                        );
+                                                    }
+                                                    if second_hop_complete {
+                                                        let mut authoritative_second_hop_base =
+                                                            pristine_base.snapshot();
+                                                        let pristine_second_hop_hash =
+                                                            crate::ledger::LedgerState::overlay_hash_from_snapshot_for_diagnostics(
+                                                                &mut authoritative_second_hop_base,
+                                                                &second_hop_upserts,
+                                                                &second_hop_deletes,
+                                                            );
+                                                        info!(
+                                                            "FORENSIC SECOND HOP PRISTINE ROOT CHECK seq={}: pristine_authoritative={} first_hop_authoritative={} local={} network={} upserts={} deletes={}",
+                                                            seq,
+                                                            hex::encode_upper(&pristine_second_hop_hash[..16]),
+                                                            hex::encode_upper(&pristine_authoritative_hash[..16]),
+                                                            hex::encode_upper(&replay_result.header.account_hash[..16]),
+                                                            hex::encode_upper(&seq_account_hash[..16]),
+                                                            second_hop_upserts.len(),
+                                                            second_hop_deletes.len(),
+                                                        );
+                                                        if pristine_second_hop_hash
+                                                            != seq_account_hash
+                                                        {
+                                                            const FORENSIC_THIRD_HOP_MAX_KEYS:
+                                                                usize = 60_000;
+                                                            let merged_authoritative_raw: std::collections::HashMap<
+                                                                [u8; 32],
+                                                                Vec<u8>,
+                                                            > = second_hop_upserts
+                                                                .iter()
+                                                                .map(|(key, bytes)| {
+                                                                    (key.0, bytes.clone())
+                                                                })
+                                                                .collect();
+                                                            let (
+                                                                third_hop_delta,
+                                                                third_hop_frontier,
+                                                                third_hop_discovered,
+                                                            ) = {
+                                                                let ls = ledger_state
+                                                                    .lock()
+                                                                    .unwrap_or_else(|e| {
+                                                                        e.into_inner()
+                                                                    });
+                                                                let mut seed_keys =
+                                                                    std::collections::BTreeSet::new(
+                                                                    );
+                                                                seed_keys.extend(
+                                                                    merged_authoritative_raw
+                                                                        .keys()
+                                                                        .map(|key| {
+                                                                            crate::ledger::Key(*key)
+                                                                        }),
+                                                                );
+                                                                let mut sources: Vec<
+                                                                    &std::collections::HashMap<
+                                                                        [u8; 32],
+                                                                        Vec<u8>,
+                                                                    >,
+                                                                > = Vec::with_capacity(2);
+                                                                if let Some(prestate_map) =
+                                                                    prestate_captured.as_ref()
+                                                                {
+                                                                    sources.push(prestate_map);
+                                                                }
+                                                                sources.push(
+                                                                    &merged_authoritative_raw,
+                                                                );
+                                                                collect_authoritative_second_hop_delta_ordered_with_sources(
+                                                                    &ls,
+                                                                    &sources,
+                                                                    &seed_keys,
+                                                                    &second_hop_frontier,
+                                                                    FORENSIC_THIRD_HOP_MAX_KEYS,
+                                                                )
+                                                            };
+                                                            if third_hop_discovered
+                                                                > third_hop_delta.len()
+                                                            {
+                                                                warn!(
+                                                                    "FORENSIC THIRD HOP SCOPE seq={}: frontier_keys={} discovered={} capped_to={}",
+                                                                    seq,
+                                                                    third_hop_frontier.len(),
+                                                                    third_hop_discovered,
+                                                                    third_hop_delta.len(),
+                                                                );
+                                                            } else {
+                                                                info!(
+                                                                    "FORENSIC THIRD HOP SCOPE seq={}: frontier_keys={} discovered={} delta_keys={}",
+                                                                    seq,
+                                                                    third_hop_frontier.len(),
+                                                                    third_hop_discovered,
+                                                                    third_hop_delta.len(),
+                                                                );
+                                                            }
+                                                            if !third_hop_delta.is_empty() {
+                                                                match crate::ledger::forensic::fetch_rippled_reference(
+                                                                    &rpc_host,
+                                                                    rpc_port,
+                                                                    seq,
+                                                                    &third_hop_delta,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok((
+                                                                        third_hop_ref,
+                                                                        third_hop_not_found,
+                                                                        third_hop_unavailable,
+                                                                    )) => {
+                                                                        let third_hop_found_count =
+                                                                            third_hop_ref.len();
+                                                                        let third_hop_not_found_count =
+                                                                            third_hop_not_found.len();
+                                                                        let third_hop_unavailable_count =
+                                                                            third_hop_unavailable.len();
+                                                                        if third_hop_not_found_count > 0 {
+                                                                            let unresolved: Vec<String> =
+                                                                                third_hop_not_found
+                                                                                    .iter()
+                                                                                    .take(64)
+                                                                                    .map(|key| {
+                                                                                        hex::encode_upper(key)
+                                                                                    })
+                                                                                    .collect();
+                                                                            warn!(
+                                                                                "FORENSIC THIRD HOP UNRESOLVED KEYS seq={}: count={} sample={:?}",
+                                                                                seq,
+                                                                                third_hop_not_found_count,
+                                                                                unresolved,
+                                                                            );
+                                                                        }
+                                                                        let third_hop_complete =
+                                                                            third_hop_unavailable_count
+                                                                                == 0;
+                                                                        if !third_hop_complete {
+                                                                            warn!(
+                                                                                "FORENSIC THIRD HOP INCOMPLETE seq={}: unavailable_keys={}",
+                                                                                seq,
+                                                                                third_hop_unavailable_count,
+                                                                            );
+                                                                        }
+                                                                        let mut third_hop_upsert_map: std::collections::BTreeMap<
+                                                                            crate::ledger::Key,
+                                                                            Vec<u8>,
+                                                                        > = second_hop_upserts
+                                                                            .iter()
+                                                                            .cloned()
+                                                                            .collect();
+                                                                        let mut third_hop_delete_set: std::collections::BTreeSet<
+                                                                            crate::ledger::Key,
+                                                                        > = second_hop_deletes
+                                                                            .iter()
+                                                                            .copied()
+                                                                            .collect();
+                                                                        for (key, bytes) in third_hop_ref {
+                                                                            let key = crate::ledger::Key(key);
+                                                                            third_hop_delete_set.remove(&key);
+                                                                            third_hop_upsert_map.insert(key, bytes);
+                                                                        }
+                                                                        for key in third_hop_not_found {
+                                                                            let key = crate::ledger::Key(key);
+                                                                            third_hop_upsert_map.remove(&key);
+                                                                            third_hop_delete_set.insert(key);
+                                                                        }
+                                                                        let third_hop_upserts: Vec<(
+                                                                            crate::ledger::Key,
+                                                                            Vec<u8>,
+                                                                        )> = third_hop_upsert_map
+                                                                            .into_iter()
+                                                                            .collect();
+                                                                        let third_hop_deletes: Vec<crate::ledger::Key> =
+                                                                            third_hop_delete_set
+                                                                                .into_iter()
+                                                                                .collect();
+                                                                        let third_hop_overlay_hash =
+                                                                            if third_hop_complete {
+                                                                                let ls = ledger_state
+                                                                                    .lock()
+                                                                                    .unwrap_or_else(|e| e.into_inner());
+                                                                                ls.overlay_hash_from_entries_for_diagnostics(
+                                                                                    &third_hop_upserts,
+                                                                                    &third_hop_deletes,
+                                                                                )
+                                                                            } else {
+                                                                                None
+                                                                            };
+                                                                        if let Some(root) = third_hop_overlay_hash {
+                                                                            info!(
+                                                                                "FORENSIC THIRD HOP ROOT CHECK seq={}: authoritative_overlay={} second_hop_authoritative={} local={} network={} fetched={} not_found={} unavailable={} upserts={} deletes={}",
+                                                                                seq,
+                                                                                hex::encode_upper(&root[..16]),
+                                                                                hex::encode_upper(&pristine_second_hop_hash[..16]),
+                                                                                hex::encode_upper(&replay_result.header.account_hash[..16]),
+                                                                                hex::encode_upper(&seq_account_hash[..16]),
+                                                                                third_hop_found_count,
+                                                                                third_hop_not_found_count,
+                                                                                third_hop_unavailable_count,
+                                                                                third_hop_upserts.len(),
+                                                                                third_hop_deletes.len(),
+                                                                            );
+                                                                        }
+                                                                        if third_hop_complete {
+                                                                            let mut authoritative_third_hop_base =
+                                                                                pristine_base.snapshot();
+                                                                            let pristine_third_hop_hash =
+                                                                                crate::ledger::LedgerState::overlay_hash_from_snapshot_for_diagnostics(
+                                                                                    &mut authoritative_third_hop_base,
+                                                                                    &third_hop_upserts,
+                                                                                    &third_hop_deletes,
+                                                                                );
+                                                                            info!(
+                                                                                "FORENSIC THIRD HOP PRISTINE ROOT CHECK seq={}: pristine_authoritative={} second_hop_authoritative={} local={} network={} upserts={} deletes={}",
+                                                                                seq,
+                                                                                hex::encode_upper(&pristine_third_hop_hash[..16]),
+                                                                                hex::encode_upper(&pristine_second_hop_hash[..16]),
+                                                                                hex::encode_upper(&replay_result.header.account_hash[..16]),
+                                                                                hex::encode_upper(&seq_account_hash[..16]),
+                                                                                third_hop_upserts.len(),
+                                                                                third_hop_deletes.len(),
+                                                                            );
+                                                                            if pristine_third_hop_hash
+                                                                                != seq_account_hash
+                                                                            {
+                                                                                const FORENSIC_FOURTH_HOP_MAX_KEYS: usize =
+                                                                                    150_000;
+                                                                                let merged_third_hop_raw: std::collections::HashMap<
+                                                                                    [u8; 32],
+                                                                                    Vec<u8>,
+                                                                                > = third_hop_upserts
+                                                                                    .iter()
+                                                                                    .map(|(key, bytes)| {
+                                                                                        (key.0, bytes.clone())
+                                                                                    })
+                                                                                    .collect();
+                                                                                let (
+                                                                                    fourth_hop_delta,
+                                                                                    fourth_hop_frontier,
+                                                                                    fourth_hop_discovered,
+                                                                                ) = {
+                                                                                    let ls = ledger_state
+                                                                                        .lock()
+                                                                                        .unwrap_or_else(|e| e.into_inner());
+                                                                                    let mut seed_keys =
+                                                                                        std::collections::BTreeSet::new();
+                                                                                    seed_keys.extend(
+                                                                                        merged_third_hop_raw
+                                                                                            .keys()
+                                                                                            .map(|key| crate::ledger::Key(*key)),
+                                                                                    );
+                                                                                    let mut sources: Vec<
+                                                                                        &std::collections::HashMap<[u8; 32], Vec<u8>>,
+                                                                                    > = Vec::with_capacity(2);
+                                                                                    if let Some(prestate_map) =
+                                                                                        prestate_captured.as_ref()
+                                                                                    {
+                                                                                        sources.push(prestate_map);
+                                                                                    }
+                                                                                    sources.push(&merged_third_hop_raw);
+                                                                                    collect_authoritative_second_hop_delta_ordered_with_sources(
+                                                                                        &ls,
+                                                                                        &sources,
+                                                                                        &seed_keys,
+                                                                                        &third_hop_frontier,
+                                                                                        FORENSIC_FOURTH_HOP_MAX_KEYS,
+                                                                                    )
+                                                                                };
+                                                                                if fourth_hop_discovered > fourth_hop_delta.len() {
+                                                                                    warn!(
+                                                                                        "FORENSIC FOURTH HOP SCOPE seq={}: frontier_keys={} discovered={} capped_to={}",
+                                                                                        seq,
+                                                                                        fourth_hop_frontier.len(),
+                                                                                        fourth_hop_discovered,
+                                                                                        fourth_hop_delta.len(),
+                                                                                    );
+                                                                                } else {
+                                                                                    info!(
+                                                                                        "FORENSIC FOURTH HOP SCOPE seq={}: frontier_keys={} discovered={} delta_keys={}",
+                                                                                        seq,
+                                                                                        fourth_hop_frontier.len(),
+                                                                                        fourth_hop_discovered,
+                                                                                        fourth_hop_delta.len(),
+                                                                                    );
+                                                                                }
+                                                                                if !fourth_hop_delta.is_empty() {
+                                                                                    match crate::ledger::forensic::fetch_rippled_reference(
+                                                                                        &rpc_host,
+                                                                                        rpc_port,
+                                                                                        seq,
+                                                                                        &fourth_hop_delta,
+                                                                                    )
+                                                                                    .await
+                                                                                    {
+                                                                                        Ok((
+                                                                                            fourth_hop_ref,
+                                                                                            fourth_hop_not_found,
+                                                                                            fourth_hop_unavailable,
+                                                                                        )) => {
+                                                                                            let fourth_hop_found_count =
+                                                                                                fourth_hop_ref.len();
+                                                                                            let fourth_hop_not_found_count =
+                                                                                                fourth_hop_not_found.len();
+                                                                                            let fourth_hop_unavailable_count =
+                                                                                                fourth_hop_unavailable.len();
+                                                                                            if fourth_hop_not_found_count > 0 {
+                                                                                                let unresolved: Vec<String> =
+                                                                                                    fourth_hop_not_found
+                                                                                                        .iter()
+                                                                                                        .take(64)
+                                                                                                        .map(|key| {
+                                                                                                            hex::encode_upper(key)
+                                                                                                        })
+                                                                                                        .collect();
+                                                                                                warn!(
+                                                                                                    "FORENSIC FOURTH HOP UNRESOLVED KEYS seq={}: count={} sample={:?}",
+                                                                                                    seq,
+                                                                                                    fourth_hop_not_found_count,
+                                                                                                    unresolved,
+                                                                                                );
+                                                                                            }
+                                                                                            let fourth_hop_complete =
+                                                                                                fourth_hop_unavailable_count
+                                                                                                    == 0;
+                                                                                            if !fourth_hop_complete {
+                                                                                                warn!(
+                                                                                                    "FORENSIC FOURTH HOP INCOMPLETE seq={}: unavailable_keys={}",
+                                                                                                    seq,
+                                                                                                    fourth_hop_unavailable_count,
+                                                                                                );
+                                                                                            }
+                                                                                            let mut fourth_hop_upsert_map: std::collections::BTreeMap<
+                                                                                                crate::ledger::Key,
+                                                                                                Vec<u8>,
+                                                                                            > = third_hop_upserts
+                                                                                                .iter()
+                                                                                                .cloned()
+                                                                                                .collect();
+                                                                                            let mut fourth_hop_delete_set: std::collections::BTreeSet<
+                                                                                                crate::ledger::Key,
+                                                                                            > = third_hop_deletes
+                                                                                                .iter()
+                                                                                                .copied()
+                                                                                                .collect();
+                                                                                            for (key, bytes) in fourth_hop_ref {
+                                                                                                let key = crate::ledger::Key(key);
+                                                                                                fourth_hop_delete_set.remove(&key);
+                                                                                                fourth_hop_upsert_map.insert(key, bytes);
+                                                                                            }
+                                                                                            for key in fourth_hop_not_found {
+                                                                                                let key = crate::ledger::Key(key);
+                                                                                                fourth_hop_upsert_map.remove(&key);
+                                                                                                fourth_hop_delete_set.insert(key);
+                                                                                            }
+                                                                                            let fourth_hop_upserts: Vec<(
+                                                                                                crate::ledger::Key,
+                                                                                                Vec<u8>,
+                                                                                            )> = fourth_hop_upsert_map
+                                                                                                .into_iter()
+                                                                                                .collect();
+                                                                                            let fourth_hop_deletes: Vec<crate::ledger::Key> =
+                                                                                                fourth_hop_delete_set
+                                                                                                    .into_iter()
+                                                                                                    .collect();
+                                                                                            let fourth_hop_overlay_hash =
+                                                                                                if fourth_hop_complete {
+                                                                                                    let ls = ledger_state
+                                                                                                        .lock()
+                                                                                                        .unwrap_or_else(|e| e.into_inner());
+                                                                                                    ls.overlay_hash_from_entries_for_diagnostics(
+                                                                                                        &fourth_hop_upserts,
+                                                                                                        &fourth_hop_deletes,
+                                                                                                    )
+                                                                                                } else {
+                                                                                                    None
+                                                                                                };
+                                                                                            if let Some(root) = fourth_hop_overlay_hash {
+                                                                                                info!(
+                                                                                                    "FORENSIC FOURTH HOP ROOT CHECK seq={}: authoritative_overlay={} third_hop_authoritative={} local={} network={} fetched={} not_found={} unavailable={} upserts={} deletes={}",
+                                                                                                    seq,
+                                                                                                    hex::encode_upper(&root[..16]),
+                                                                                                    hex::encode_upper(&pristine_third_hop_hash[..16]),
+                                                                                                    hex::encode_upper(&replay_result.header.account_hash[..16]),
+                                                                                                    hex::encode_upper(&seq_account_hash[..16]),
+                                                                                                    fourth_hop_found_count,
+                                                                                                    fourth_hop_not_found_count,
+                                                                                                    fourth_hop_unavailable_count,
+                                                                                                    fourth_hop_upserts.len(),
+                                                                                                    fourth_hop_deletes.len(),
+                                                                                                );
+                                                                                            }
+                                                                                            if fourth_hop_complete {
+                                                                                                let mut authoritative_fourth_hop_base =
+                                                                                                    pristine_base.snapshot();
+                                                                                                let pristine_fourth_hop_hash =
+                                                                                                    crate::ledger::LedgerState::overlay_hash_from_snapshot_for_diagnostics(
+                                                                                                        &mut authoritative_fourth_hop_base,
+                                                                                                        &fourth_hop_upserts,
+                                                                                                        &fourth_hop_deletes,
+                                                                                                    );
+                                                                                                info!(
+                                                                                                    "FORENSIC FOURTH HOP PRISTINE ROOT CHECK seq={}: pristine_authoritative={} third_hop_authoritative={} local={} network={} upserts={} deletes={}",
+                                                                                                    seq,
+                                                                                                    hex::encode_upper(&pristine_fourth_hop_hash[..16]),
+                                                                                                    hex::encode_upper(&pristine_third_hop_hash[..16]),
+                                                                                                    hex::encode_upper(&replay_result.header.account_hash[..16]),
+                                                                                                    hex::encode_upper(&seq_account_hash[..16]),
+                                                                                                    fourth_hop_upserts.len(),
+                                                                                                    fourth_hop_deletes.len(),
+                                                                                                );
+                                                                                            }
+                                                                                        }
+                                                                                        Err(e) => {
+                                                                                            warn!(
+                                                                                                "FORENSIC FOURTH HOP FETCH FAILED seq={}: {}",
+                                                                                                seq,
+                                                                                                e,
+                                                                                            );
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        warn!(
+                                                                            "FORENSIC THIRD HOP FETCH FAILED seq={}: {}",
+                                                                            seq,
+                                                                            e,
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "FORENSIC SECOND HOP FETCH FAILED seq={}: {}",
+                                                        seq,
+                                                        e,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if reference_complete
                                         && !matched
                                         && pristine_authoritative_hash == seq_account_hash
                                     {
-                                        let repair_loaded = if let Some(anchor_root) = sync_account_hash {
+                                        let repair_loaded = if let Some(anchor_root) =
+                                            sync_account_hash
+                                        {
                                             let mut ls = ledger_state
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner());
@@ -3928,8 +5808,12 @@ pub async fn run_follower(
                                                         if let Some(raw) = ls.get_raw_owned(key) {
                                                             if raw.len() >= 3 && raw[0] == 0x11 {
                                                                 let entry_type =
-                                                                    u16::from_be_bytes([raw[1], raw[2]]);
-                                                                remove_typed(&mut ls, entry_type, key);
+                                                                    u16::from_be_bytes([
+                                                                        raw[1], raw[2],
+                                                                    ]);
+                                                                remove_typed(
+                                                                    &mut ls, entry_type, key,
+                                                                );
                                                             } else {
                                                                 ls.remove_raw(key);
                                                             }
@@ -3940,9 +5824,12 @@ pub async fn run_follower(
                                                     for (key, raw) in &authoritative_upserts {
                                                         ls.insert_raw(*key, raw.clone());
                                                         if raw.len() >= 3 && raw[0] == 0x11 {
-                                                            let entry_type =
-                                                                u16::from_be_bytes([raw[1], raw[2]]);
-                                                            sync_typed(&mut ls, entry_type, key, raw);
+                                                            let entry_type = u16::from_be_bytes([
+                                                                raw[1], raw[2],
+                                                            ]);
+                                                            sync_typed(
+                                                                &mut ls, entry_type, key, raw,
+                                                            );
                                                             crate::ledger::close::ensure_owner_directory_entries_for_created_sle(
                                                                 &mut ls,
                                                                 *key,
@@ -4016,6 +5903,13 @@ pub async fn run_follower(
                         }
                         Err(e) => warn!("forensic: bundle write failed: {}", e),
                     }
+                } else if first_post_sync_seq == Some(seq) {
+                    warn!(
+                        "forensic: capture skipped at seq={} because tx_blobs_for_capture={} prestate_captured={}",
+                        seq,
+                        tx_blobs_for_capture.is_some(),
+                        prestate_captured.is_some(),
+                    );
                 }
 
                 if repaired_from_pristine_authoritative {
@@ -4934,8 +6828,8 @@ async fn fetch_sle_binary(local_host: &str, local_port: u16, req: &str) -> Optio
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RpcLedgerEntryFetch {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RpcLedgerEntryFetch {
     Found(Vec<u8>),
     NotFound,
     Unavailable,
@@ -4976,14 +6870,26 @@ fn parse_ledger_entry_fetch_response(resp: &Value) -> RpcLedgerEntryFetch {
     }
 }
 
-async fn fetch_sle_binary_status(local_host: &str, local_port: u16, req: &str) -> RpcLedgerEntryFetch {
+async fn fetch_sle_binary_status(
+    local_host: &str,
+    local_port: u16,
+    req: &str,
+) -> RpcLedgerEntryFetch {
     let mut saw_not_found = false;
 
     if let Ok(body) = crate::rpc_sync::http_post(local_host, local_port, req).await {
         if let Ok(resp) = serde_json::from_str::<Value>(&body) {
             match parse_ledger_entry_fetch_response(&resp) {
                 RpcLedgerEntryFetch::Found(data) => return RpcLedgerEntryFetch::Found(data),
-                RpcLedgerEntryFetch::NotFound => saw_not_found = true,
+                RpcLedgerEntryFetch::NotFound => {
+                    // When the follower is configured with a concrete RPC endpoint, treat a
+                    // definitive NotFound there as authoritative instead of fanning out to
+                    // every public server for the same absent key.
+                    if local_port != 0 {
+                        return RpcLedgerEntryFetch::NotFound;
+                    }
+                    saw_not_found = true;
+                }
                 RpcLedgerEntryFetch::Unavailable => {}
             }
         }
@@ -5223,7 +7129,7 @@ async fn compare_engine_touched_keys(
 async fn reconcile_touched_keys_with_rpc(
     ledger_state: Arc<std::sync::Mutex<crate::ledger::LedgerState>>,
     touched_keys: &[crate::ledger::Key],
-    explicit_delete_keys: &std::collections::BTreeSet<crate::ledger::Key>,
+    _explicit_delete_keys: &std::collections::BTreeSet<crate::ledger::Key>,
     seq: u32,
     rpc_host: &str,
     rpc_port: u16,
@@ -5295,14 +7201,7 @@ async fn reconcile_touched_keys_with_rpc(
             }
             RpcLedgerEntryFetch::NotFound => {
                 not_found += 1;
-                if !explicit_delete_keys.contains(key) {
-                    continue;
-                }
-                if let Some(existing) = ls.get_raw_owned(key) {
-                    if let Some(sle) = crate::ledger::sle::SLE::from_raw(*key, existing) {
-                        remove_typed(&mut ls, sle.entry_type() as u16, key);
-                    }
-                    ls.remove_raw(key);
+                if remove_authoritatively_absent_key(&mut ls, key) {
                     removed += 1;
                 }
             }
@@ -5327,6 +7226,17 @@ async fn reconcile_touched_keys_with_rpc(
     )
 }
 
+fn remove_authoritatively_absent_key(
+    state: &mut crate::ledger::LedgerState,
+    key: &crate::ledger::Key,
+) -> bool {
+    let existed =
+        state.get_raw_owned(key).is_some() || state.get_committed_raw_owned(key).is_some();
+    state.clear_typed_entry_for_key(key);
+    state.remove_raw(key);
+    existed
+}
+
 async fn reconcile_metadata_keys_with_rpc(
     ledger_state: Arc<std::sync::Mutex<crate::ledger::LedgerState>>,
     meta_with_hashes: &[([u8; 32], Vec<u8>)],
@@ -5336,7 +7246,6 @@ async fn reconcile_metadata_keys_with_rpc(
 ) -> (usize, usize, usize, usize, usize) {
     const RPC_FETCH_TIMEOUT_SECS: u64 = 25;
     const RPC_FETCH_MAX_IN_FLIGHT: usize = 24;
-    let explicit_delete_keys = collect_deleted_metadata_keys(meta_with_hashes);
     let mut key_set = std::collections::BTreeSet::<crate::ledger::Key>::new();
     for (_tx_hash, meta_blob) in meta_with_hashes {
         let nodes =
@@ -5406,14 +7315,7 @@ async fn reconcile_metadata_keys_with_rpc(
             }
             RpcLedgerEntryFetch::NotFound => {
                 not_found += 1;
-                if !explicit_delete_keys.contains(key) {
-                    continue;
-                }
-                if let Some(existing) = ls.get_raw_owned(key) {
-                    if let Some(sle) = crate::ledger::sle::SLE::from_raw(*key, existing) {
-                        remove_typed(&mut ls, sle.entry_type() as u16, key);
-                    }
-                    ls.remove_raw(key);
+                if remove_authoritatively_absent_key(&mut ls, key) {
                     removed += 1;
                 }
             }
@@ -5912,12 +7814,6 @@ pub async fn test_one_ledger(
                     Some(*ledger_seq),
                     &deleted,
                 );
-                // Dump first modify for debugging
-                let target = "1ed8ddfd80f275cb1ce7f18bb9d906655de8029805d8b95fb9020b30425821eb";
-                if hex::encode(key.0) == target {
-                    info!("PATCH_RESULT for {}: {}", target, hex::encode(&patched));
-                    info!("PATCH_BEFORE: {}", hex::encode(&existing_data));
-                }
                 state.insert_raw(*key, patched.clone());
                 patched_cache.insert(*key, patched);
             }
@@ -6151,6 +8047,34 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_reconcile_skips_first_post_sync_mismatch() {
+        assert!(!should_attempt_authoritative_reconcile(
+            true,
+            false,
+            Some(103_674_820),
+            103_674_820,
+        ));
+        assert!(should_attempt_authoritative_reconcile(
+            true,
+            false,
+            Some(103_674_820),
+            103_674_821,
+        ));
+        assert!(!should_attempt_authoritative_reconcile(
+            true,
+            true,
+            Some(103_674_820),
+            103_674_821,
+        ));
+        assert!(!should_attempt_authoritative_reconcile(
+            false,
+            false,
+            Some(103_674_820),
+            103_674_820,
+        ));
+    }
+
+    #[test]
     fn authoritative_delete_removes_supported_raw_even_without_typed_cache() {
         let mut state = crate::ledger::LedgerState::new();
         let account = crate::ledger::account::AccountRoot {
@@ -6268,12 +8192,111 @@ mod tests {
     }
 
     #[test]
+    fn collect_missing_modified_base_keys_skips_created_same_ledger_seen_later() {
+        let state = crate::ledger::LedgerState::new();
+        let created_then_modified = crate::ledger::Key([0x34; 32]);
+        let nodes = vec![
+            vec![crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0072,
+                ledger_index: created_then_modified.0,
+                fields: Vec::new(),
+                previous_fields: Vec::new(),
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+            vec![crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x0072,
+                ledger_index: created_then_modified.0,
+                fields: Vec::new(),
+                previous_fields: Vec::new(),
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+        ];
+
+        let missing = collect_missing_modified_base_keys_from_nodes(&state, &nodes);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn collect_missing_modified_base_keys_includes_deleted_parent_objects() {
+        let state = crate::ledger::LedgerState::new();
+        let deleted_key = crate::ledger::Key([0x44; 32]);
+        let nodes = vec![vec![crate::ledger::meta::AffectedNode {
+            action: crate::ledger::meta::Action::Deleted,
+            entry_type: 0x006f,
+            ledger_index: deleted_key.0,
+            fields: Vec::new(),
+            previous_fields: Vec::new(),
+            prev_txn_id: None,
+            prev_txn_lgrseq: None,
+        }]];
+
+        let missing = collect_missing_modified_base_keys_from_nodes(&state, &nodes);
+        assert_eq!(missing, vec![deleted_key]);
+    }
+
+    #[test]
+    fn hydrate_present_modified_base_keys_hydrates_deleted_offer_from_raw_state() {
+        let mut state = crate::ledger::LedgerState::new();
+        let offer = crate::ledger::offer::Offer {
+            account: [0x55; 20],
+            sequence: 9,
+            taker_pays: crate::transaction::amount::Amount::Xrp(10),
+            taker_gets: crate::transaction::amount::Amount::Xrp(20),
+            flags: 0,
+            book_directory: [0u8; 32],
+            book_node: 0,
+            owner_node: 0,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let key = offer.key();
+        state.insert_raw(key, offer.to_sle_binary());
+
+        let nodes = vec![vec![crate::ledger::meta::AffectedNode {
+            action: crate::ledger::meta::Action::Deleted,
+            entry_type: 0x006f,
+            ledger_index: key.0,
+            fields: Vec::new(),
+            previous_fields: Vec::new(),
+            prev_txn_id: None,
+            prev_txn_lgrseq: None,
+        }]];
+
+        let hydrated = hydrate_present_modified_base_keys_from_nodes(&mut state, &nodes);
+        assert_eq!(hydrated, 1);
+        assert!(state.get_offer(&key).is_some());
+    }
+
+    #[test]
+    fn filter_missing_replay_prerequisite_keys_skips_created_same_ledger_objects() {
+        let state = crate::ledger::LedgerState::new();
+        let created_key = crate::ledger::Key([0x61; 32]);
+        let actually_missing = crate::ledger::Key([0x62; 32]);
+
+        let mut keys = std::collections::BTreeSet::new();
+        keys.insert(created_key);
+        keys.insert(actually_missing);
+
+        let mut created_same_ledger = std::collections::BTreeSet::new();
+        created_same_ledger.insert(created_key);
+
+        let missing = filter_missing_replay_prerequisite_keys(&state, keys, &created_same_ledger);
+        assert_eq!(missing, vec![actually_missing]);
+    }
+
+    #[test]
     fn collect_replay_prerequisite_keys_includes_offer_funding_trustline() {
         let kp = crate::crypto::keys::KeyPair::Secp256k1(
-            crate::crypto::keys::Secp256k1KeyPair::from_seed(
-                "snoPBrXtMeMyMHUVTgbuqAfg1SUTb",
-            )
-            .unwrap(),
+            crate::crypto::keys::Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb")
+                .unwrap(),
         );
         let account = crate::crypto::account_id(&kp.public_key_bytes());
         let issuer =
@@ -6299,10 +8322,8 @@ mod tests {
     #[test]
     fn collect_replay_prerequisite_keys_includes_direct_xrp_destination_account() {
         let kp = crate::crypto::keys::KeyPair::Secp256k1(
-            crate::crypto::keys::Secp256k1KeyPair::from_seed(
-                "snoPBrXtMeMyMHUVTgbuqAfg1SUTb",
-            )
-            .unwrap(),
+            crate::crypto::keys::Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb")
+                .unwrap(),
         );
         let destination =
             crate::crypto::base58::decode_account("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe").unwrap();
@@ -6316,6 +8337,156 @@ mod tests {
             .sign(&kp)
             .unwrap();
         let expected = crate::ledger::account::shamap_key(&destination);
+        let keys = collect_replay_prerequisite_keys(&[(signed.blob, Vec::new())]);
+        assert!(keys.contains(&expected));
+    }
+
+    #[test]
+    fn collect_replay_prerequisite_keys_includes_direct_iou_payment_lines_and_issuer() {
+        let kp = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed("shHM53KPZ87Gwdqarm1bAmPeXg8Tn")
+                .unwrap(),
+        );
+        let account = crate::crypto::account_id(&kp.public_key_bytes());
+        let destination =
+            crate::crypto::base58::decode_account("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe").unwrap();
+        let issuer =
+            crate::crypto::base58::decode_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
+        let currency = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let signed = crate::transaction::builder::TxBuilder::payment()
+            .account(&kp)
+            .destination("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe")
+            .unwrap()
+            .amount(crate::transaction::Amount::Iou {
+                value: crate::transaction::amount::IouValue::from_f64(25.0),
+                currency: currency.clone(),
+                issuer,
+            })
+            .fee(12)
+            .sequence(1)
+            .sign(&kp)
+            .unwrap();
+        let keys = collect_replay_prerequisite_keys(&[(signed.blob, Vec::new())]);
+        assert!(keys.contains(&crate::ledger::trustline::shamap_key(
+            &account, &issuer, &currency
+        )));
+        assert!(keys.contains(&crate::ledger::trustline::shamap_key(
+            &destination,
+            &issuer,
+            &currency
+        )));
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&destination)));
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&issuer)));
+    }
+
+    #[test]
+    fn collect_replay_prerequisite_keys_includes_path_payment_accounts_and_lines() {
+        let sender = [0x11; 20];
+        let destination = [0x22; 20];
+        let deliver_issuer = [0x33; 20];
+        let send_max_issuer = [0x44; 20];
+        let path_account = [0x55; 20];
+        let path_issuer = [0x66; 20];
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let eur = crate::transaction::amount::Currency::from_code("EUR").unwrap();
+        let jpy = crate::transaction::amount::Currency::from_code("JPY").unwrap();
+
+        let mut tx = crate::transaction::ParsedTx::default();
+        tx.tx_type = 0;
+        tx.account = sender;
+        tx.destination = Some(destination);
+        tx.amount = Some(crate::transaction::Amount::Iou {
+            value: crate::transaction::amount::IouValue::from_f64(25.0),
+            currency: usd.clone(),
+            issuer: deliver_issuer,
+        });
+        tx.send_max = Some(crate::transaction::Amount::Iou {
+            value: crate::transaction::amount::IouValue::from_f64(30.0),
+            currency: eur.clone(),
+            issuer: send_max_issuer,
+        });
+        tx.deliver_min = Some(crate::transaction::Amount::Iou {
+            value: crate::transaction::amount::IouValue::from_f64(20.0),
+            currency: usd.clone(),
+            issuer: deliver_issuer,
+        });
+        tx.paths = vec![vec![crate::transaction::PathStep {
+            account: Some(path_account),
+            currency: Some(jpy.code),
+            issuer: Some(path_issuer),
+        }]];
+
+        let mut keys = std::collections::BTreeSet::new();
+        collect_replay_prerequisite_keys_for_parsed(&tx, &mut keys);
+
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&destination)));
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&deliver_issuer)));
+        assert!(keys.contains(&crate::ledger::trustline::shamap_key(
+            &sender,
+            &deliver_issuer,
+            &usd,
+        )));
+        assert!(keys.contains(&crate::ledger::trustline::shamap_key(
+            &destination,
+            &deliver_issuer,
+            &usd,
+        )));
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&send_max_issuer)));
+        assert!(keys.contains(&crate::ledger::trustline::shamap_key(
+            &sender,
+            &send_max_issuer,
+            &eur,
+        )));
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&path_account)));
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&path_issuer)));
+        assert!(keys.contains(&crate::ledger::trustline::shamap_key(
+            &path_account,
+            &path_issuer,
+            &jpy,
+        )));
+    }
+
+    #[test]
+    fn collect_replay_prerequisite_keys_includes_trustset_trustline() {
+        let kp = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb")
+                .unwrap(),
+        );
+        let account = crate::crypto::account_id(&kp.public_key_bytes());
+        let issuer =
+            crate::crypto::base58::decode_account("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe").unwrap();
+        let currency = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let signed = crate::transaction::builder::TxBuilder::trust_set()
+            .account(&kp)
+            .limit_amount(crate::transaction::Amount::Iou {
+                value: crate::transaction::amount::IouValue::from_f64(100.0),
+                currency: currency.clone(),
+                issuer,
+            })
+            .fee(12)
+            .sequence(1)
+            .sign(&kp)
+            .unwrap();
+        let expected = crate::ledger::trustline::shamap_key(&account, &issuer, &currency);
+        let keys = collect_replay_prerequisite_keys(&[(signed.blob, Vec::new())]);
+        assert!(keys.contains(&expected));
+    }
+
+    #[test]
+    fn collect_replay_prerequisite_keys_includes_offer_cancel_target_offer() {
+        let kp = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb")
+                .unwrap(),
+        );
+        let account = crate::crypto::account_id(&kp.public_key_bytes());
+        let signed = crate::transaction::builder::TxBuilder::offer_cancel()
+            .account(&kp)
+            .offer_sequence(42)
+            .fee(12)
+            .sequence(1)
+            .sign(&kp)
+            .unwrap();
+        let expected = crate::ledger::offer::shamap_key(&account, 42);
         let keys = collect_replay_prerequisite_keys(&[(signed.blob, Vec::new())]);
         assert!(keys.contains(&expected));
     }
@@ -6356,8 +8527,8 @@ mod tests {
         expand_directory_neighborhoods_with_sources(&state, &[&prestate], &mut keys);
 
         assert!(keys.contains(&root));
-        assert!(keys.contains(&prev));
-        assert!(keys.contains(&next));
+        assert!(!keys.contains(&prev));
+        assert!(!keys.contains(&next));
     }
 
     #[test]
@@ -6403,10 +8574,136 @@ mod tests {
             offer.book_node,
         )));
 
-        let mut book_root = offer.book_directory;
-        book_root[24..32].copy_from_slice(&0u64.to_be_bytes());
-        assert!(keys.contains(&crate::ledger::Key(book_root)));
         assert!(keys.contains(&crate::ledger::Key(offer.additional_books[0])));
+    }
+
+    #[test]
+    fn pristine_related_scope_expansion_backfills_offer_neighbors() {
+        let offer = crate::ledger::offer::Offer {
+            account: [0x31; 20],
+            sequence: 9,
+            taker_pays: crate::transaction::amount::Amount::Xrp(10),
+            taker_gets: crate::transaction::amount::Amount::Xrp(20),
+            flags: 0,
+            book_directory: {
+                let mut key = [0x44; 32];
+                key[24..32].copy_from_slice(&77u64.to_be_bytes());
+                key
+            },
+            book_node: 5,
+            owner_node: 3,
+            expiration: None,
+            domain_id: None,
+            additional_books: vec![],
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let offer_key = offer.key();
+        let owner_root = crate::ledger::directory::owner_dir_key(&offer.account);
+        let owner_page = crate::ledger::directory::page_key(&owner_root.0, offer.owner_node);
+        let book_page = crate::ledger::directory::page_key(&offer.book_directory, offer.book_node);
+
+        let owner_root_dir = crate::ledger::directory::DirectoryNode {
+            key: owner_root.0,
+            root_index: owner_root.0,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            exchange_rate: None,
+            owner: Some(offer.account),
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        let owner_page_dir = crate::ledger::directory::DirectoryNode {
+            key: owner_page.0,
+            root_index: owner_root.0,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            exchange_rate: None,
+            owner: Some(offer.account),
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        let book_root_dir = crate::ledger::directory::DirectoryNode {
+            key: offer.book_directory,
+            root_index: offer.book_directory,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            exchange_rate: Some(1),
+            owner: None,
+            taker_pays_currency: Some([0x11; 20]),
+            taker_pays_issuer: Some([0x12; 20]),
+            taker_gets_currency: Some([0x13; 20]),
+            taker_gets_issuer: Some([0x14; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        let book_page_dir = crate::ledger::directory::DirectoryNode {
+            key: book_page.0,
+            root_index: offer.book_directory,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            exchange_rate: Some(1),
+            owner: None,
+            taker_pays_currency: Some([0x11; 20]),
+            taker_pays_issuer: Some([0x12; 20]),
+            taker_gets_currency: Some([0x13; 20]),
+            taker_gets_issuer: Some([0x14; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+
+        let mut pristine_lookup = std::collections::HashMap::<[u8; 32], Vec<u8>>::new();
+        pristine_lookup.insert(owner_root.0, owner_root_dir.encode());
+        pristine_lookup.insert(owner_page.0, owner_page_dir.encode());
+        pristine_lookup.insert(offer.book_directory, book_root_dir.encode());
+        pristine_lookup.insert(book_page.0, book_page_dir.encode());
+
+        let mut prestate = std::collections::HashMap::new();
+        prestate.insert(offer_key.0, offer.to_sle_binary());
+
+        let added =
+            expand_prestate_with_related_scope_lookup(&mut prestate, &[offer_key.0], 16, |key| {
+                pristine_lookup.get(&key.0).cloned()
+            });
+
+        assert_eq!(added, 4);
+        assert!(prestate.contains_key(&owner_root.0));
+        assert!(prestate.contains_key(&owner_page.0));
+        assert!(prestate.contains_key(&offer.book_directory));
+        assert!(prestate.contains_key(&book_page.0));
     }
 
     #[test]
@@ -6488,9 +8785,7 @@ mod tests {
         let owner_root = crate::ledger::directory::owner_dir_key(&check.account);
         let destination_root = crate::ledger::directory::owner_dir_key(&check.destination);
         assert!(keys.contains(&crate::ledger::account::shamap_key(&check.account)));
-        assert!(keys.contains(&crate::ledger::account::shamap_key(
-            &check.destination
-        )));
+        assert!(keys.contains(&crate::ledger::account::shamap_key(&check.destination)));
         assert!(keys.contains(&crate::ledger::directory::page_key(
             &owner_root.0,
             check.owner_node,
@@ -6564,10 +8859,543 @@ mod tests {
             offer.book_node,
         )));
 
-        let mut book_root = offer.book_directory;
-        book_root[24..32].copy_from_slice(&0u64.to_be_bytes());
-        assert!(keys.contains(&crate::ledger::Key(book_root)));
         assert!(keys.contains(&crate::ledger::Key(offer.additional_books[0])));
+    }
+
+    #[test]
+    fn authoritative_hop_frontier_promotes_owner_directory_members() {
+        let mut state = crate::ledger::LedgerState::new();
+        let additional_book = [0x88; 32];
+        let offer = crate::ledger::offer::Offer {
+            account: [0x52; 20],
+            sequence: 12,
+            taker_pays: crate::transaction::amount::Amount::Xrp(10),
+            taker_gets: crate::transaction::amount::Amount::Xrp(20),
+            flags: 0,
+            book_directory: {
+                let mut key = [0x79; 32];
+                key[24..32].copy_from_slice(&17u64.to_be_bytes());
+                key
+            },
+            book_node: 17,
+            owner_node: 5,
+            expiration: None,
+            domain_id: None,
+            additional_books: vec![additional_book],
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let offer_key = offer.key();
+        state.insert_raw(offer_key, offer.to_sle_binary());
+
+        let owner_root = crate::ledger::directory::owner_dir_key(&offer.account);
+        let owner_page = crate::ledger::directory::page_key(&owner_root.0, offer.owner_node);
+        let dir = crate::ledger::directory::DirectoryNode {
+            key: owner_page.0,
+            root_index: owner_root.0,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            owner: Some(offer.account),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_page, dir.to_sle_binary());
+
+        let mut known_keys = std::collections::BTreeSet::new();
+        known_keys.insert(owner_page);
+        let frontier_keys = known_keys.clone();
+
+        let (first_delta, next_frontier, _) = collect_authoritative_second_hop_delta_with_sources(
+            &state,
+            &[],
+            &known_keys,
+            &frontier_keys,
+            64,
+        );
+        let first_delta_keys: std::collections::BTreeSet<crate::ledger::Key> = first_delta
+            .iter()
+            .map(|key| crate::ledger::Key(*key))
+            .collect();
+
+        assert!(first_delta_keys.contains(&offer_key));
+        assert!(first_delta_keys.contains(&owner_root));
+        assert!(next_frontier.contains(&offer_key));
+
+        known_keys.extend(first_delta_keys.iter().copied());
+        let (second_delta, second_frontier, _) =
+            collect_authoritative_second_hop_delta_with_sources(
+                &state,
+                &[],
+                &known_keys,
+                &next_frontier,
+                64,
+            );
+        let second_delta_keys: std::collections::BTreeSet<crate::ledger::Key> = second_delta
+            .iter()
+            .map(|key| crate::ledger::Key(*key))
+            .collect();
+
+        assert!(second_delta_keys.contains(&crate::ledger::Key(offer.book_directory)));
+        assert!(
+            second_delta_keys.contains(&crate::ledger::directory::page_key(
+                &offer.book_directory,
+                offer.book_node,
+            ))
+        );
+        assert!(second_delta_keys.contains(&crate::ledger::Key(additional_book)));
+        assert!(second_frontier.contains(&crate::ledger::Key(offer.book_directory)));
+        assert!(
+            second_frontier.contains(&crate::ledger::directory::page_key(
+                &offer.book_directory,
+                offer.book_node,
+            ))
+        );
+        assert!(second_frontier.contains(&crate::ledger::Key(additional_book)));
+    }
+
+    #[test]
+    fn authoritative_hop_offer_scope_promotes_owner_and_book_directory_frontier() {
+        let mut state = crate::ledger::LedgerState::new();
+        let additional_book = [0x99; 32];
+        let offer = crate::ledger::offer::Offer {
+            account: [0x53; 20],
+            sequence: 13,
+            taker_pays: crate::transaction::amount::Amount::Xrp(10),
+            taker_gets: crate::transaction::amount::Amount::Xrp(20),
+            flags: 0,
+            book_directory: {
+                let mut key = [0x7A; 32];
+                key[24..32].copy_from_slice(&19u64.to_be_bytes());
+                key
+            },
+            book_node: 19,
+            owner_node: 6,
+            expiration: None,
+            domain_id: None,
+            additional_books: vec![additional_book],
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let offer_key = offer.key();
+        state.insert_raw(offer_key, offer.to_sle_binary());
+
+        let mut known_keys = std::collections::BTreeSet::new();
+        known_keys.insert(offer_key);
+        let frontier_keys = known_keys.clone();
+        let owner_root = crate::ledger::directory::owner_dir_key(&offer.account);
+        let owner_page = crate::ledger::directory::page_key(&owner_root.0, offer.owner_node);
+
+        let (delta, next_frontier, _) = collect_authoritative_second_hop_delta_with_sources(
+            &state,
+            &[],
+            &known_keys,
+            &frontier_keys,
+            64,
+        );
+        let delta_keys: std::collections::BTreeSet<crate::ledger::Key> =
+            delta.iter().map(|key| crate::ledger::Key(*key)).collect();
+
+        assert!(delta_keys.contains(&crate::ledger::account::shamap_key(&offer.account)));
+        assert!(delta_keys.contains(&crate::ledger::directory::owner_dir_key(&offer.account)));
+        assert!(delta_keys.contains(&crate::ledger::Key(offer.book_directory)));
+        assert!(delta_keys.contains(&crate::ledger::directory::page_key(
+            &offer.book_directory,
+            offer.book_node,
+        )));
+        assert!(delta_keys.contains(&crate::ledger::Key(additional_book)));
+        assert!(next_frontier.contains(&owner_root));
+        assert!(next_frontier.contains(&owner_page));
+        assert!(!next_frontier.contains(&crate::ledger::account::shamap_key(&offer.account)));
+        assert!(next_frontier.contains(&crate::ledger::Key(offer.book_directory)));
+        assert!(next_frontier.contains(&crate::ledger::directory::page_key(
+            &offer.book_directory,
+            offer.book_node,
+        )));
+        assert!(next_frontier.contains(&crate::ledger::Key(additional_book)));
+        assert!(!next_frontier.contains(&offer_key));
+    }
+
+    #[test]
+    fn authoritative_hop_frontier_does_not_recurse_non_root_owner_neighbors() {
+        let mut state = crate::ledger::LedgerState::new();
+        let owner = [0x61; 20];
+        let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+        let owner_page = crate::ledger::directory::page_key(&owner_root.0, 2);
+        let next_page = crate::ledger::directory::page_key(&owner_root.0, 3);
+        let dir = crate::ledger::directory::DirectoryNode {
+            key: owner_page.0,
+            root_index: owner_root.0,
+            indexes: vec![],
+            index_next: 3,
+            index_previous: 0,
+            owner: Some(owner),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: true,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_page, dir.to_sle_binary());
+
+        let mut known_keys = std::collections::BTreeSet::new();
+        known_keys.insert(owner_page);
+        let frontier_keys = known_keys.clone();
+
+        let (delta, next_frontier, _) = collect_authoritative_second_hop_delta_with_sources(
+            &state,
+            &[],
+            &known_keys,
+            &frontier_keys,
+            64,
+        );
+        let delta_keys: std::collections::BTreeSet<crate::ledger::Key> =
+            delta.iter().map(|key| crate::ledger::Key(*key)).collect();
+
+        assert!(delta_keys.contains(&crate::ledger::account::shamap_key(&owner)));
+        assert!(delta_keys.contains(&owner_root));
+        assert!(next_frontier.contains(&owner_root));
+        assert!(!delta_keys.contains(&next_page));
+        assert!(!next_frontier.contains(&next_page));
+    }
+
+    #[test]
+    fn authoritative_hop_frontier_owner_root_can_seed_first_chain_page() {
+        let mut state = crate::ledger::LedgerState::new();
+        let owner = [0x62; 20];
+        let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+        let next_page = crate::ledger::directory::page_key(&owner_root.0, 3);
+        let dir = crate::ledger::directory::DirectoryNode {
+            key: owner_root.0,
+            root_index: owner_root.0,
+            indexes: vec![],
+            index_next: 3,
+            index_previous: 0,
+            owner: Some(owner),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: true,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_root, dir.to_sle_binary());
+
+        let mut known_keys = std::collections::BTreeSet::new();
+        known_keys.insert(owner_root);
+        let frontier_keys = known_keys.clone();
+
+        let (delta, next_frontier, _) = collect_authoritative_second_hop_delta_with_sources(
+            &state,
+            &[],
+            &known_keys,
+            &frontier_keys,
+            64,
+        );
+        let delta_keys: std::collections::BTreeSet<crate::ledger::Key> =
+            delta.iter().map(|key| crate::ledger::Key(*key)).collect();
+
+        assert!(delta_keys.contains(&crate::ledger::account::shamap_key(&owner)));
+        assert!(delta_keys.contains(&next_page));
+        assert!(next_frontier.contains(&next_page));
+    }
+
+    #[test]
+    fn authoritative_hop_frontier_promotes_book_directory_members() {
+        let mut state = crate::ledger::LedgerState::new();
+        let offer = crate::ledger::offer::Offer {
+            account: [0x64; 20],
+            sequence: 21,
+            taker_pays: crate::transaction::amount::Amount::Xrp(10),
+            taker_gets: crate::transaction::amount::Amount::Xrp(20),
+            flags: 0,
+            book_directory: {
+                let mut key = [0x95; 32];
+                key[24..32].copy_from_slice(&4u64.to_be_bytes());
+                key
+            },
+            book_node: 4,
+            owner_node: 7,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let offer_key = offer.key();
+        state.insert_raw(offer_key, offer.to_sle_binary());
+
+        let book_page = crate::ledger::directory::page_key(&offer.book_directory, offer.book_node);
+        let book_dir = crate::ledger::DirectoryNode {
+            key: book_page.0,
+            root_index: offer.book_directory,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(0x1234),
+            taker_pays_currency: Some([0x11; 20]),
+            taker_pays_issuer: Some([0x12; 20]),
+            taker_gets_currency: Some([0x13; 20]),
+            taker_gets_issuer: Some([0x14; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(book_page, book_dir.to_sle_binary());
+
+        let mut known_keys = std::collections::BTreeSet::new();
+        known_keys.insert(book_page);
+        let frontier_keys = known_keys.clone();
+
+        let (first_delta, next_frontier, _) = collect_authoritative_second_hop_delta_with_sources(
+            &state,
+            &[],
+            &known_keys,
+            &frontier_keys,
+            64,
+        );
+        let first_delta_keys: std::collections::BTreeSet<crate::ledger::Key> = first_delta
+            .iter()
+            .map(|key| crate::ledger::Key(*key))
+            .collect();
+
+        assert!(first_delta_keys.contains(&offer_key));
+        assert!(first_delta_keys.contains(&crate::ledger::Key(offer.book_directory)));
+        assert!(next_frontier.contains(&offer_key));
+
+        known_keys.extend(first_delta_keys.iter().copied());
+        let (second_delta, second_frontier, _) =
+            collect_authoritative_second_hop_delta_with_sources(
+                &state,
+                &[],
+                &known_keys,
+                &next_frontier,
+                64,
+            );
+        let second_delta_keys: std::collections::BTreeSet<crate::ledger::Key> = second_delta
+            .iter()
+            .map(|key| crate::ledger::Key(*key))
+            .collect();
+
+        assert!(second_delta_keys.contains(&crate::ledger::account::shamap_key(&offer.account)));
+        assert!(
+            second_delta_keys.contains(&crate::ledger::directory::owner_dir_key(&offer.account))
+        );
+        assert!(
+            second_delta_keys.contains(&crate::ledger::directory::page_key(
+                &crate::ledger::directory::owner_dir_key(&offer.account).0,
+                offer.owner_node,
+            ))
+        );
+        assert!(second_frontier.contains(&crate::ledger::directory::owner_dir_key(&offer.account)));
+        assert!(
+            second_frontier.contains(&crate::ledger::directory::page_key(
+                &crate::ledger::directory::owner_dir_key(&offer.account).0,
+                offer.owner_node,
+            ))
+        );
+    }
+
+    #[test]
+    fn authoritative_hop_frontier_promotes_trustline_account_scope() {
+        let mut state = crate::ledger::LedgerState::new();
+        let low = [0x31; 20];
+        let high = [0x62; 20];
+        let trustline = crate::ledger::trustline::RippleState {
+            low_account: low,
+            high_account: high,
+            currency: crate::transaction::amount::Currency { code: [0x55; 20] },
+            balance: crate::transaction::amount::IouValue::ZERO,
+            low_limit: crate::transaction::amount::IouValue {
+                mantissa: 1_000_000_000_000_000,
+                exponent: -15,
+            },
+            high_limit: crate::transaction::amount::IouValue {
+                mantissa: 2_000_000_000_000_000,
+                exponent: -15,
+            },
+            flags: 0,
+            low_node: 6,
+            high_node: 8,
+            low_quality_in: 0,
+            low_quality_out: 0,
+            high_quality_in: 0,
+            high_quality_out: 0,
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: Some(Vec::new()),
+        };
+        let mut trustline = trustline;
+        trustline.raw_sle = Some(trustline.encode());
+        let trustline_key = trustline.key();
+        state.insert_raw(trustline_key, trustline.to_sle_binary());
+
+        let owner_root = crate::ledger::directory::owner_dir_key(&low);
+        let owner_page = crate::ledger::directory::page_key(&owner_root.0, trustline.low_node);
+        let dir = crate::ledger::directory::DirectoryNode {
+            key: owner_page.0,
+            root_index: owner_root.0,
+            indexes: vec![trustline_key.0],
+            index_next: 0,
+            index_previous: 0,
+            owner: Some(low),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_page, dir.to_sle_binary());
+
+        let mut known_keys = std::collections::BTreeSet::new();
+        known_keys.insert(owner_page);
+        let frontier_keys = known_keys.clone();
+
+        let (first_delta, next_frontier, _) = collect_authoritative_second_hop_delta_with_sources(
+            &state,
+            &[],
+            &known_keys,
+            &frontier_keys,
+            64,
+        );
+        let first_delta_keys: std::collections::BTreeSet<crate::ledger::Key> = first_delta
+            .iter()
+            .map(|key| crate::ledger::Key(*key))
+            .collect();
+
+        assert!(first_delta_keys.contains(&trustline_key));
+        assert!(first_delta_keys.contains(&owner_root));
+        assert!(first_delta_keys.contains(&crate::ledger::account::shamap_key(&low)));
+        assert!(next_frontier.contains(&trustline_key));
+
+        known_keys.extend(first_delta_keys.iter().copied());
+        let (second_delta, second_frontier, _) =
+            collect_authoritative_second_hop_delta_with_sources(
+                &state,
+                &[],
+                &known_keys,
+                &next_frontier,
+                64,
+            );
+        let second_delta_keys: std::collections::BTreeSet<crate::ledger::Key> = second_delta
+            .iter()
+            .map(|key| crate::ledger::Key(*key))
+            .collect();
+
+        let high_root = crate::ledger::directory::owner_dir_key(&high);
+        let high_page = crate::ledger::directory::page_key(&high_root.0, trustline.high_node);
+
+        assert!(second_delta_keys.contains(&crate::ledger::account::shamap_key(&high)));
+        assert!(second_delta_keys.contains(&high_root));
+        assert!(second_delta_keys.contains(&high_page));
+        assert!(second_frontier.contains(&high_root));
+        assert!(second_frontier.contains(&high_page));
+    }
+
+    #[test]
+    fn authoritative_hop_cap_preserves_discovery_order_over_key_sort() {
+        let mut state = crate::ledger::LedgerState::new();
+
+        let first_frontier = crate::ledger::Key([0x10; 32]);
+        let second_frontier = crate::ledger::Key([0x20; 32]);
+        let first_member = [0xF0; 32];
+        let second_member = [0x01; 32];
+
+        let first_dir = crate::ledger::directory::DirectoryNode {
+            key: first_frontier.0,
+            root_index: first_frontier.0,
+            indexes: vec![first_member],
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(7),
+            taker_pays_currency: Some([0x11; 20]),
+            taker_pays_issuer: Some([0x12; 20]),
+            taker_gets_currency: Some([0x13; 20]),
+            taker_gets_issuer: Some([0x14; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(first_frontier, first_dir.to_sle_binary());
+
+        let second_dir = crate::ledger::directory::DirectoryNode {
+            key: second_frontier.0,
+            root_index: second_frontier.0,
+            indexes: vec![second_member],
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(9),
+            taker_pays_currency: Some([0x21; 20]),
+            taker_pays_issuer: Some([0x22; 20]),
+            taker_gets_currency: Some([0x23; 20]),
+            taker_gets_issuer: Some([0x24; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(second_frontier, second_dir.to_sle_binary());
+
+        let known_keys = std::collections::BTreeSet::from([first_frontier, second_frontier]);
+        let frontier_keys = known_keys.clone();
+
+        let (delta, _, discovered) = collect_authoritative_second_hop_delta_with_sources(
+            &state,
+            &[],
+            &known_keys,
+            &frontier_keys,
+            1,
+        );
+
+        assert_eq!(discovered, 2);
+        assert_eq!(delta, vec![first_member]);
     }
 
     #[test]
@@ -6739,6 +9567,7 @@ mod tests {
             58,
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &[],
             &mut state,
         );
 
@@ -6749,13 +9578,667 @@ mod tests {
             .expect("low owner root must exist");
         let low_dir =
             crate::ledger::DirectoryNode::decode(&low_raw, low_root.0).expect("valid low root");
-        assert!(low_dir.indexes.iter().any(|index| index == &trustline_key.0));
+        assert!(low_dir
+            .indexes
+            .iter()
+            .any(|index| index == &trustline_key.0));
 
         let high_raw = state
             .get_raw_owned(&high_root)
             .expect("high owner root must exist");
-        let high_dir = crate::ledger::DirectoryNode::decode(&high_raw, high_root.0)
-            .expect("valid high root");
-        assert!(high_dir.indexes.iter().any(|index| index == &trustline_key.0));
+        let high_dir =
+            crate::ledger::DirectoryNode::decode(&high_raw, high_root.0).expect("valid high root");
+        assert!(high_dir
+            .indexes
+            .iter()
+            .any(|index| index == &trustline_key.0));
+    }
+
+    #[test]
+    fn metadata_patch_created_directory_applies_offer_index_delta() {
+        let mut state = crate::ledger::LedgerState::new();
+        let owner = [0x33; 20];
+        let mut book_root = [0x66; 32];
+        book_root[24..32].copy_from_slice(&0u64.to_be_bytes());
+        let dir_key = crate::ledger::directory::page_key(&book_root, 1);
+        let offer_key = [0xC2; 32];
+
+        let nodes = vec![
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x006f,
+                ledger_index: offer_key,
+                fields: vec![
+                    crate::ledger::meta::ParsedField {
+                        type_code: 8,
+                        field_code: 1,
+                        data: owner.to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 3,
+                        field_code: 4,
+                        data: 0u64.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 5,
+                        field_code: 16,
+                        data: book_root.to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 3,
+                        field_code: 3,
+                        data: 1u64.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 6,
+                        field_code: 4,
+                        data: crate::transaction::amount::Amount::Xrp(10).to_bytes(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 6,
+                        field_code: 5,
+                        data: crate::transaction::amount::Amount::Xrp(20).to_bytes(),
+                    },
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+            crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x0064,
+                ledger_index: dir_key.0,
+                fields: vec![
+                    crate::ledger::meta::ParsedField {
+                        type_code: 5,
+                        field_code: 8,
+                        data: book_root.to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 3,
+                        field_code: 6,
+                        data: 0x1122u64.to_be_bytes().to_vec(),
+                    },
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            },
+        ];
+        let metadata = crate::ledger::meta::encode_metadata(0, 0, &nodes);
+
+        let stats = apply_metadata_patches(
+            &[([0xAB; 32], metadata)],
+            58,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &[],
+            &mut state,
+        );
+
+        assert_eq!(stats.created_override_miss_keys.len(), 2);
+
+        let dir_raw = state
+            .get_raw_owned(&dir_key)
+            .expect("directory page must exist");
+        let dir =
+            crate::ledger::DirectoryNode::decode(&dir_raw, dir_key.0).expect("valid directory");
+        assert!(dir.indexes.iter().any(|index| index == &offer_key));
+    }
+
+    #[test]
+    fn metadata_patch_created_authoritative_not_found_removes_local_entry() {
+        let mut state = crate::ledger::LedgerState::new();
+        let account = crate::ledger::AccountRoot {
+            account_id: [0x57; 20],
+            balance: 5_000_000,
+            sequence: 7,
+            owner_count: 1,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let key = crate::ledger::account::shamap_key(&account.account_id);
+        state.insert_account(account.clone());
+
+        let metadata = crate::ledger::meta::encode_metadata(
+            0,
+            0,
+            &[crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x0061,
+                ledger_index: key.0,
+                fields: vec![crate::ledger::meta::ParsedField {
+                    type_code: 8,
+                    field_code: 1,
+                    data: account.account_id.to_vec(),
+                }],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+        );
+        let mut created_overrides = std::collections::HashMap::new();
+        created_overrides.insert(key, RpcLedgerEntryFetch::NotFound);
+
+        let stats = apply_metadata_patches(
+            &[([0xAC; 32], metadata)],
+            58,
+            &created_overrides,
+            &std::collections::HashMap::new(),
+            &[],
+            &mut state,
+        );
+
+        assert_eq!(stats.created_override_miss_keys.len(), 1);
+        assert!(state.get_raw_owned(&key).is_none());
+        assert!(state.get_account(&account.account_id).is_none());
+    }
+
+    #[test]
+    fn metadata_patch_created_authoritative_not_found_cleans_offer_owner_directory_side_effects() {
+        let mut state = crate::ledger::LedgerState::new();
+        let owner = [0x58; 20];
+        let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+        let owner_page_num = 7u64;
+        let owner_page_key = crate::ledger::directory::page_key(&owner_root.0, owner_page_num);
+        let offer = crate::ledger::Offer {
+            account: owner,
+            sequence: 12,
+            taker_pays: crate::transaction::amount::Amount::Xrp(10),
+            taker_gets: crate::transaction::amount::Amount::Xrp(20),
+            flags: 0,
+            book_directory: [0x91; 32],
+            book_node: 0,
+            owner_node: owner_page_num,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let offer_key = offer.key();
+
+        let owner_root_dir = crate::ledger::DirectoryNode {
+            key: owner_root.0,
+            root_index: owner_root.0,
+            indexes: vec![],
+            index_next: owner_page_num,
+            index_previous: owner_page_num,
+            owner: Some(owner),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: true,
+            has_index_previous: true,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_root, owner_root_dir.encode());
+
+        let owner_page = crate::ledger::DirectoryNode {
+            key: owner_page_key.0,
+            root_index: owner_root.0,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            owner: Some(owner),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_page_key, owner_page.encode());
+
+        let offer_sle = offer.to_sle_binary();
+        state.insert_raw(offer_key, offer_sle.clone());
+        sync_typed(&mut state, 0x006f, &offer_key, &offer_sle);
+
+        let metadata = crate::ledger::meta::encode_metadata(
+            0,
+            0,
+            &[crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Created,
+                entry_type: 0x006f,
+                ledger_index: offer_key.0,
+                fields: vec![
+                    crate::ledger::meta::ParsedField {
+                        type_code: 2,
+                        field_code: 4,
+                        data: offer.sequence.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 3,
+                        field_code: 4,
+                        data: owner_page_num.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 5,
+                        field_code: 16,
+                        data: offer.book_directory.to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 6,
+                        field_code: 4,
+                        data: offer.taker_pays.to_bytes(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 6,
+                        field_code: 5,
+                        data: offer.taker_gets.to_bytes(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 8,
+                        field_code: 1,
+                        data: owner.to_vec(),
+                    },
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+        );
+        let mut created_overrides = std::collections::HashMap::new();
+        created_overrides.insert(offer_key, RpcLedgerEntryFetch::NotFound);
+
+        let stats = apply_metadata_patches(
+            &[([0xAD; 32], metadata)],
+            58,
+            &created_overrides,
+            &std::collections::HashMap::new(),
+            &[],
+            &mut state,
+        );
+
+        assert_eq!(stats.created_override_miss_keys.len(), 1);
+        assert!(state.get_raw_owned(&offer_key).is_none());
+
+        let root_raw = state
+            .get_raw_owned(&owner_root)
+            .expect("owner root must remain present");
+        let root_dir = crate::ledger::DirectoryNode::decode(&root_raw, owner_root.0)
+            .expect("valid owner root");
+        assert!(!root_dir.indexes.contains(&offer_key.0));
+
+        if let Some(page_raw) = state.get_raw_owned(&owner_page_key) {
+            let page_dir = crate::ledger::DirectoryNode::decode(&page_raw, owner_page_key.0)
+                .expect("valid owner page");
+            assert!(!page_dir.indexes.contains(&offer_key.0));
+        }
+    }
+
+    #[test]
+    fn metadata_patch_deleted_offer_cleans_owner_and_book_directory_side_effects() {
+        let mut state = crate::ledger::LedgerState::new();
+        state.enable_amendment(crate::crypto::sha512_first_half(b"fixPreviousTxnID"));
+        let owner = [0x5A; 20];
+        let owner_root = crate::ledger::directory::owner_dir_key(&owner);
+        let owner_page_num = 4u64;
+        let owner_page_key = crate::ledger::directory::page_key(&owner_root.0, owner_page_num);
+        let book_root = [0x93; 32];
+        let book_root_key = crate::ledger::Key(book_root);
+
+        let offer = crate::ledger::Offer {
+            account: owner,
+            sequence: 27,
+            taker_pays: crate::transaction::amount::Amount::Xrp(10),
+            taker_gets: crate::transaction::amount::Amount::Xrp(20),
+            flags: 0,
+            book_directory: book_root,
+            book_node: 0,
+            owner_node: owner_page_num,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let offer_key = offer.key();
+
+        let owner_root_dir = crate::ledger::DirectoryNode {
+            key: owner_root.0,
+            root_index: owner_root.0,
+            indexes: vec![],
+            index_next: owner_page_num,
+            index_previous: owner_page_num,
+            owner: Some(owner),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: true,
+            has_index_previous: true,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_root, owner_root_dir.encode());
+
+        let owner_page = crate::ledger::DirectoryNode {
+            key: owner_page_key.0,
+            root_index: owner_root.0,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            owner: Some(owner),
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(owner_page_key, owner_page.encode());
+
+        let book_root_dir = crate::ledger::DirectoryNode {
+            key: book_root,
+            root_index: book_root,
+            indexes: vec![offer_key.0],
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(7),
+            taker_pays_currency: Some([0x11; 20]),
+            taker_pays_issuer: Some([0x12; 20]),
+            taker_gets_currency: Some([0x13; 20]),
+            taker_gets_issuer: Some([0x14; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        state.insert_raw(book_root_key, book_root_dir.encode());
+
+        let offer_sle = offer.to_sle_binary();
+        state.insert_raw(offer_key, offer_sle.clone());
+        sync_typed(&mut state, 0x006f, &offer_key, &offer_sle);
+
+        let metadata = crate::ledger::meta::encode_metadata(
+            0,
+            0,
+            &[crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Deleted,
+                entry_type: 0x006f,
+                ledger_index: offer_key.0,
+                fields: vec![
+                    crate::ledger::meta::ParsedField {
+                        type_code: 2,
+                        field_code: 4,
+                        data: offer.sequence.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 3,
+                        field_code: 3,
+                        data: offer.book_node.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 3,
+                        field_code: 4,
+                        data: owner_page_num.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 5,
+                        field_code: 16,
+                        data: offer.book_directory.to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 6,
+                        field_code: 4,
+                        data: offer.taker_pays.to_bytes(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 6,
+                        field_code: 5,
+                        data: offer.taker_gets.to_bytes(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 8,
+                        field_code: 1,
+                        data: owner.to_vec(),
+                    },
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+        );
+
+        let _stats = apply_metadata_patches(
+            &[([0xAE; 32], metadata)],
+            58,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &[],
+            &mut state,
+        );
+
+        assert!(state.get_raw_owned(&offer_key).is_none());
+
+        let root_raw = state
+            .get_raw_owned(&owner_root)
+            .expect("owner root must remain present");
+        let root_dir = crate::ledger::DirectoryNode::decode(&root_raw, owner_root.0)
+            .expect("valid owner root");
+        assert!(!root_dir.indexes.contains(&offer_key.0));
+        assert_eq!(root_dir.previous_txn_id, Some([0xAE; 32]));
+        assert_eq!(root_dir.previous_txn_lgr_seq, Some(58));
+
+        if let Some(page_raw) = state.get_raw_owned(&owner_page_key) {
+            let page_dir = crate::ledger::DirectoryNode::decode(&page_raw, owner_page_key.0)
+                .expect("valid owner page");
+            assert!(!page_dir.indexes.contains(&offer_key.0));
+            assert_eq!(page_dir.previous_txn_id, Some([0xAE; 32]));
+            assert_eq!(page_dir.previous_txn_lgr_seq, Some(58));
+        }
+
+        if let Some(book_raw) = state.get_raw_owned(&book_root_key) {
+            let book_dir = crate::ledger::DirectoryNode::decode(&book_raw, book_root_key.0)
+                .expect("valid book root");
+            assert!(!book_dir.indexes.contains(&offer_key.0));
+            assert_eq!(book_dir.previous_txn_id, Some([0xAE; 32]));
+            assert_eq!(book_dir.previous_txn_lgr_seq, Some(58));
+        }
+    }
+
+    #[test]
+    fn metadata_patch_modified_uses_per_tx_prestate_before_live_raw() {
+        let mut state = crate::ledger::LedgerState::new();
+        let book_root = {
+            let mut key = [0x84; 32];
+            key[24..32].copy_from_slice(&0u64.to_be_bytes());
+            key
+        };
+        let dir_key = crate::ledger::Key(book_root);
+        let before_dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(9),
+            taker_pays_currency: Some([0x01; 20]),
+            taker_pays_issuer: Some([0x02; 20]),
+            taker_gets_currency: Some([0x03; 20]),
+            taker_gets_issuer: Some([0x04; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        let live_dir = crate::ledger::DirectoryNode {
+            key: dir_key.0,
+            root_index: dir_key.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: Some(9),
+            taker_pays_currency: Some([0xEE; 20]),
+            taker_pays_issuer: Some([0xED; 20]),
+            taker_gets_currency: Some([0xEC; 20]),
+            taker_gets_issuer: Some([0xEB; 20]),
+            nftoken_id: None,
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        };
+        let before_raw = before_dir.encode();
+        state.insert_raw(dir_key, live_dir.encode());
+
+        let tx_hash = [0xAE; 32];
+        let metadata = crate::ledger::meta::encode_metadata(
+            0,
+            0,
+            &[crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0064,
+                ledger_index: dir_key.0,
+                fields: vec![
+                    crate::ledger::meta::ParsedField {
+                        type_code: 3,
+                        field_code: 6,
+                        data: 9u64.to_be_bytes().to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 5,
+                        field_code: 8,
+                        data: book_root.to_vec(),
+                    },
+                ],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+        );
+        let per_tx_local_touched = vec![crate::ledger::close::TxLocalTouched {
+            tx_id: tx_hash,
+            tx_index: 0,
+            touched: vec![(dir_key, Some(before_raw))],
+        }];
+
+        let stats = apply_metadata_patches(
+            &[(tx_hash, metadata)],
+            58,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &per_tx_local_touched,
+            &mut state,
+        );
+
+        assert_eq!(stats.missing_modified, 0);
+
+        let raw = state
+            .get_raw_owned(&dir_key)
+            .expect("directory must remain present");
+        let dir = crate::ledger::DirectoryNode::decode(&raw, dir_key.0).expect("valid directory");
+        assert_eq!(dir.taker_pays_currency, Some([0x01; 20]));
+        assert_eq!(dir.taker_pays_issuer, Some([0x02; 20]));
+        assert_eq!(dir.taker_gets_currency, Some([0x03; 20]));
+        assert_eq!(dir.taker_gets_issuer, Some([0x04; 20]));
+    }
+
+    #[test]
+    fn authoritative_not_found_removes_local_account_even_without_metadata_delete() {
+        let mut state = crate::ledger::LedgerState::new();
+        let account = crate::ledger::AccountRoot {
+            account_id: [0x77; 20],
+            balance: 5_000_000,
+            sequence: 7,
+            owner_count: 1,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let key = crate::ledger::account::shamap_key(&account.account_id);
+        state.insert_account(account.clone());
+
+        assert!(state.get_raw_owned(&key).is_some());
+        assert!(state.get_account(&account.account_id).is_some());
+
+        assert!(remove_authoritatively_absent_key(&mut state, &key));
+        assert!(state.get_raw_owned(&key).is_none());
+        assert!(state.get_account(&account.account_id).is_none());
+    }
+
+    #[test]
+    fn collect_auxiliary_non_metadata_touched_keys_excludes_metadata_keys() {
+        let tx_hash = [0xB1; 32];
+        let metadata_key = crate::ledger::Key([0x11; 32]);
+        let auxiliary_key = crate::ledger::Key([0x22; 32]);
+        let metadata = crate::ledger::meta::encode_metadata(
+            0,
+            0,
+            &[crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x006f,
+                ledger_index: metadata_key.0,
+                fields: vec![],
+                previous_fields: vec![],
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+        );
+        let per_tx_local_touched = vec![crate::ledger::close::TxLocalTouched {
+            tx_id: tx_hash,
+            tx_index: 0,
+            touched: vec![(metadata_key, None), (auxiliary_key, None)],
+        }];
+
+        let collected = collect_auxiliary_non_metadata_touched_keys(
+            &[(tx_hash, metadata)],
+            &per_tx_local_touched,
+        );
+
+        assert_eq!(collected, vec![auxiliary_key]);
     }
 }

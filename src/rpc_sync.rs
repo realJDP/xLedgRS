@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
 
@@ -231,46 +231,241 @@ pub async fn run_rpc_sync(
     sync_state.running.store(false, Ordering::SeqCst);
 }
 
-/// Minimal HTTP POST client using raw TCP.
-/// The rippled admin RPC is plain HTTP on a private network.
-pub async fn http_post(host: &str, port: u16, body: &str) -> anyhow::Result<String> {
-    let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(&addr).await?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcTransport {
+    Http,
+    Https,
+}
 
+/// Minimal HTTP POST client with TLS support for public XRPL RPC endpoints.
+///
+/// Local/private admin RPC is still plain HTTP, but public full-history
+/// endpoints on ports like 51234 expect HTTPS.
+pub async fn http_post(host: &str, port: u16, body: &str) -> anyhow::Result<String> {
     let request = format!(
         "POST / HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         host, port, body.len(), body
     );
 
-    stream.write_all(request.as_bytes()).await?;
+    let response = match preferred_transport(host, port) {
+        RpcTransport::Https => match post_https(host, port, &request).await {
+            Ok(resp) => resp,
+            Err(https_err) => {
+                let http_err = match post_http(host, port, &request).await {
+                    Ok(resp) => return extract_http_body(&resp),
+                    Err(err) => err,
+                };
+                return Err(anyhow::anyhow!(
+                    "HTTPS request failed ({https_err}); HTTP fallback failed ({http_err})"
+                ));
+            }
+        },
+        RpcTransport::Http => post_http(host, port, &request).await?,
+    };
 
-    // Read the full response with a timeout; rippled can stall on large pages.
-    let mut response = Vec::new();
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        stream.read_to_end(&mut response),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(anyhow::anyhow!("read timeout (60s)")),
+    extract_http_body(&response)
+}
+
+fn preferred_transport(host: &str, port: u16) -> RpcTransport {
+    if is_probably_local_host(host) {
+        return RpcTransport::Http;
+    }
+    match port {
+        443 | 51234 => RpcTransport::Https,
+        _ => RpcTransport::Http,
+    }
+}
+
+fn is_probably_local_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" || host == "[::1]" {
+        return true;
     }
 
-    let response_str = String::from_utf8_lossy(&response);
+    let parsed = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>();
+    match parsed {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unique_local(),
+        Err(_) => false,
+    }
+}
 
-    // Find the body after `\r\n\r\n`.
-    let body_start = response_str
-        .find("\r\n\r\n")
+async fn post_http(host: &str, port: u16, request: &str) -> anyhow::Result<Vec<u8>> {
+    let addr = format!("{}:{}", host, port);
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect timeout (10s)"))??;
+
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+    read_http_response(&mut stream).await
+}
+
+async fn post_https(host: &str, port: u16, request: &str) -> anyhow::Result<Vec<u8>> {
+    use rustls::ClientConfig;
+    use rustls_pki_types::ServerName;
+    use std::sync::Arc as StdArc;
+    use tokio_rustls::TlsConnector;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(StdArc::new(config));
+
+    let addr = format!("{}:{}", host, port);
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect timeout (10s)"))??;
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
+    let mut tls = connector.connect(server_name, tcp).await?;
+
+    tls.write_all(request.as_bytes()).await?;
+    tls.flush().await?;
+    read_http_response(&mut tls).await
+}
+
+async fn read_http_response<R>(reader: &mut R) -> anyhow::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(60), reader.read(&mut chunk))
+            .await
+        {
+            Ok(Ok(0)) => {
+                if is_complete_http_response(&response) {
+                    return Ok(response);
+                }
+                return Err(anyhow::anyhow!(
+                    "unexpected EOF before complete HTTP response"
+                ));
+            }
+            Ok(Ok(n)) => {
+                response.extend_from_slice(&chunk[..n]);
+                if is_complete_http_response(&response) {
+                    return Ok(response);
+                }
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(anyhow::anyhow!("read timeout (60s)")),
+        }
+    }
+}
+
+fn extract_http_body(response: &[u8]) -> anyhow::Result<String> {
+    let body_start = header_end_offset(response)
         .ok_or_else(|| anyhow::anyhow!("no HTTP body separator found"))?;
+    let headers = std::str::from_utf8(&response[..body_start])
+        .map_err(|_| anyhow::anyhow!("HTTP headers are not valid UTF-8"))?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP status line"))?;
+    if !(200..300).contains(&status) {
+        return Err(anyhow::anyhow!("HTTP status {}", status));
+    }
 
-    let body_content = &response_str[body_start + 4..];
-
-    // Handle chunked transfer encoding.
-    if response_str.contains("Transfer-Encoding: chunked") {
-        Ok(decode_chunked(body_content))
+    let body = &response[body_start..];
+    if is_chunked_headers(headers) {
+        Ok(decode_chunked(&String::from_utf8_lossy(body)))
+    } else if let Some(content_length) = content_length(headers) {
+        if body.len() < content_length {
+            return Err(anyhow::anyhow!(
+                "HTTP body shorter than Content-Length ({}/{})",
+                body.len(),
+                content_length
+            ));
+        }
+        Ok(String::from_utf8_lossy(&body[..content_length]).to_string())
     } else {
-        Ok(body_content.to_string())
+        Ok(String::from_utf8_lossy(body).to_string())
+    }
+}
+
+fn is_complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = header_end_offset(response) else {
+        return false;
+    };
+    let Ok(headers) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let body = &response[header_end..];
+    if is_chunked_headers(headers) {
+        return is_complete_chunked_body(body);
+    }
+    if let Some(content_length) = content_length(headers) {
+        return body.len() >= content_length;
+    }
+    false
+}
+
+fn header_end_offset(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("content-length") {
+            return None;
+        }
+        value.trim().parse::<usize>().ok()
+    })
+}
+
+fn is_chunked_headers(headers: &str) -> bool {
+    headers.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
+fn is_complete_chunked_body(mut body: &[u8]) -> bool {
+    loop {
+        let Some(line_end) = body.windows(2).position(|window| window == b"\r\n") else {
+            return false;
+        };
+        let Ok(size_line) = std::str::from_utf8(&body[..line_end]) else {
+            return false;
+        };
+        let size_hex = size_line.split(';').next().unwrap_or_default().trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+            return false;
+        };
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return body.starts_with(b"\r\n");
+        }
+        if body.len() < size + 2 {
+            return false;
+        }
+        if &body[size..size + 2] != b"\r\n" {
+            return false;
+        }
+        body = &body[size + 2..];
     }
 }
 
@@ -402,6 +597,29 @@ mod tests {
     fn test_decode_chunked_single() {
         let input = "d\r\n{\"test\":true}\r\n0\r\n\r\n";
         assert_eq!(decode_chunked(input), "{\"test\":true}");
+    }
+
+    #[test]
+    fn test_preferred_transport_public_rpc_uses_https() {
+        assert_eq!(
+            preferred_transport("s1.ripple.com", 51234),
+            RpcTransport::Https
+        );
+        assert_eq!(preferred_transport("example.com", 443), RpcTransport::Https);
+    }
+
+    #[test]
+    fn test_preferred_transport_local_admin_uses_http() {
+        assert_eq!(preferred_transport("127.0.0.1", 5005), RpcTransport::Http);
+        assert_eq!(preferred_transport("localhost", 51234), RpcTransport::Http);
+        assert_eq!(preferred_transport("10.0.0.9", 51234), RpcTransport::Http);
+    }
+
+    #[test]
+    fn test_extract_http_body_rejects_non_success_status() {
+        let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\nnope";
+        let err = extract_http_body(response).unwrap_err().to_string();
+        assert!(err.contains("HTTP status 503"));
     }
 
     fn make_header(seq: u32) -> LedgerHeader {

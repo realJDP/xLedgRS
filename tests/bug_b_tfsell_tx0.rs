@@ -1,9 +1,9 @@
 //! Deterministic reproducer for Bug B (tfSell + tfImmediateOrCancel crossing
 //! math divergence).
 //!
-//! Loads the captured forensic bundle for mainnet ledger 103483090, seeds a
-//! fresh `LedgerState` with the pre-replay metadata-affected keys, and replays
-//! only tx_idx=0 — an `OfferCreate` from account
+//! Loads an opt-in captured forensic bundle, seeds a fresh `LedgerState` with
+//! the pre-replay metadata-affected keys, and replays only tx_idx=0 — an
+//! `OfferCreate` from account
 //! `3200D97F878B3DB3252290FB8F9C9710AA369182` with flags `tfSell | tfIOC` and
 //! 3 crossing candidates in the opposite book.
 //!
@@ -11,10 +11,9 @@
 //! the divergent RLUSD trust line (RippleState SLE, shamap key
 //! `02E619195FA6D4F298FCE0EE851282604CAAB64A3B008A65811D2F8CA402FC83`).
 //!
-//! This fixture depends on the forensic bundle at
-//! `debug-runs/103483089-103483090-epoch1775952772/` being present on disk.
-//! When the bundle is absent, the test skips so fresh checkouts do not fail
-//! before the capture is restored.
+//! Set `XLEDGRSV2BETA_BUG_B_FIXTURE` to the forensic bundle directory to run this
+//! test. Without the env var, the test skips so fresh checkouts do not depend
+//! on private capture data.
 
 use std::path::PathBuf;
 
@@ -22,7 +21,6 @@ use xrpl::ledger::close::replay_ledger;
 use xrpl::ledger::forensic::loader;
 use xrpl::ledger::{Key, LedgerState};
 
-const BUNDLE_DIR: &str = "debug-runs/103483089-103483090-epoch1775952772";
 const DIVERGENT_KEY_HEX: &str = "02E619195FA6D4F298FCE0EE851282604CAAB64A3B008A65811D2F8CA402FC83";
 
 fn decode_key(hex_str: &str) -> [u8; 32] {
@@ -34,7 +32,10 @@ fn decode_key(hex_str: &str) -> [u8; 32] {
 
 #[test]
 fn bug_b_tfsell_tx0_trust_line_matches_rippled() {
-    let bundle = PathBuf::from(BUNDLE_DIR);
+    let Some(bundle) = std::env::var_os("XLEDGRSV2BETA_BUG_B_FIXTURE").map(PathBuf::from) else {
+        eprintln!("XLEDGRSV2BETA_BUG_B_FIXTURE not set — skipping forensic fixture test");
+        return;
+    };
     if !bundle.exists() {
         eprintln!(
             "bundle not found at {:?} — skipping (re-capture required)",

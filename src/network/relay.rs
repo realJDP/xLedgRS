@@ -824,7 +824,7 @@ pub fn decode_replay_delta_response(payload: &[u8]) -> Option<proto::TmReplayDel
     proto::TmReplayDeltaResponse::decode(payload).ok()
 }
 
-// ── Snapshot sync (xLedgRS custom — not understood by rippled) ────────────────
+// ── Snapshot sync (xLedgRSv2Beta custom — not understood by rippled) ────────────────
 // This remains a project-local protocol; wire-compatible TMGetLedger parity is
 // a future interoperability goal rather than a hidden requirement of this code.
 
@@ -871,7 +871,7 @@ pub fn decode_snapshot_end(data: &[u8]) -> Option<(u32, [u8; 32])> {
     Some((seq, hash))
 }
 
-// ── Historical ledger download (xLedgRS custom — not understood by rippled) ──
+// ── Historical ledger download (xLedgRSv2Beta custom — not understood by rippled) ──
 // This remains a project-local protocol; wire-compatible TMGetLedger parity is
 // a future interoperability goal rather than a hidden requirement of this code.
 

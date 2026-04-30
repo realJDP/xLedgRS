@@ -5,6 +5,8 @@
 mod account_delete;
 mod account_set;
 mod amm;
+mod amm_step;
+mod asset_flow;
 mod batch;
 mod check;
 mod clawback;
@@ -129,6 +131,12 @@ pub struct TxContext {
     /// DeliveredAmount from validated metadata (top-level sfDeliveredAmount),
     /// when present.
     pub validated_delivered_amount: Option<Amount>,
+    /// Validated replay bridge for OfferCreate transactions whose metadata
+    /// shows AMM-only crossing that the local offer engine does not yet model.
+    pub validated_offer_create_amm_bridge: bool,
+    /// Validated replay bridge for self-Payment transactions whose metadata
+    /// shows an AMM-only XRP/IOU swap that Flow does not yet model.
+    pub validated_payment_amm_self_swap_bridge: bool,
 }
 
 impl TxContext {
@@ -140,6 +148,8 @@ impl TxContext {
             close_time,
             validated_result: None,
             validated_delivered_amount: None,
+            validated_offer_create_amm_bridge: false,
+            validated_payment_amm_self_swap_bridge: false,
         }
     }
 }
@@ -152,6 +162,8 @@ impl Default for TxContext {
             close_time: 0,
             validated_result: None,
             validated_delivered_amount: None,
+            validated_offer_create_amm_bridge: false,
+            validated_payment_amm_self_swap_bridge: false,
         }
     }
 }
@@ -170,6 +182,56 @@ pub enum ApplyResult {
 /// must use `TicketSequence` instead of the literal `Sequence=0`.
 pub(crate) fn sequence_proxy(tx: &ParsedTx) -> u32 {
     tx.ticket_sequence.unwrap_or(tx.sequence)
+}
+
+fn ticket_exists(state: &LedgerState, account: &[u8; 20], ticket_seq: u32) -> bool {
+    let ticket_key = crate::ledger::keylet::ticket(account, ticket_seq);
+    state.get_raw_owned(&ticket_key.key).is_some()
+}
+
+fn consume_ticket(
+    state: &mut LedgerState,
+    account: &[u8; 20],
+    ticket_seq: u32,
+    account_root: &mut crate::ledger::AccountRoot,
+) -> bool {
+    let ticket_key = crate::ledger::keylet::ticket(account, ticket_seq);
+    let mut ticket_owner_node = None;
+    let ticket_exists = if let Some(ticket) = state.remove_ticket(&ticket_key.key) {
+        ticket_owner_node = Some(ticket.owner_node);
+        true
+    } else if let Some(raw) = state.get_raw_owned(&ticket_key.key) {
+        // Ticket exists in NuDB but was not hydrated into the typed map.
+        // Decode before deletion so OwnerNode can target the right page.
+        ticket_owner_node =
+            crate::ledger::Ticket::decode_from_sle(&raw).map(|ticket| ticket.owner_node);
+        state.remove_raw(&ticket_key.key);
+        true
+    } else {
+        false
+    };
+
+    if !ticket_exists {
+        return false;
+    }
+
+    let owner_root = crate::ledger::directory::owner_dir_key(account);
+    let removed_from_owner_dir = ticket_owner_node
+        .map(|owner_node| {
+            crate::ledger::directory::dir_remove_root_page(
+                state,
+                &owner_root,
+                owner_node,
+                &ticket_key.key.0,
+            )
+        })
+        .unwrap_or(false);
+    if !removed_from_owner_dir {
+        crate::ledger::directory::dir_remove(state, account, &ticket_key.key.0);
+    }
+    account_root.owner_count = account_root.owner_count.saturating_sub(1);
+    account_root.ticket_count = account_root.ticket_count.saturating_sub(1);
+    true
 }
 
 /// Bridge handlers that currently rely on authoritative metadata during
@@ -257,7 +319,7 @@ pub fn run_tx(
         }
     }
 
-    let acct = match state.get_account(&tx.account) {
+    let acct = match load_existing_account(state, &tx.account) {
         Some(a) => a.clone(),
         None => {
             return TxRunResult {
@@ -273,16 +335,37 @@ pub fn run_tx(
     // Sequence=0 signals ticket-based; TicketSequence present signals ticket-based.
     if tx.ticket_sequence.is_some() && tx.sequence != 0 {
         return TxRunResult {
-            ter: ter::TEM_INVALID,
+            ter: ter::TEM_SEQ_AND_TICKET,
             applied: false,
             touched: Vec::new(),
         };
     }
 
-    // For ticket-based txs (sequence=0), skip the normal sequence check.
-    // Full ticket consumption is deferred to the handler. This stage only
-    // enforces the gate.
-    if tx.sequence != 0 && tx.sequence != acct.sequence {
+    if tx.sequence == 0 {
+        let Some(ticket_seq) = tx.ticket_sequence else {
+            return TxRunResult {
+                ter: ter::TEF_PAST_SEQ,
+                applied: false,
+                touched: Vec::new(),
+            };
+        };
+
+        if acct.sequence <= ticket_seq {
+            return TxRunResult {
+                ter: ter::TER_PRE_TICKET,
+                applied: false,
+                touched: Vec::new(),
+            };
+        }
+
+        if !ticket_exists(state, &tx.account, ticket_seq) {
+            return TxRunResult {
+                ter: ter::TEF_NO_TICKET,
+                applied: false,
+                touched: Vec::new(),
+            };
+        }
+    } else if tx.sequence != acct.sequence {
         if flags.contains(ApplyFlags::VALIDATED_REPLAY) {
             tracing::warn!(
                 "validated replay terPRE_SEQ: acct={} tx_seq={} acct_seq={} tx_type={} ticket_seq={:?}",
@@ -293,8 +376,13 @@ pub fn run_tx(
                 tx.ticket_sequence,
             );
         }
+        let ter = if tx.sequence < acct.sequence {
+            ter::TEF_PAST_SEQ
+        } else {
+            ter::TER_PRE_SEQ
+        };
         return TxRunResult {
-            ter: ter::TER_PRE_SEQ,
+            ter,
             applied: false,
             touched: Vec::new(),
         };
@@ -354,7 +442,15 @@ pub fn run_tx(
         // Discard all tx effects, then re-apply fee+sequence only
         state.discard_tx();
         state.begin_tx();
-        apply_fee_only(state, tx);
+        let fee_only_ter = apply_fee_only(state, tx);
+        if !fee_only_ter.is_tes_success() {
+            state.discard_tx();
+            return TxRunResult {
+                ter: fee_only_ter,
+                applied: false,
+                touched: Vec::new(),
+            };
+        }
         let touched = state.commit_tx();
         return TxRunResult {
             ter,
@@ -428,7 +524,15 @@ pub fn run_tx(
 
     // Fee-only reset
     state.begin_tx();
-    apply_fee_only(state, tx);
+    let fee_only_ter = apply_fee_only(state, tx);
+    if !fee_only_ter.is_tes_success() {
+        state.discard_tx();
+        return TxRunResult {
+            ter: fee_only_ter,
+            applied: false,
+            touched: Vec::new(),
+        };
+    }
 
     // Check invariants on fee-only path
     let fee_touched = state.peek_tx_journal();
@@ -458,17 +562,43 @@ pub fn run_tx(
     }
 }
 
-/// Apply only fee deduction and sequence bump — no transaction-specific logic.
+/// Apply only fee deduction and sequence/ticket consumption — no transaction-specific logic.
 /// Used after a reset (discard) to claim the fee on tec results.
-fn apply_fee_only(state: &mut LedgerState, tx: &ParsedTx) {
-    if let Some(acct) = state.get_account(&tx.account) {
+fn apply_fee_only(state: &mut LedgerState, tx: &ParsedTx) -> TxResult {
+    if let Some(acct) = load_existing_account(state, &tx.account) {
         let mut updated = acct.clone();
         // Cap fee to available balance (rippled Transactor.cpp:1033-1034)
         let fee = std::cmp::min(tx.fee, updated.balance);
         updated.balance -= fee;
-        updated.sequence += 1;
+        if tx.sequence != 0 {
+            updated.sequence += 1;
+        } else if let Some(ticket_seq) = tx.ticket_sequence {
+            if !consume_ticket(state, &tx.account, ticket_seq, &mut updated) {
+                return ter::TEF_BAD_LEDGER;
+            }
+        }
         state.insert_account(updated);
+        ter::TES_SUCCESS
+    } else {
+        ter::TER_NO_ACCOUNT
     }
+}
+
+pub(crate) fn load_existing_account(
+    state: &mut LedgerState,
+    account_id: &[u8; 20],
+) -> Option<crate::ledger::account::AccountRoot> {
+    if let Some(existing) = state.get_account(account_id).cloned() {
+        return Some(existing);
+    }
+
+    let key = crate::ledger::account::shamap_key(account_id);
+    let raw = state
+        .get_raw_owned(&key)
+        .or_else(|| state.get_committed_raw_owned(&key))?;
+    let account = crate::ledger::account::AccountRoot::decode(&raw).ok()?;
+    state.hydrate_account(account.clone());
+    Some(account)
 }
 
 /// Classify a TxRunResult for the close loop.
@@ -731,6 +861,14 @@ fn extract_majorities_raw(sle_data: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Recover the sender balance before the transaction fee was deducted.
+///
+/// Reserve gates for reserve-creating transactors should use the pre-fee
+/// balance, matching rippled's convention.
+pub(crate) fn balance_before_fee(balance_after_fee: u64, fee: u64) -> u64 {
+    balance_after_fee.saturating_add(fee)
+}
+
 pub fn apply_tx(state: &mut LedgerState, tx: &ParsedTx, ctx: &TxContext) -> ApplyResult {
     // ── Pseudo-transactions (system txs) ─────────────────────────────────────
     // These have Account=0x0000..., Fee=0, Sequence=0.  They don't debit any
@@ -857,7 +995,7 @@ pub fn apply_tx(state: &mut LedgerState, tx: &ParsedTx, ctx: &TxContext) -> Appl
     }
 
     // Load the sender's account.
-    let mut new_sender = match state.get_account(&tx.account) {
+    let mut new_sender = match load_existing_account(state, &tx.account) {
         Some(a) => a.clone(),
         None => return ApplyResult::ClaimedCost("terNO_ACCOUNT"),
     };
@@ -872,21 +1010,8 @@ pub fn apply_tx(state: &mut LedgerState, tx: &ParsedTx, ctx: &TxContext) -> Appl
     } else if let Some(ticket_seq) = tx.ticket_sequence {
         // Consume the ticket: delete from state, remove from owner directory,
         // decrement owner_count. Matches rippled's consumeTicket().
-        let ticket_key = crate::ledger::keylet::ticket(&tx.account, ticket_seq);
-        let ticket_exists = if state.remove_ticket(&ticket_key.key).is_some() {
-            true
-        } else if state.get_raw_owned(&ticket_key.key).is_some() {
-            // Ticket exists in NuDB but wasn't hydrated into typed map.
-            // Remove the raw SLE directly.
-            state.remove_raw(&ticket_key.key);
-            true
-        } else {
-            false
-        };
-        if ticket_exists {
-            crate::ledger::directory::dir_remove(state, &tx.account, &ticket_key.key.0);
-            new_sender.owner_count = new_sender.owner_count.saturating_sub(1);
-            new_sender.ticket_count = new_sender.ticket_count.saturating_sub(1);
+        if !consume_ticket(state, &tx.account, ticket_seq, &mut new_sender) {
+            return ApplyResult::ClaimedCost("tefBAD_LEDGER");
         }
     }
 
@@ -906,7 +1031,21 @@ pub fn apply_tx(state: &mut LedgerState, tx: &ParsedTx, ctx: &TxContext) -> Appl
             match tx.tx_type {
                 2 => escrow::apply_escrow_finish(state, tx, ctx.close_time), // EscrowFinish
                 4 => escrow::apply_escrow_cancel(state, tx, ctx.close_time), // EscrowCancel
-                7 => offer::apply_offer_create(state, tx, ctx.close_time),   // OfferCreate
+                7 => {
+                    if ctx.validated_offer_create_amm_bridge {
+                        offer::apply_validated_amm_offer_create(state, tx, ctx.close_time)
+                            .unwrap_or_else(|| {
+                                bridge_metadata_only_tx(
+                                    ctx,
+                                    tx.tx_type,
+                                    "OfferCreate AMM validated bridge",
+                                    "temUNKNOWN",
+                                )
+                            })
+                    } else {
+                        offer::apply_offer_create(state, tx, ctx.close_time)
+                    }
+                } // OfferCreate
                 8 => offer::apply_offer_cancel(state, tx),                   // OfferCancel
                 15 => paychan::apply_paychan_claim(state, tx, ctx.close_time), // PaymentChannelClaim
                 17 => check::apply_check_cash(state, tx, ctx.close_time),      // CheckCash
@@ -1198,6 +1337,157 @@ mod tests {
     }
 
     #[test]
+    fn validated_replay_amm_payment_bridge_spends_exact_quote_not_send_max() {
+        use crate::ledger::meta::ParsedField;
+        use crate::ledger::RippleState;
+        use crate::transaction::amount::{Currency, IouValue, Issue};
+
+        let mut state = state_with_genesis(1_000_000_000);
+        let issuer = dest_id();
+        let pseudo = [0xBB; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let usd_issue = Issue::Iou {
+            currency: usd.clone(),
+            issuer,
+        };
+        let deliver = Amount::Iou {
+            value: IouValue::from_f64(10.0),
+            currency: usd.clone(),
+            issuer,
+        };
+
+        state.insert_account(AccountRoot {
+            account_id: issuer,
+            balance: 0,
+            sequence: 1,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        });
+        state.insert_account(AccountRoot {
+            account_id: pseudo,
+            balance: 10_000_000_000,
+            sequence: 1,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        });
+
+        let mut pool_line = RippleState::new(&pseudo, &issuer, usd.clone());
+        pool_line.transfer(&issuer, &IouValue::from_f64(1_000.0));
+        state.insert_trustline(pool_line);
+
+        let amm_fields = vec![
+            ParsedField {
+                type_code: 8,
+                field_code: 1,
+                data: pseudo.to_vec(),
+            },
+            ParsedField {
+                type_code: 1,
+                field_code: 2,
+                data: 0u16.to_be_bytes().to_vec(),
+            },
+            ParsedField {
+                type_code: 24,
+                field_code: 3,
+                data: Issue::Xrp.to_bytes(),
+            },
+            ParsedField {
+                type_code: 24,
+                field_code: 4,
+                data: usd_issue.to_bytes(),
+            },
+        ];
+        state.insert_raw(
+            amm::amm_key(&Issue::Xrp, &usd_issue),
+            crate::ledger::meta::build_sle(0x0079, &amm_fields, None, None),
+        );
+
+        let tx = ParsedTx {
+            tx_type: 0,
+            flags: 0x0002_0000,
+            sequence: 1,
+            fee: 12,
+            account: genesis_id(),
+            destination: Some(genesis_id()),
+            amount: Some(deliver.clone()),
+            send_max: Some(Amount::Xrp(200_000_000)),
+            ..ParsedTx::default()
+        };
+        let replay_ctx = TxContext {
+            ledger_seq: 2,
+            validated_result: Some(ter::TES_SUCCESS),
+            validated_delivered_amount: Some(deliver.clone()),
+            validated_payment_amm_self_swap_bridge: true,
+            ..TxContext::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &replay_ctx, ApplyFlags::VALIDATED_REPLAY);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let expected_spend = 101_010_102;
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 1_000_000_000 - 12 - expected_spend);
+        assert_eq!(sender.sequence, 2);
+
+        let pool_account = state.get_account(&pseudo).unwrap();
+        assert_eq!(pool_account.balance, 10_000_000_000 + expected_spend);
+
+        let sender_line = state
+            .get_trustline_for(&genesis_id(), &issuer, &usd)
+            .unwrap();
+        assert_eq!(
+            sender_line.balance_for(&genesis_id()),
+            IouValue::from_f64(10.0)
+        );
+
+        let pool_line = state.get_trustline_for(&pseudo, &issuer, &usd).unwrap();
+        assert_eq!(pool_line.balance_for(&pseudo), IouValue::from_f64(990.0));
+    }
+
+    #[test]
+    fn direct_xrp_self_payment_without_paths_is_redundant() {
+        let mut state = state_with_genesis(1_000_000);
+        let tx = ParsedTx {
+            tx_type: 0,
+            sequence: 1,
+            fee: 12,
+            account: genesis_id(),
+            destination: Some(genesis_id()),
+            amount: Some(Amount::Xrp(100_000)),
+            ..ParsedTx::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEM_REDUNDANT);
+        assert!(!result.applied);
+        assert!(result.touched.is_empty());
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 1_000_000);
+        assert_eq!(sender.sequence, 1);
+    }
+
+    #[test]
     fn validated_replay_same_currency_sendmax_does_not_mutate_trustline_locally() {
         use crate::transaction::amount::{Currency, IouValue};
 
@@ -1251,7 +1541,10 @@ mod tests {
         let result = run_tx(&mut state, &tx, &replay_ctx, ApplyFlags::VALIDATED_REPLAY);
         assert_eq!(result.ter, ter::TES_SUCCESS);
 
-        let after = state.get_trustline(&key).unwrap().balance_for(&genesis_id());
+        let after = state
+            .get_trustline(&key)
+            .unwrap()
+            .balance_for(&genesis_id());
         assert_eq!(after.mantissa, before.mantissa);
         assert_eq!(after.exponent, before.exponent);
 
@@ -1313,7 +1606,10 @@ mod tests {
 
         let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
         assert_eq!(result.ter, ter::TEC_PATH_DRY);
-        assert!(result.applied, "unsupported same-currency SendMax should fee-claim");
+        assert!(
+            result.applied,
+            "unsupported same-currency SendMax should fee-claim"
+        );
     }
 
     #[test]
@@ -1336,7 +1632,7 @@ mod tests {
             previous_txn_lgr_seq: 0,
             raw_sle: None,
         });
-        let tx = sign_payment(1, 10_500_000, 12);
+        let tx = sign_payment(1, 19_500_000, 12);
 
         let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
         assert_eq!(result.ter, ter::TEC_UNFUNDED_PAYMENT);
@@ -1346,6 +1642,82 @@ mod tests {
         assert_eq!(sender.balance, 20_000_000 - 12);
         assert_eq!(sender.sequence, 2);
         assert_eq!(state.get_account(&dest_id()).unwrap().balance, 1);
+    }
+
+    #[test]
+    fn direct_xrp_payment_creates_destination_with_ledger_sequence() {
+        let mut state = state_with_genesis(50_000_000);
+        let tx = sign_payment(1, 10_000_000, 12);
+        let run_ctx = TxContext {
+            ledger_seq: 88,
+            ..ctx(0)
+        };
+
+        let result = run_tx(&mut state, &tx, &run_ctx, ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let dest = state.get_account(&dest_id()).unwrap();
+        assert_eq!(dest.balance, 10_000_000);
+        assert_eq!(dest.sequence, 88);
+    }
+
+    #[test]
+    fn direct_xrp_payment_clears_destination_password_spent() {
+        let mut state = state_with_genesis(50_000_000);
+        state.insert_account(AccountRoot {
+            account_id: dest_id(),
+            balance: 10_000_000,
+            sequence: 1,
+            owner_count: 0,
+            flags: crate::ledger::account::LSF_PASSWORD_SPENT,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        });
+
+        let tx = sign_payment(1, 1_000_000, 12);
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let dest = state.get_account(&dest_id()).unwrap();
+        assert_eq!(dest.balance, 11_000_000);
+        assert_eq!(dest.flags & crate::ledger::account::LSF_PASSWORD_SPENT, 0);
+    }
+
+    #[test]
+    fn self_issued_iou_self_payment_without_paths_is_redundant() {
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_genesis(50_000_000);
+        let usd = Currency::from_code("USD").unwrap();
+        let tx = ParsedTx {
+            tx_type: 0,
+            sequence: 1,
+            fee: 12,
+            account: genesis_id(),
+            destination: Some(genesis_id()),
+            amount: Some(Amount::Iou {
+                value: IouValue::from_f64(5.0),
+                currency: usd,
+                issuer: genesis_id(),
+            }),
+            ..ParsedTx::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEM_REDUNDANT);
+        assert!(!result.applied);
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 50_000_000);
+        assert_eq!(sender.sequence, 1);
     }
 
     #[test]
@@ -1509,6 +1881,16 @@ mod tests {
     // ── TrustSet tests ──────────────────────────────────────────────────────
 
     fn sign_trustset(seq: u32, currency: &str, issuer: &str, limit: f64) -> ParsedTx {
+        sign_trustset_with_flags(seq, currency, issuer, limit, 0)
+    }
+
+    fn sign_trustset_with_flags(
+        seq: u32,
+        currency: &str,
+        issuer: &str,
+        limit: f64,
+        flags: u32,
+    ) -> ParsedTx {
         use crate::transaction::amount::{Currency, IouValue};
         let kp = genesis_kp();
         let issuer_id = crate::crypto::base58::decode_account(issuer).unwrap();
@@ -1522,6 +1904,7 @@ mod tests {
             .limit_amount(iou_amount)
             .fee(12)
             .sequence(seq)
+            .flags(flags)
             .sign(&kp)
             .unwrap();
         parse_blob(&signed.blob).unwrap()
@@ -1560,10 +1943,229 @@ mod tests {
         let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
         let tl = state.get_trustline_for(&genesis_id(), &dest_id(), &usd);
         assert!(tl.is_some(), "trust line should have been created");
+        let tl = tl.unwrap();
 
-        // Owner count incremented on both sides
+        // Only the side that set the limit should carry owner reserve.
         let sender = state.get_account(&genesis_id()).unwrap();
         assert_eq!(sender.owner_count, 1);
+        let peer = state.get_account(&dest_id()).unwrap();
+        assert_eq!(peer.owner_count, 0);
+
+        if genesis_id() < dest_id() {
+            assert_eq!(
+                tl.flags & crate::ledger::trustline::LSF_LOW_RESERVE,
+                crate::ledger::trustline::LSF_LOW_RESERVE
+            );
+            assert_eq!(tl.flags & crate::ledger::trustline::LSF_HIGH_RESERVE, 0);
+        } else {
+            assert_eq!(
+                tl.flags & crate::ledger::trustline::LSF_HIGH_RESERVE,
+                crate::ledger::trustline::LSF_HIGH_RESERVE
+            );
+            assert_eq!(tl.flags & crate::ledger::trustline::LSF_LOW_RESERVE, 0);
+        }
+
+        let key = crate::ledger::trustline::shamap_key(&genesis_id(), &dest_id(), &usd);
+        let raw = state
+            .get_raw_owned(&key)
+            .expect("raw trustline should exist");
+        let parsed = crate::ledger::meta::parse_sle(&raw).expect("trustline SLE should parse");
+        assert!(parsed
+            .fields
+            .iter()
+            .any(|f| f.type_code == 3 && f.field_code == 7));
+        assert!(parsed
+            .fields
+            .iter()
+            .any(|f| f.type_code == 3 && f.field_code == 8));
+    }
+
+    #[test]
+    fn test_trustset_set_no_ripple_sets_sender_side_flag() {
+        const TF_SET_NO_RIPPLE: u32 = 0x0002_0000;
+
+        let mut state = state_with_two_accounts();
+        let tx = sign_trustset_with_flags(
+            1,
+            "USD",
+            "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe",
+            1000.0,
+            TF_SET_NO_RIPPLE,
+        );
+        let result = apply_tx(&mut state, &tx, &ctx(0));
+        assert_eq!(result, ApplyResult::Success);
+
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let tl = state
+            .get_trustline_for(&genesis_id(), &dest_id(), &usd)
+            .expect("trust line should have been created");
+        let expected = if tl.low_account == genesis_id() {
+            crate::ledger::trustline::LSF_LOW_NO_RIPPLE
+        } else {
+            crate::ledger::trustline::LSF_HIGH_NO_RIPPLE
+        };
+        assert_eq!(tl.flags & expected, expected);
+    }
+
+    #[test]
+    fn test_trustset_applies_sender_quality_fields() {
+        let mut state = state_with_two_accounts();
+        let mut tx = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1000.0);
+        tx.quality_in = Some(1_250_000_000);
+        tx.quality_out = Some(1_000_000_000);
+
+        let result = apply_tx(&mut state, &tx, &ctx(0));
+        assert_eq!(result, ApplyResult::Success);
+
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let tl = state
+            .get_trustline_for(&genesis_id(), &dest_id(), &usd)
+            .expect("trust line should have been created");
+        if tl.low_account == genesis_id() {
+            assert_eq!(tl.low_quality_in, 1_250_000_000);
+            assert_eq!(tl.low_quality_out, 0);
+            assert_eq!(tl.high_quality_in, 0);
+            assert_eq!(tl.high_quality_out, 0);
+        } else {
+            assert_eq!(tl.high_quality_in, 1_250_000_000);
+            assert_eq!(tl.high_quality_out, 0);
+            assert_eq!(tl.low_quality_in, 0);
+            assert_eq!(tl.low_quality_out, 0);
+        }
+    }
+
+    #[test]
+    fn test_trustset_quality_only_line_is_not_redundant() {
+        let mut state = state_with_two_accounts();
+        let mut tx = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 0.0);
+        tx.quality_out = Some(1_500_000_000);
+
+        let result = apply_tx(&mut state, &tx, &ctx(0));
+        assert_eq!(result, ApplyResult::Success);
+
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let tl = state
+            .get_trustline_for(&genesis_id(), &dest_id(), &usd)
+            .expect("quality-only trust line should be created");
+        if tl.low_account == genesis_id() {
+            assert_eq!(tl.low_quality_out, 1_500_000_000);
+        } else {
+            assert_eq!(tl.high_quality_out, 1_500_000_000);
+        }
+        assert_eq!(state.get_account(&genesis_id()).unwrap().owner_count, 1);
+    }
+
+    #[test]
+    fn test_trustset_quality_one_clears_quality_and_deletes_default_line() {
+        let mut state = state_with_two_accounts();
+        let mut tx = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 0.0);
+        tx.quality_out = Some(1_500_000_000);
+        assert_eq!(apply_tx(&mut state, &tx, &ctx(0)), ApplyResult::Success);
+
+        let mut clear_tx = sign_trustset(2, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 0.0);
+        clear_tx.quality_out = Some(1_000_000_000);
+        assert_eq!(
+            apply_tx(&mut state, &clear_tx, &ctx(0)),
+            ApplyResult::Success
+        );
+
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        assert!(
+            state
+                .get_trustline_for(&genesis_id(), &dest_id(), &usd)
+                .is_none(),
+            "defaulted quality-only trust line should be deleted"
+        );
+        assert_eq!(state.get_account(&genesis_id()).unwrap().owner_count, 0);
+    }
+
+    #[test]
+    fn test_trustset_hydrates_and_touches_raw_only_peer_account() {
+        let mut state = state_with_genesis(50_000_000);
+        let peer = AccountRoot {
+            account_id: dest_id(),
+            balance: 50_000_000,
+            sequence: 1,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let peer_key = crate::ledger::account::shamap_key(&peer.account_id);
+        state.insert_raw(peer_key, peer.to_sle_binary());
+
+        let tx = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1000.0);
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+        assert!(result.touched.iter().any(|(key, _)| *key == peer_key));
+
+        let tx_id = [7u8; 32];
+        crate::ledger::close::stamp_touched_previous_fields(
+            &mut state,
+            &result.touched,
+            &tx_id,
+            1234,
+        );
+
+        let peer = state
+            .get_account(&dest_id())
+            .expect("raw-only peer account should be hydrated");
+        assert_eq!(peer.owner_count, 0);
+        assert_eq!(peer.previous_txn_id, tx_id);
+        assert_eq!(peer.previous_txn_lgr_seq, 1234);
+
+        let meta = crate::ledger::close::build_tx_metadata(
+            &state,
+            &result.touched,
+            tx_id,
+            1234,
+            0,
+            "tesSUCCESS",
+        );
+        let (_, nodes) = crate::ledger::meta::parse_metadata_with_index(&meta);
+        let peer_node = nodes
+            .iter()
+            .find(|node| node.ledger_index == peer_key.0)
+            .expect("peer previous-txn-only touch should produce a ModifiedNode");
+        assert!(matches!(
+            peer_node.action,
+            crate::ledger::meta::Action::Modified
+        ));
+        assert!(peer_node.previous_fields.is_empty());
+    }
+
+    #[test]
+    fn test_trustset_allows_balance_that_only_clears_reserve_pre_fee() {
+        let mut state = state_with_two_accounts();
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let fees = crate::ledger::fees::Fees::default();
+        let required = fees.reserve_base + fees.reserve_inc;
+
+        let mut sender = state.get_account(&genesis_id()).unwrap().clone();
+        sender.balance = required + 1;
+        state.insert_account(sender);
+
+        let tx = sign_trustset(1, "USD", "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe", 1000.0);
+        let result = apply_tx(&mut state, &tx, &ctx(0));
+        assert_eq!(result, ApplyResult::Success);
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.owner_count, 1);
+        assert_eq!(sender.balance, required + 1 - tx.fee);
+        assert!(
+            state
+                .get_trustline_for(&genesis_id(), &dest_id(), &usd)
+                .is_some(),
+            "trust line should be created when pre-fee balance clears reserve"
+        );
     }
 
     #[test]
@@ -1606,6 +2208,8 @@ mod tests {
         // Owner count should still be 1 (same trust line updated, not new)
         let sender = state.get_account(&genesis_id()).unwrap();
         assert_eq!(sender.owner_count, 1);
+        let peer = state.get_account(&dest_id()).unwrap();
+        assert_eq!(peer.owner_count, 0);
     }
 
     #[test]
@@ -1625,6 +2229,8 @@ mod tests {
 
         let sender = state.get_account(&genesis_id()).unwrap();
         assert_eq!(sender.owner_count, 0);
+        let peer = state.get_account(&dest_id()).unwrap();
+        assert_eq!(peer.owner_count, 0);
     }
 
     #[test]
@@ -1713,6 +2319,54 @@ mod tests {
             .account(&kp)
             .taker_pays(pays)
             .taker_gets(gets)
+            .offer_sequence(cancel_seq)
+            .fee(12)
+            .sequence(seq)
+            .sign(&kp)
+            .unwrap();
+        parse_blob(&signed.blob).unwrap()
+    }
+
+    #[test]
+    fn validated_replay_offer_create_amm_bridge_avoids_local_standing_offer() {
+        let mut state = state_with_genesis(50_000_000);
+        let usd = Amount::Iou {
+            value: crate::transaction::amount::IouValue::from_f64(25.0),
+            currency: crate::transaction::amount::Currency::from_code("USD").unwrap(),
+            issuer: dest_id(),
+        };
+        let tx = sign_offer_create(1, Amount::Xrp(500_000), usd);
+        let replay_ctx = TxContext {
+            ledger_seq: 2,
+            validated_result: Some(ter::TES_SUCCESS),
+            validated_offer_create_amm_bridge: true,
+            ..TxContext::default()
+        };
+
+        let result = run_tx(&mut state, &tx, &replay_ctx, ApplyFlags::VALIDATED_REPLAY);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+        assert!(result.applied);
+        assert_eq!(
+            result.touched.len(),
+            1,
+            "bridge should only touch sender account"
+        );
+
+        let acct = load_existing_account(&mut state, &genesis_id()).expect("sender account");
+        assert_eq!(acct.sequence, 2);
+        assert_eq!(acct.balance, 49_999_988);
+
+        let offer_key = crate::ledger::offer::shamap_key(&genesis_id(), 1);
+        assert!(
+            state.get_raw_owned(&offer_key).is_none(),
+            "validated AMM bridge must not create a local standing offer"
+        );
+    }
+
+    fn sign_offer_cancel(seq: u32, cancel_seq: u32) -> ParsedTx {
+        let kp = genesis_kp();
+        let signed = TxBuilder::offer_cancel()
+            .account(&kp)
             .offer_sequence(cancel_seq)
             .fee(12)
             .sequence(seq)
@@ -1846,6 +2500,61 @@ mod tests {
     }
 
     #[test]
+    fn test_offer_cancel_hydrates_raw_offer_and_clears_book_directory() {
+        use crate::ledger::directory::owner_dir_contains_entry;
+        use crate::transaction::amount::{Currency, IouValue};
+
+        let mut state = state_with_genesis(50_000_000);
+        let usd = Amount::Iou {
+            value: IouValue::from_f64(50.0),
+            currency: Currency::from_code("USD").unwrap(),
+            issuer: dest_id(),
+        };
+        let create_tx = sign_offer_create(1, usd, Amount::Xrp(500_000));
+        assert_eq!(
+            apply_tx(&mut state, &create_tx, &ctx(0)),
+            ApplyResult::Success
+        );
+
+        let offer = state.offers_by_account(&genesis_id())[0].clone();
+        let offer_key = offer.key();
+        let book_dir_key = crate::ledger::Key(offer.book_directory);
+        assert!(state.get_raw_owned(&offer_key).is_some());
+        assert!(owner_dir_contains_entry(
+            &state,
+            &genesis_id(),
+            &offer_key.0
+        ));
+
+        state.clear_typed_entry_for_key(&offer_key);
+        assert!(state.get_offer(&offer_key).is_none());
+        assert!(state.get_raw_owned(&offer_key).is_some());
+
+        let cancel_tx = sign_offer_cancel(2, 1);
+        assert_eq!(
+            apply_tx(&mut state, &cancel_tx, &ctx(0)),
+            ApplyResult::Success
+        );
+
+        assert!(state.get_raw_owned(&offer_key).is_none());
+        assert!(state.get_offer(&offer_key).is_none());
+        assert!(!owner_dir_contains_entry(
+            &state,
+            &genesis_id(),
+            &offer_key.0
+        ));
+
+        if let Some(raw) = state.get_raw_owned(&book_dir_key) {
+            let dir = crate::ledger::DirectoryNode::decode(&raw, book_dir_key.0)
+                .expect("book directory should decode");
+            assert!(!dir.indexes.contains(&offer_key.0));
+        }
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.owner_count, 0);
+    }
+
+    #[test]
     fn test_multiple_offers_sorted_by_quality() {
         use crate::ledger::BookKey;
         use crate::transaction::amount::{Currency, IouValue};
@@ -1926,6 +2635,65 @@ mod tests {
     }
 
     #[test]
+    fn test_offer_crossing_hydrates_raw_only_counterparty_account() {
+        let mut state = state_with_genesis(100_000_000);
+        let kp2 = crate::crypto::keys::Secp256k1KeyPair::from_seed_entropy(&[99u8; 16]);
+        let acct2_id = crate::crypto::account_id(&kp2.public_key_bytes());
+        let acct2 = AccountRoot {
+            account_id: acct2_id,
+            balance: 100_000_000,
+            sequence: 1,
+            owner_count: 1,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let acct2_key = crate::ledger::account::shamap_key(&acct2_id);
+        state.insert_raw(acct2_key, acct2.to_sle_binary());
+
+        state.insert_offer(crate::ledger::Offer {
+            account: acct2_id,
+            sequence: 1,
+            taker_pays: Amount::Xrp(1_000_000),
+            taker_gets: Amount::Xrp(2_000_000),
+            flags: 0,
+            book_directory: [0u8; 32],
+            book_node: 0,
+            owner_node: 0,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        });
+
+        let tx = sign_offer_create(1, Amount::Xrp(2_000_000), Amount::Xrp(1_000_000));
+        let result = apply_tx(&mut state, &tx, &ctx(0));
+        assert_eq!(result, ApplyResult::Success);
+
+        let acct2 = state
+            .get_account(&acct2_id)
+            .expect("crossed counterparty account should hydrate from raw bytes");
+        assert_eq!(
+            acct2.owner_count, 0,
+            "consumed offer should decrement owner count"
+        );
+        assert_eq!(
+            acct2.balance, 99_000_000,
+            "counterparty XRP balance should be updated during crossing"
+        );
+    }
+
+    #[test]
     fn test_offer_no_crossing_when_prices_dont_overlap() {
         use crate::transaction::amount::{Currency, IouValue};
 
@@ -1974,10 +2742,8 @@ mod tests {
         let r2 = apply_tx(&mut state, &tx2, &ctx(0));
         assert_eq!(r2, ApplyResult::Success, "tx2 should be placed");
 
-        // Both offers must remain — prices don't overlap, no crossing should
-        // happen. Earlier revisions deleted `tx1` unconditionally when it
-        // encountered it as a self-owned offer in the opposite book, without
-        // first checking the quality gate (see src/ledger/tx/offer.rs fix).
+        // Both offers must remain because prices do not overlap; self-owned
+        // offers in the opposite book still have to pass the quality gate.
         assert_eq!(
             state.offers_by_account(&genesis_id()).len(),
             2,
@@ -2072,6 +2838,76 @@ mod tests {
             &genesis_id(),
             &old_key.0
         ));
+    }
+
+    #[test]
+    fn apply_fee_only_hydrates_raw_only_sender_account() {
+        let mut state = LedgerState::new();
+        let raw_only = AccountRoot {
+            account_id: genesis_id(),
+            balance: 1_000,
+            sequence: 7,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let key = crate::ledger::account::shamap_key(&raw_only.account_id);
+        state.insert_raw(key, raw_only.to_sle_binary());
+
+        let tx = sign_offer_create(7, Amount::Xrp(1), Amount::Xrp(2));
+        apply_fee_only(&mut state, &tx);
+
+        let updated = state
+            .get_account(&genesis_id())
+            .expect("fee-only path should hydrate the sender account");
+        assert_eq!(updated.balance, 988);
+        assert_eq!(updated.sequence, 8);
+    }
+
+    #[test]
+    fn run_tx_hydrates_raw_only_sender_for_preclaim_and_apply() {
+        let mut state = LedgerState::new();
+        let raw_only = AccountRoot {
+            account_id: genesis_id(),
+            balance: 100_000_000,
+            sequence: 1,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let key = crate::ledger::account::shamap_key(&raw_only.account_id);
+        state.insert_raw(key, raw_only.to_sle_binary());
+
+        let tx = sign_offer_create(1, Amount::Xrp(1_000_000), Amount::Xrp(2_000_000));
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+        assert!(state
+            .get_offer(&crate::ledger::offer::shamap_key(&genesis_id(), 1))
+            .is_some());
+        let sender = state
+            .get_account(&genesis_id())
+            .expect("sender should hydrate from raw bytes during run_tx");
+        assert_eq!(sender.sequence, 2);
+        assert_eq!(sender.balance, 100_000_000 - tx.fee);
     }
 
     // ── Escrow tests ────────────────────────────────────────────────────────
@@ -2395,6 +3231,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -2535,6 +3373,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -2613,6 +3453,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -2740,6 +3582,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -2834,6 +3678,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -2940,6 +3786,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -3023,6 +3871,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: None,
@@ -3192,20 +4042,48 @@ mod tests {
         tx.ticket_sequence = Some(42); // ticket mode
         tx.sequence = 1; // but sequence is also set (non-zero) → conflict
         let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
-        assert_eq!(result.ter, ter::TEM_INVALID);
+        assert_eq!(result.ter, ter::TEM_SEQ_AND_TICKET);
         assert!(!result.applied);
     }
 
     #[test]
-    fn run_tx_ticket_sequence_with_zero_seq_allowed() {
+    fn run_tx_sequence_zero_without_ticket_is_past_sequence() {
+        let mut state = state_with_genesis(10_000_000);
+        let mut tx = sign_payment(0, 1_000, 12);
+        tx.sequence = 0;
+        tx.ticket_sequence = None;
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEF_PAST_SEQ);
+        assert!(!result.applied);
+    }
+
+    #[test]
+    fn run_tx_future_ticket_sequence_retries() {
         let mut state = state_with_genesis(10_000_000);
         let mut tx = sign_payment(0, 1_000, 12);
         tx.ticket_sequence = Some(42); // ticket mode
         tx.sequence = 0; // correct: sequence=0 for ticket-based
-                         // Should pass the preclaim checks (may fail in handler since ticket doesn't exist,
-                         // but it should NOT fail with temINVALID)
         let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
-        assert_ne!(result.ter, ter::TEM_INVALID);
+        assert_eq!(result.ter, ter::TER_PRE_TICKET);
+        assert!(!result.applied);
+    }
+
+    #[test]
+    fn run_tx_missing_past_ticket_is_permanent_failure() {
+        let mut state = state_with_genesis(10_000_000);
+        {
+            let mut sender = state.get_account(&genesis_id()).unwrap().clone();
+            sender.sequence = 43;
+            state.insert_account(sender);
+        }
+        let mut tx = sign_payment(0, 1_000, 12);
+        tx.sequence = 0;
+        tx.ticket_sequence = Some(42);
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEF_NO_TICKET);
+        assert!(!result.applied);
     }
 
     #[test]
@@ -3220,7 +4098,12 @@ mod tests {
         };
         let tx = sign_offer_create(1, usd, Amount::Xrp(100_000_000));
 
-        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::VALIDATED_REPLAY);
+        let replay_ctx = TxContext {
+            validated_result: Some(ter::TEC_UNFUNDED_OFFER),
+            ..ctx(0)
+        };
+
+        let result = run_tx(&mut state, &tx, &replay_ctx, ApplyFlags::VALIDATED_REPLAY);
         assert_eq!(result.ter, ter::TEC_UNFUNDED_OFFER);
         assert!(result.applied, "validated tec replay must claim fee only");
 
@@ -3337,6 +4220,8 @@ mod tests {
             set_flag: None,
             clear_flag: None,
             transfer_rate: None,
+            quality_in: None,
+            quality_out: None,
             tick_size: None,
             last_ledger_seq: None,
             ticket_count: Some(count),
@@ -3375,6 +4260,7 @@ mod tests {
         let mut acct = state.get_account(&genesis_id()).unwrap().clone();
         acct.owner_count += 1;
         acct.ticket_count += 1;
+        acct.sequence = acct.sequence.max(ticket_seq.saturating_add(1));
         state.insert_account(acct);
     }
 
@@ -3452,6 +4338,31 @@ mod tests {
     }
 
     #[test]
+    fn ticketed_ticket_create_starts_at_current_account_sequence() {
+        let mut state = state_with_genesis(100_000_000);
+        insert_ticket_for_genesis(&mut state, 42);
+
+        let mut tx = ticket_create_tx(0, 2);
+        tx.ticket_sequence = Some(42);
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TES_SUCCESS);
+
+        let wrong_first = crate::ledger::ticket::shamap_key(&genesis_id(), 1);
+        let first = crate::ledger::ticket::shamap_key(&genesis_id(), 43);
+        let second = crate::ledger::ticket::shamap_key(&genesis_id(), 44);
+
+        assert!(state.get_raw_owned(&wrong_first).is_none());
+        assert!(state.get_raw_owned(&first).is_some());
+        assert!(state.get_raw_owned(&second).is_some());
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.sequence, 45);
+        assert_eq!(sender.ticket_count, 2);
+        assert_eq!(sender.owner_count, 2);
+    }
+
+    #[test]
     fn run_tx_consuming_ticket_decrements_ticket_count() {
         let mut state = state_with_two_accounts();
         insert_ticket_for_genesis(&mut state, 42);
@@ -3464,6 +4375,38 @@ mod tests {
         assert_eq!(result.ter, ter::TES_SUCCESS);
 
         let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.ticket_count, 0);
+        assert_eq!(sender.owner_count, 0);
+    }
+
+    #[test]
+    fn run_tx_ticketed_tec_consumes_ticket_without_bumping_sequence() {
+        let mut state = state_with_two_accounts();
+        insert_ticket_for_genesis(&mut state, 42);
+        let starting_sequence = state.get_account(&genesis_id()).unwrap().sequence;
+
+        let mut tx = ParsedTx {
+            tx_type: 27,
+            flags: 1,
+            sequence: 0,
+            fee: 12,
+            account: genesis_id(),
+            destination: Some([0x44; 20]),
+            amount: Some(Amount::Xrp(1_000)),
+            nftoken_id: Some([0xAB; 32]),
+            ticket_sequence: Some(42),
+            signing_pubkey: vec![0x02; 33],
+            ..ParsedTx::default()
+        };
+        tx.sequence = 0;
+
+        let result = run_tx(&mut state, &tx, &ctx(0), ApplyFlags::NONE);
+        assert_eq!(result.ter, ter::TEC_NO_DST);
+        assert!(result.applied, "ticketed tec must still claim fee");
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 50_000_000 - 12);
+        assert_eq!(sender.sequence, starting_sequence);
         assert_eq!(sender.ticket_count, 0);
         assert_eq!(sender.owner_count, 0);
     }

@@ -1,18 +1,21 @@
 //! Reproducer for Bug C: book directory retains extra entry after self-cross
-//! offer removal. Replays txs 0..=25 from the forensic bundle and asserts
-//! the book directory `036D7E923EF22B65...` matches rippled byte-exact.
+//! offer removal. Set `XLEDGRSV2BETA_BUG_C_FIXTURE` to an opt-in forensic bundle,
+//! then this test replays txs 0..=25 and asserts the target book directory
+//! matches rippled byte-exact.
 
 use std::path::PathBuf;
 use xrpl::ledger::close::replay_ledger;
 use xrpl::ledger::forensic::loader;
 use xrpl::ledger::{Key, LedgerState};
 
-const BUNDLE_DIR: &str = "debug-runs/103483089-103483090-epoch1775955380";
 const DIVERGENT_KEY_HEX: &str = "036D7E923EF22B65E19D95A6365C3373E1E96586E27015074A06ADD99C2D8000";
 
 #[test]
 fn bug_c_book_dir_matches_rippled() {
-    let bundle = PathBuf::from(BUNDLE_DIR);
+    let Some(bundle) = std::env::var_os("XLEDGRSV2BETA_BUG_C_FIXTURE").map(PathBuf::from) else {
+        eprintln!("XLEDGRSV2BETA_BUG_C_FIXTURE not set — skipping forensic fixture test");
+        return;
+    };
     if !bundle.exists() {
         eprintln!("bundle not found — skipping");
         return;

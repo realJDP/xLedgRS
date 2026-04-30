@@ -137,7 +137,7 @@ pub enum ConsensusPhase {
     Establish,
     /// Consensus reached; applying tx set to produce the new ledger.
     Accepted,
-    /// xLedgRS extension (not in rippled's consensus model): tracks that 80%+ of
+    /// xLedgRSv2Beta extension (not in rippled's consensus model): tracks that 80%+ of
     /// UNL validated the same ledger hash, indicating validation finality after
     /// consensus acceptance. rippled handles this via separate validation tracking
     /// rather than a consensus phase.

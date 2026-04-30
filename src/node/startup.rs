@@ -39,7 +39,7 @@ impl Node {
     /// Start the node: peer listener, RPC server, and bootstrap dialing.
     pub async fn start(self: Arc<Self>) -> anyhow::Result<()> {
         info!(
-            "xledgrs node starting — peer={} rpc={} tls={} standalone={}",
+            "xLedgRSv2Beta node starting — peer={} rpc={} tls={} standalone={}",
             self.config.peer_addr,
             self.config.rpc_addr,
             self.config.use_tls,

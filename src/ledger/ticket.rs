@@ -34,6 +34,41 @@ pub struct Ticket {
 }
 
 impl Ticket {
+    pub fn decode_from_sle(data: &[u8]) -> Option<Self> {
+        let parsed = crate::ledger::meta::parse_sle(data)?;
+        if parsed.entry_type != 0x0054 {
+            return None;
+        }
+
+        let mut account = [0u8; 20];
+        let mut sequence = 0u32;
+        let mut owner_node = 0u64;
+
+        for field in &parsed.fields {
+            match (field.type_code, field.field_code) {
+                (2, 41) if field.data.len() >= 4 => {
+                    sequence = u32::from_be_bytes(field.data[..4].try_into().ok()?);
+                }
+                (3, 4) if field.data.len() >= 8 => {
+                    owner_node = u64::from_be_bytes(field.data[..8].try_into().ok()?);
+                }
+                (8, 1) if field.data.len() >= 20 => {
+                    account.copy_from_slice(&field.data[..20]);
+                }
+                _ => {}
+            }
+        }
+
+        Some(Self {
+            account,
+            sequence,
+            owner_node,
+            previous_txn_id: parsed.prev_txn_id.unwrap_or([0u8; 32]),
+            previous_txn_lgrseq: parsed.prev_txn_lgrseq.unwrap_or(0),
+            raw_sle: Some(data.to_vec()),
+        })
+    }
+
     pub fn to_sle_binary(&self) -> Vec<u8> {
         let raw = match &self.raw_sle {
             Some(r) => r,

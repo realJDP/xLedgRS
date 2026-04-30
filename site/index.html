@@ -3,13 +3,27 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>xLedgRS | XRP Ledger Node in Rust</title>
-<meta name="description" content="xLedgRS is an XRP Ledger node implementation in Rust with native peer networking, JSON-RPC, WebSocket, optional gRPC, configuration templates, and built-in process lifecycle commands.">
-<meta property="og:title" content="xLedgRS | XRP Ledger Node in Rust">
-<meta property="og:description" content="Fast, information-first operator docs for xLedgRS.">
+<title>xLedgRSv2Beta | XRP Ledger Node in Rust</title>
+<meta name="description" content="xLedgRSv2Beta is an XRP Ledger node implementation in Rust with native peer networking, JSON-RPC, WebSocket, optional gRPC, configuration templates, and built-in process lifecycle commands.">
+<meta property="og:title" content="xLedgRSv2Beta | XRP Ledger Node in Rust">
+<meta property="og:description" content="Fast, information-first operator docs for xLedgRSv2Beta.">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://xledgrs.com">
-<link rel="canonical" href="https://xledgrs.com">
+<meta property="og:url" content="https://xLedgRSv2Beta.com">
+<meta property="og:site_name" content="xLedgRSv2Beta">
+<meta property="og:image" content="https://xLedgRSv2Beta.com/xLedgRSv2Beta-og.png">
+<meta property="og:image:secure_url" content="https://xLedgRSv2Beta.com/xLedgRSv2Beta-og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="xLedgRSv2Beta social preview">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="xLedgRSv2Beta | XRP Ledger Node in Rust">
+<meta name="twitter:description" content="Fast, information-first operator docs for xLedgRSv2Beta.">
+<meta name="twitter:image" content="https://xLedgRSv2Beta.com/xLedgRSv2Beta-og.png">
+<meta name="theme-color" content="#0e6fff">
+<link rel="canonical" href="https://xLedgRSv2Beta.com">
+<link rel="icon" type="image/png" sizes="512x512" href="https://xLedgRSv2Beta.com/xLedgRSv2Beta-mark.png">
+<link rel="apple-touch-icon" href="https://xLedgRSv2Beta.com/xLedgRSv2Beta-mark.png">
 <style>
 :root {
   --bg: #f5f7fb;
@@ -342,15 +356,15 @@ th {
 <header class="topbar">
   <div class="wrap">
     <div class="brand">
-      <img src="xledgrs-mark.png" alt="xLedgRS mark">
+      <img src="xLedgRSv2Beta-mark.png" alt="xLedgRSv2Beta mark">
       <div>
-        <h1>xLedgRS</h1>
+        <h1>xLedgRSv2Beta</h1>
         <p>XRPL node implementation in Rust</p>
       </div>
     </div>
     <nav class="nav" aria-label="Primary">
       <a href="https://github.com/realJDP/xLedgRS" target="_blank" rel="noopener">GitHub</a>
-      <a href="https://github.com/realJDP/xLedgRS/archive/HEAD.zip" target="_blank" rel="noopener">Download</a>
+      <a href="https://github.com/realJDP/xLedgRS/releases" target="_blank" rel="noopener">Releases</a>
       <a href="#build">Build</a>
       <a href="#run">Run</a>
       <a href="#config">Config</a>
@@ -364,25 +378,25 @@ th {
   <section class="hero">
     <div class="hero-grid">
       <div class="card">
-        <h2>Fast operator reference for xLedgRS 1.0beta.</h2>
+        <h2>Fast operator reference for xLedgRSv2Beta 2.0.0-beta.</h2>
         <p>
-          xLedgRS is an XRP Ledger node implementation in Rust focused on protocol
+          xLedgRSv2Beta is a beta XRP Ledger node implementation in Rust focused on protocol
           compatibility, operational clarity, and practical deployment.
         </p>
         <div class="actions">
           <a class="btn btn-primary" href="https://github.com/realJDP/xLedgRS" target="_blank" rel="noopener">Open GitHub</a>
-          <a class="btn" href="https://github.com/realJDP/xLedgRS/archive/HEAD.zip" target="_blank" rel="noopener">Download ZIP</a>
+          <a class="btn" href="https://github.com/realJDP/xLedgRS/releases" target="_blank" rel="noopener">Releases</a>
           <a class="btn" href="https://github.com/realJDP/xLedgRS#readme" target="_blank" rel="noopener">README</a>
         </div>
         <div class="badge-row">
-          <span class="badge">Version <strong>1.0beta</strong></span>
-          <span class="badge">Updated <strong>2026-04-17</strong></span>
+          <span class="badge">Version <strong>2.0.0-beta</strong></span>
+          <span class="badge">Status <strong>public beta</strong></span>
           <span class="badge">Default ports <strong>51235 / 5005 / 6006</strong></span>
         </div>
         <div class="quick">
           <div class="item">
             <div class="label">Primary binary</div>
-            <div class="value mono">xledgrs</div>
+            <div class="value mono">xLedgRSv2Beta</div>
           </div>
           <div class="item">
             <div class="label">Lifecycle</div>
@@ -390,7 +404,7 @@ th {
           </div>
           <div class="item">
             <div class="label">Mainnet config</div>
-            <div class="value mono">cfg/xledgrs.cfg</div>
+            <div class="value mono">cfg/xLedgRSv2Beta.cfg</div>
           </div>
           <div class="item">
             <div class="label">Validator config</div>
@@ -401,12 +415,12 @@ th {
 
       <div class="stack">
         <div class="card">
-          <h3>Included in 1.0beta</h3>
+          <h3>Included in 2.0.0-beta</h3>
           <ul class="list small">
             <li>Native peer protocol runtime</li>
             <li>JSON-RPC and WebSocket services</li>
             <li>Optional gRPC surface</li>
-          <li>Configuration templates</li>
+            <li>Configuration templates</li>
             <li>Built-in process lifecycle commands</li>
             <li>Default rippled-style ports in shipped configs</li>
           </ul>
@@ -414,8 +428,8 @@ th {
         <div class="card">
           <h3>Default operator settings</h3>
           <ul class="list small">
-            <li>Mainnet follower data dir: <span class="mono">./xledgrs-data</span></li>
-            <li>Mainnet validator data dir: <span class="mono">./xledgrs-validator-data</span></li>
+            <li>Mainnet follower data dir: <span class="mono">./xLedgRSv2Beta-data</span></li>
+            <li>Mainnet validator data dir: <span class="mono">./xLedgRSv2Beta-validator-data</span></li>
             <li>PID/log files default into the configured data dir</li>
             <li>Built-in peer bootstrap list uses public XRPL hubs</li>
           </ul>
@@ -460,21 +474,21 @@ sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compile
     <div class="grid-2">
       <div class="card">
         <h3>Mainnet follower</h3>
-        <div class="code"><pre>cp cfg/xledgrs.cfg ./xledgrs.cfg
-./target/release/xledgrs --start --config ./xledgrs.cfg
-./target/release/xledgrs --status --config ./xledgrs.cfg</pre></div>
+        <div class="code"><pre>cp cfg/xLedgRSv2Beta.cfg ./xLedgRSv2Beta.cfg
+./target/release/xledgrs --start --config ./xLedgRSv2Beta.cfg
+./target/release/xledgrs --status --config ./xLedgRSv2Beta.cfg</pre></div>
       </div>
       <div class="card">
         <h3>Testnet follower</h3>
-        <div class="code"><pre>cp cfg/testnet.cfg ./xledgrs-testnet.cfg
-./target/release/xledgrs --start --config ./xledgrs-testnet.cfg</pre></div>
+        <div class="code"><pre>cp cfg/testnet.cfg ./xLedgRSv2Beta-testnet.cfg
+./target/release/xledgrs --start --config ./xLedgRSv2Beta-testnet.cfg</pre></div>
       </div>
     </div>
 
     <div class="grid-2" style="margin-top:14px;">
       <div class="card">
         <h3>Foreground run</h3>
-        <div class="code"><pre>./target/release/xledgrs --config ./xledgrs.cfg</pre></div>
+        <div class="code"><pre>./target/release/xledgrs --config ./xLedgRSv2Beta.cfg</pre></div>
         <p class="muted small">
           Use this mode for direct terminal debugging. The process stays attached and exits on
           <span class="mono">Ctrl-C</span> or <span class="mono">SIGTERM</span>.
@@ -501,7 +515,7 @@ sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compile
         </thead>
         <tbody>
           <tr>
-            <td class="mono">cfg/xledgrs.cfg</td>
+            <td class="mono">cfg/xLedgRSv2Beta.cfg</td>
             <td>Mainnet follower</td>
             <td>Default release-safe mainnet node template</td>
           </tr>
@@ -521,7 +535,7 @@ sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compile
             <td>Validator-mode testnet template</td>
           </tr>
           <tr>
-            <td class="mono">cfg/xledgrs-example.cfg</td>
+            <td class="mono">cfg/xLedgRSv2Beta-example.cfg</td>
             <td>Generic example</td>
             <td>Example template using the current config section names</td>
           </tr>
@@ -551,8 +565,8 @@ sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compile
       <div class="card">
         <h3>Lifecycle files</h3>
         <ul class="list small">
-          <li>PID: <span class="mono">xledgrs.pid</span></li>
-          <li>Log: <span class="mono">xledgrs.log</span></li>
+          <li>PID: <span class="mono">xLedgRSv2Beta.pid</span></li>
+          <li>Log: <span class="mono">xLedgRSv2Beta.log</span></li>
           <li>Default location: configured data dir</li>
         </ul>
       </div>
@@ -584,7 +598,7 @@ sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compile
         <h3>gRPC</h3>
         <p class="muted small">
           Optional service layer with <span class="mono">XRPLedgerAPIService</span> and the
-          <span class="mono">Xledgrs</span> extension surface when a gRPC address is configured.
+          <span class="mono">XLedgRSv2Beta</span> extension surface when a gRPC address is configured.
         </p>
       </div>
     </div>
@@ -604,7 +618,7 @@ sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compile
       <div class="card">
         <h3>Deployment model</h3>
         <ul class="list">
-          <li>Run the node directly with the <span class="mono">xledgrs</span> binary</li>
+          <li>Run the node directly with the <span class="mono">xLedgRSv2Beta</span> binary</li>
           <li>Use shipped configuration templates as the starting point</li>
           <li>Use the built-in lifecycle commands for background process control</li>
         </ul>
@@ -613,7 +627,7 @@ sudo apt install -y build-essential clang pkg-config libssl-dev protobuf-compile
   </section>
 
   <div class="footer">
-    xLedgRS static site.
+    xLedgRSv2Beta static site.
   </div>
 </main>
 </body>

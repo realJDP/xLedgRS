@@ -154,7 +154,13 @@ impl RippleState {
 
     /// `true` if neither side has a balance and both limits are zero — safe to delete.
     pub fn is_empty(&self) -> bool {
-        self.balance.mantissa == 0 && self.low_limit.mantissa == 0 && self.high_limit.mantissa == 0
+        self.balance.mantissa == 0
+            && self.low_limit.mantissa == 0
+            && self.high_limit.mantissa == 0
+            && self.low_quality_in == 0
+            && self.low_quality_out == 0
+            && self.high_quality_in == 0
+            && self.high_quality_out == 0
     }
 
     /// Set the limit for `account`.  Panics if `account` is neither low nor high.
@@ -198,10 +204,8 @@ impl RippleState {
     /// mantissas in a wider intermediate and renormalize the result. The
     /// previous inline implementation used raw i64 math with saturating_mul
     /// and no renormalization, which could overflow (debug: panic, release:
-    /// wrapping) and produce catastrophically wrong balances on crossing
-    /// paths that touched the trust line via tfSell offers. See the bug hunt
-    /// for 103483090:tx0, where this was the source of a +1.30 → -0.00092
-    /// RLUSD divergence against rippled.
+    /// wrapping) and produce wrong balances on crossing paths that touched the
+    /// trust line via tfSell offers.
     pub fn transfer(&mut self, sender: &[u8; 20], amount: &IouValue) {
         if sender == &self.low_account {
             self.balance = self.balance.sub(amount);
@@ -264,6 +268,18 @@ impl RippleState {
                 data: self.high_quality_out.to_be_bytes().to_vec(),
             });
         }
+
+        // sfLowNode / sfHighNode are required on RippleState, even when zero.
+        fields.push(ParsedField {
+            type_code: 3,
+            field_code: 7,
+            data: self.low_node.to_be_bytes().to_vec(),
+        });
+        fields.push(ParsedField {
+            type_code: 3,
+            field_code: 8,
+            data: self.high_node.to_be_bytes().to_vec(),
+        });
 
         // sfBalance (6,2) — issuer = ACCOUNT_ONE sentinel (rippled canonical
         // encoding for trust-line Balance; the actual issuer is implicit in
@@ -870,6 +886,20 @@ mod tests {
         assert_eq!(decoded.balance.mantissa, tl.balance.mantissa);
         assert_eq!(decoded.low_limit.mantissa, tl.low_limit.mantissa);
         assert_eq!(decoded.flags, tl.flags);
+    }
+
+    #[test]
+    fn test_encode_includes_low_high_node_fields_even_when_zero() {
+        let tl = RippleState::new(&acct(3), &acct(7), usd());
+        let parsed = crate::ledger::meta::parse_sle(&tl.encode()).expect("parse_sle should work");
+        assert!(parsed
+            .fields
+            .iter()
+            .any(|f| f.type_code == 3 && f.field_code == 7));
+        assert!(parsed
+            .fields
+            .iter()
+            .any(|f| f.type_code == 3 && f.field_code == 8));
     }
 
     #[test]

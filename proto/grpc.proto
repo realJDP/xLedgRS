@@ -5,12 +5,12 @@ option java_package = "org.xrpl.rpc.v1";
 option java_multiple_files = true;
 
 // Extension surface for local server info and submit.
-service Xledgrs {
+service XLedgRSv2Beta {
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
   rpc Submit(SubmitRequest) returns (SubmitResponse);
 }
 
-// Primary rippled-parity surface.
+// Primary ledger gRPC surface for supported rippled-shaped ledger APIs.
 service XRPLedgerAPIService {
   // Get a specific ledger, optionally including transactions and any modified,
   // added or deleted ledger objects.
