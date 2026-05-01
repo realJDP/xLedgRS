@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Nftoken support for XRPL ledger state and SHAMap logic.
 //! NFToken — non-fungible tokens on the XRP Ledger.
 //!
 //! Simplified flat storage model (one entry per NFT) rather than the page
