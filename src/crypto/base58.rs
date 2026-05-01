@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Base58 helpers for XRPL keys, signing, and addresses.
 //! XRPL base58check encoding/decoding.
 //!
 //! XRPL uses a custom base58 alphabet — different from Bitcoin's:
