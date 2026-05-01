@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Analyze Missing Refs diagnostic utility for parity investigation.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
