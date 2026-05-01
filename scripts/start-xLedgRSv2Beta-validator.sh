@@ -1,4 +1,5 @@
 #!/bin/bash
+# xLedgRS purpose: Start a validator node with validator config defaults.
 set -euo pipefail
 
 CONFIG_FILE="$HOME/xLedgRSv2Beta-validator.cfg"
