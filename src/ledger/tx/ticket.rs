@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ticket transaction engine logic for ledger replay.
 //! Ticket — IMPLEMENTED
 
 use super::ApplyResult;
