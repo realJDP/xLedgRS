@@ -1,3 +1,4 @@
+// xLedgRS purpose: Define local gRPC services exposed by xLedgRSv2Beta.
 syntax = "proto3";
 
 package org.xrpl.rpc.v1;
