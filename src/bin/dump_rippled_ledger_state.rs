@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Dump Rippled Ledger State diagnostic utility for parity investigation.
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
