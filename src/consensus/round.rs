@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Round support for XRPL consensus and validation.
 //! A single consensus round — tracks proposals, converges positions, counts validations.
 //!
 //! # Convergence thresholds (relative timing — matches rippled)
