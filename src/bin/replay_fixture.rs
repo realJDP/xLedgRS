@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Replay Fixture diagnostic utility for parity investigation.
 //! Offline replay harness for engine-divergence debugging.
 //!
 //! Loads a forensic bundle produced by the follower's capture path and runs
