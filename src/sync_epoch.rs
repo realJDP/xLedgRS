@@ -1,3 +1,8 @@
+//! Per-ledger sync epoch bookkeeping.
+//!
+//! Tracks outstanding node requests, peer assignments, and useful responses for
+//! one fixed ledger target during SHAMap acquisition.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
