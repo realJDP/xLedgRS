@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Xchain transaction engine logic for ledger replay.
 //! XChain bridge types — types 41-48.
 //!
 //! XChainBridge amendment is NOT active on mainnet (March 2026), so these
