@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ws support for JSON-RPC and WebSocket APIs.
 //! WebSocket API server — real-time event streaming + request/response.
 //!
 //! Reuses the same `dispatch()` function as the HTTP JSON-RPC server for
