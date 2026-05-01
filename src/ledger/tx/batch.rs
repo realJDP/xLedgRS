@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Batch transaction engine logic for ledger replay.
 //! Batch transaction (type 71) — execute multiple inner transactions.
 //!
 //! The Batch amendment is NOT active on mainnet (Supported::no in rippled).
