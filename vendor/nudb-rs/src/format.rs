@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Encode and decode NuDB on-disk records.
 //! NuDB on-disk format constants and structures.
 
 use std::io::{self, Read, Write};
