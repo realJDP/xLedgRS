@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Paychan support for XRPL ledger state and SHAMap logic.
 //! PayChannel — an off-chain XRP payment channel between two accounts.
 //!
 //! A payment channel locks XRP that can be claimed incrementally by the
