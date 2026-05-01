@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Field support for transaction parsing and submission.
 //! XRPL field definitions and field-ID encoding.
 //!
 //! Every XRPL field has a (type_code, field_code) pair that determines
