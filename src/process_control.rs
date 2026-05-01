@@ -1,3 +1,8 @@
+//! Daemon process-control helpers.
+//!
+//! Handles start/stop/restart/status behavior, pid-file ownership, log-file
+//! routing, and child process spawning for `xledgrs --start`.
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::process::CommandExt;
