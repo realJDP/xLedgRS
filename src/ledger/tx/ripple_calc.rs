@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ripple Calc transaction engine logic for ledger replay.
 //! RippleCalc — IOU payment flow helpers.
 //!
 //! Modeled after portions of rippled's flow engine:
