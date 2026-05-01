@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Inbound Transactions support for XRPL ledger state and SHAMap logic.
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
