@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Did transaction engine logic for ledger replay.
 //! DID — DIDSet (type 49) and DIDDelete (type 50).
 //!
 //! Implements state effects per rippled DIDSet.cpp and DIDDelete.cpp.
