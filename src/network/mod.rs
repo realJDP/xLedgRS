@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Mod support for XRPL peer networking.
 //! Network module — peer-to-peer overlay (RTXP protocol over TLS).
 
 pub mod cluster;
