@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Types support for JSON-RPC and WebSocket APIs.
 //! JSON-RPC envelope types for requests, responses, and errors.
 
 use serde::{Deserialize, Serialize};
