@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ticket Create legacy transactor for XRPL transaction apply.
 use super::{check_reserve, owner_dir, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::SLE;
