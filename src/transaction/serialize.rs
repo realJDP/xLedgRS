@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Serialize support for transaction parsing and submission.
 //! XRPL canonical binary serialization (STObject format).
 //!
 //! Used to produce the byte sequence that gets hashed for transaction signing.
