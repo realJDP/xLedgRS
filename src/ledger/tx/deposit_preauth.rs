@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Deposit Preauth transaction engine logic for ledger replay.
 //! DepositPreauth — IMPLEMENTED
 
 use super::ApplyResult;
