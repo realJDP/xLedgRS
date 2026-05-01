@@ -1,3 +1,4 @@
+// Compile XRPL peer and gRPC protobuf schemas for the daemon and service layer.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=proto/xrpl.proto");
