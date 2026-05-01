@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Route legacy transactor handlers by XRPL transaction type.
 //! Legacy view-stack transactor modeled after rippled's three-stage pipeline.
 //!
 //! Every transaction goes through:
