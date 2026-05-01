@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Pool support for XRPL ledger state and SHAMap logic.
 //! Transaction pool (mempool) with fee escalation matching rippled's TxQ.
 //!
 //! Key formula: `required_fee_level = multiplier × current² / target²`
