@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Asset Flow transaction engine logic for ledger replay.
 //! Shared asset balance mutations for transaction liquidity steps.
 
 use super::load_existing_account;
