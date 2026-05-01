@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Bug B Tfsell Tx0 test coverage for release and parity safety.
 //! Deterministic reproducer for Bug B (tfSell + tfImmediateOrCancel crossing
 //! math divergence).
 //!
