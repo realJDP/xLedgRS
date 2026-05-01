@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Fetch authoritative ledger data from JSON-RPC peers.
 //! RPC-based state sync for downloading full ledger state from a rippled
 //! admin endpoint.
 //!
