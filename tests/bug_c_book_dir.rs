@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Bug C Book Dir test coverage for release and parity safety.
 //! Reproducer for Bug C: book directory retains extra entry after self-cross
 //! offer removal. Set `XLEDGRSV2BETA_BUG_C_FIXTURE` to an opt-in forensic bundle,
 //! then this test replays txs 0..=25 and asserts the target book directory
