@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Invariants support for XRPL ledger state and SHAMap logic.
 //! Post-apply invariant checking — prevents invalid state from committing.
 //!
 //! Mirrors rippled's InvariantCheck system (InvariantCheck.cpp).
