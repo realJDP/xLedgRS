@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Mod support for JSON-RPC and WebSocket APIs.
 //! JSON-RPC and WebSocket APIs for supported rippled-compatible requests.
 //!
 //! Unsupported methods and transaction types return explicit errors rather than
