@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Node Store support for XRPL ledger state and SHAMap logic.
 //! Content-addressed storage for SHAMap nodes.
 //!
 //! Nodes are keyed by their content hash, which is the SHA-512-half of the
