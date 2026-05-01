@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Nft Page support for XRPL ledger state and SHAMap logic.
 //! NFTokenPage — page-based storage matching rippled's NFTokenPage SLE model.
 //!
 //! Each NFTokenPage holds up to 32 tokens, doubly-linked to adjacent pages.
