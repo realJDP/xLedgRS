@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Keylet support for XRPL ledger state and SHAMap logic.
 //! Keylet — type-safe SHAMap lookup key.
 //!
 //! A Keylet pairs a 32-byte SHAMap key with its expected LedgerEntryType.
