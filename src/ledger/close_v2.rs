@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Close V2 support for XRPL ledger state and SHAMap logic.
 //! close_v2 — experimental ledger close using the view stack.
 //!
 //! Flow:
