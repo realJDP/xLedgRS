@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Peer Policy piece of the live node runtime.
 use super::*;
 
 pub(super) fn peer_reservations_map(
