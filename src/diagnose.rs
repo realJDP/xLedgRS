@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Run storage and live hash diagnostics for mismatches.
 //! Diagnostic tool for debugging hash mismatches.
 //!
 //! Verifies internal consistency of stored state:
