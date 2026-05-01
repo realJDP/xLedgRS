@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Handlers support for JSON-RPC and WebSocket APIs.
 //! RPC method handlers — one function per rippled API method.
 //!
 //! Each handler takes `&RpcRequest` params and `&NodeContext`, returns
