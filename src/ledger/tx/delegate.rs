@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Delegate transaction engine logic for ledger replay.
 //! Delegate — DelegateSet (type 64).
 //!
 //! Implements directory maintenance and owner_count accounting per rippled
