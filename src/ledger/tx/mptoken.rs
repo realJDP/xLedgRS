@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Mptoken transaction engine logic for ledger replay.
 //! MPToken — MPTokenIssuanceCreate (54), MPTokenIssuanceDestroy (55),
 //!           MPTokenIssuanceSet (56), MPTokenAuthorize (57).
 //!
