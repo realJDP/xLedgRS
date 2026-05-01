@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Directory support for XRPL ledger state and SHAMap logic.
 //! DirectoryNode — ownership tracking in the XRP Ledger state tree.
 //!
 //! Every account has an "owner directory" that lists all objects it owns
