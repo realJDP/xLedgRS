@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Close Loop piece of the live node runtime.
 use super::*;
 use crate::consensus::{ConsensusMode, Proposal, Validation};
 use crate::network::relay;
