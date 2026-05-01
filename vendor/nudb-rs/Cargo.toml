@@ -1,3 +1,4 @@
+# xLedgRS purpose: Define the vendored NuDB Rust crate.
 [package]
 name = "nudb"
 version = "0.1.0"
