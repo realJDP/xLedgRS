@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Proposal support for XRPL consensus and validation.
 //! Validator proposals — a node's current position on the next ledger.
 //!
 //! During the Establish phase each validator broadcasts a `Proposal`
