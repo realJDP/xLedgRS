@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Dispute support for XRPL consensus and validation.
 //! Per-transaction dispute resolution — avalanche voting on individual transactions.
 //!
 //! When validators have overlapping but non-identical transaction sets, each
