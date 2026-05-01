@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Forensic support for XRPL ledger state and SHAMap logic.
 //! Forensic capture for engine-divergence debugging.
 //!
 //! When the follower detects a state-hash mismatch on the first ledger after
