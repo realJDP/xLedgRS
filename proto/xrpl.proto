@@ -1,3 +1,4 @@
+// xLedgRS purpose: Define XRPL peer protocol messages used on the network.
 syntax = "proto2";
 package protocol;
 
