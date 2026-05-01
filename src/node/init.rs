@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Init piece of the live node runtime.
 use super::*;
 
 #[derive(serde::Deserialize)]
