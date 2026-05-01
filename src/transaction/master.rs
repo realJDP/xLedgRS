@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Master support for transaction parsing and submission.
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
