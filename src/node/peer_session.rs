@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Peer Session piece of the live node runtime.
 use super::http_io::read_http_headers;
 use super::*;
 
