@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Runtime Snapshots piece of the live node runtime.
 use super::*;
 
 pub(super) struct FetchInfoSyncSnapshot {
