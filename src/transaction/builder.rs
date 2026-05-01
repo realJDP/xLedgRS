@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Builder support for transaction parsing and submission.
 //! High-level transaction builder.
 //!
 //! Constructs, signs, and serializes XRPL transactions.
