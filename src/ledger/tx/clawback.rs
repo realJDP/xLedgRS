@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Clawback transaction engine logic for ledger replay.
 //! Clawback — IMPLEMENTED
 
 use super::mptoken;
