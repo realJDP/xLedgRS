@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Offer Cancel legacy transactor for XRPL transaction apply.
 use super::{TecCode, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::views::ApplyView;
