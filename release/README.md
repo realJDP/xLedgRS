@@ -1,4 +1,6 @@
-# Release Export
+# Release Packaging
+
+This folder contains the files used to export a clean public release tree.
 
 To produce a shareable release tree, run:
 
