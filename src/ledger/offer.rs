@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Offer support for XRPL ledger state and SHAMap logic.
 //! Offer — a standing order on the XRPL decentralized exchange.
 //!
 //! An offer says: "I will give `taker_gets` in exchange for `taker_pays`."
