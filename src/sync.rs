@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Coordinate ledger state synchronization from peer data.
 //! Ledger synchronization from peer responses.
 //!
 //! When a validation arrives for a ledger sequence ahead of the local state,
