@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Check transaction engine logic for ledger replay.
 //! Check — IMPLEMENTED
 
 use super::ApplyResult;
