@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Handshake support for XRPL peer networking.
 //! XRPL peer handshake — HTTP upgrade to RTXP binary protocol.
 //!
 //! After a TLS connection is established, peers negotiate the protocol
