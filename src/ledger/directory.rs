@@ -215,6 +215,14 @@ pub struct DirectoryNode {
 }
 
 impl DirectoryNode {
+    fn encoded_indexes(&self) -> Vec<[u8; 32]> {
+        let mut indexes = self.indexes.clone();
+        if self.owner.is_some() {
+            indexes.sort();
+        }
+        indexes
+    }
+
     pub fn to_sle_binary(&self) -> Vec<u8> {
         let raw = match &self.raw_sle {
             Some(r) => r,
@@ -292,11 +300,11 @@ impl DirectoryNode {
             sle.set_field_raw_pub(17, 4, v);
         }
 
-        // Indexes (Vector256, 19, 1) — sorted by hash
-        let mut sorted_indexes = self.indexes.clone();
-        sorted_indexes.sort();
-        let mut idx_data = Vec::with_capacity(sorted_indexes.len() * 32);
-        for idx in &sorted_indexes {
+        // Indexes (Vector256, 19, 1). Owner directories use sorted insertion;
+        // book directories preserve append order within quality pages.
+        let indexes = self.encoded_indexes();
+        let mut idx_data = Vec::with_capacity(indexes.len() * 32);
+        for idx in &indexes {
             idx_data.extend_from_slice(idx);
         }
         sle.set_field_raw_pub(19, 1, &idx_data);
@@ -529,16 +537,14 @@ impl DirectoryNode {
         }
 
         // type=19 (Vector256), field=1: Indexes
-        // VL-prefixed: length = count * 32. Entries sorted by 256-bit hash
-        // to match rippled's canonical serialization (STVector256::sort at
-        // STVector256.cpp:47 is called before serialization).
-        let mut sorted_indexes = self.indexes.clone();
-        sorted_indexes.sort();
+        // VL-prefixed: length = count * 32. Owner directories are sorted;
+        // book directories preserve rippled dirAppend insertion order.
+        let indexes = self.encoded_indexes();
         out.push(0x01);
         out.push(19);
-        let vl_len = sorted_indexes.len() * 32;
+        let vl_len = indexes.len() * 32;
         crate::transaction::serialize::encode_length(vl_len, &mut out);
-        for idx in &sorted_indexes {
+        for idx in &indexes {
             out.extend_from_slice(idx);
         }
 
@@ -1587,6 +1593,21 @@ mod tests {
         assert_eq!(decoded.taker_gets_issuer, Some([0x04; 20]));
         assert_eq!(decoded.indexes.len(), 1);
         assert_eq!(decoded.owner, None);
+    }
+
+    #[test]
+    fn test_offer_quality_matches_rippled_divide_canonicalize() {
+        let offer_out = Amount::Xrp(71_347_968);
+        let offer_in = Amount::Iou {
+            value: IouValue {
+                mantissa: 9_742_641_500_000_000,
+                exponent: -14,
+            },
+            currency: crate::transaction::amount::Currency::from_code("USD").unwrap(),
+            issuer: acct(0),
+        };
+
+        assert_eq!(offer_quality(&offer_out, &offer_in), 0x4f04_d9ec_bd46_14bb);
     }
 
     #[test]

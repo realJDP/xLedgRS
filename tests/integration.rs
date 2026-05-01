@@ -41,7 +41,9 @@ async fn start_node() -> (Arc<Node>, std::net::SocketAddr, std::net::SocketAddr)
         ledger_history: xrpl::config::HistoryRetention::Count(256),
         fetch_depth: xrpl::config::HistoryRetention::Full,
         online_delete: None,
+        standalone: false,
         enable_consensus_close_loop: false,
+        validator_token: None,
         validation_seed: None,
         post_sync_checkpoint_script: None,
     };
@@ -208,7 +210,9 @@ async fn test_outbound_node_sends_handshake() {
         ledger_history: xrpl::config::HistoryRetention::Count(256),
         fetch_depth: xrpl::config::HistoryRetention::Full,
         online_delete: None,
+        standalone: false,
         enable_consensus_close_loop: false,
+        validator_token: None,
         validation_seed: None,
         post_sync_checkpoint_script: None,
     };
@@ -263,7 +267,9 @@ async fn test_two_nodes_connect() {
         ledger_history: xrpl::config::HistoryRetention::Count(256),
         fetch_depth: xrpl::config::HistoryRetention::Full,
         online_delete: None,
+        standalone: false,
         enable_consensus_close_loop: false,
+        validator_token: None,
         validation_seed: None,
         post_sync_checkpoint_script: None,
     };
@@ -305,7 +311,9 @@ async fn test_two_tls_nodes_connect() {
         ledger_history: xrpl::config::HistoryRetention::Count(256),
         fetch_depth: xrpl::config::HistoryRetention::Full,
         online_delete: None,
+        standalone: false,
         enable_consensus_close_loop: false,
+        validator_token: None,
         validation_seed: None,
         post_sync_checkpoint_script: None,
     }));
@@ -328,7 +336,9 @@ async fn test_two_tls_nodes_connect() {
         ledger_history: xrpl::config::HistoryRetention::Count(256),
         fetch_depth: xrpl::config::HistoryRetention::Full,
         online_delete: None,
+        standalone: false,
         enable_consensus_close_loop: false,
+        validator_token: None,
         validation_seed: None,
         post_sync_checkpoint_script: None,
     }));

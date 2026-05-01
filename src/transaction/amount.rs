@@ -523,7 +523,7 @@ impl IouValue {
         // Match rippled's STAmount::divide exactly:
         // 1. muldiv(numVal, tenTo17, denVal) — truncating 128-bit division
         // 2. result + 5  (rounding bias before canonicalize's /10)
-        // 3. canonicalize normalizes to [1e15, 1e16) with round-half-even
+        // 3. canonicalize normalizes to [1e15, 1e16) by truncating.
         let num = self.mantissa as i128 * 100_000_000_000_000_000i128; // 1e17
         let den = other.mantissa as i128;
         let m = if den == 0 {
@@ -543,11 +543,7 @@ impl IouValue {
         let mut abs = m.unsigned_abs();
         let mut exp = e;
         while abs > 9_999_999_999_999_999 {
-            let rem = abs % 10;
             abs /= 10;
-            if rem > 5 || (rem == 5 && abs % 2 != 0) {
-                abs += 1;
-            }
             exp += 1;
         }
         while abs < 1_000_000_000_000_000 && abs != 0 {

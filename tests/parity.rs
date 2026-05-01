@@ -2849,6 +2849,8 @@ fn mpt_tx(tx_type: u16, account: [u8; 20], seq: u32, fee: u64) -> ParsedTx {
         limit_amount: None,
         taker_pays: None,
         taker_gets: None,
+        quality_in: None,
+        quality_out: None,
         deliver_min: None,
         offer_sequence: None,
         finish_after: None,
