@@ -1,7 +1,7 @@
 # Source Layout
 
-This directory contains the Rust implementation of xLedgRSv2Beta. The code is
-split by runtime responsibility so parity work can be traced from network input,
+This directory contains the Rust implementation of xLedgRSv2Beta. Runtime code
+is grouped by responsibility so parity work can be traced from network input,
 through sync and transaction replay, into ledger state and RPC output.
 
 ## Folders
