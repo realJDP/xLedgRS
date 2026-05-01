@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ter support for XRPL ledger state and SHAMap logic.
 //! Transaction Engine Result — mirrors rippled's TER code space.
 //!
 //! A single `i32` with predicate helpers, matching rippled's
