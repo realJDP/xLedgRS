@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Serve optional gRPC APIs backed by the node runtime.
 //! gRPC service layer for xLedgRSv2Beta.
 //!
 //! This exposes the binary ledger RPC surface plus a local extension service
