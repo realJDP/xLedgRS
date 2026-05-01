@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Credential transaction engine logic for ledger replay.
 //! Credential — CredentialCreate (58), CredentialAccept (59), CredentialDelete (60)
 //!
 //! Implements directory maintenance and owner_count accounting per rippled
