@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Set Regular Key legacy transactor for XRPL transaction apply.
 use super::{TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::views::ApplyView;
