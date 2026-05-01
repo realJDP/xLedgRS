@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Sfield Meta support for XRPL ledger state and SHAMap logic.
 //! SField metadata flags — controls which fields appear in transaction metadata.
 //!
 //! Matches rippled's sMD_* flags from SField.h and sfields.macro.
