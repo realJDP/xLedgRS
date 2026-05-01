@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Fetch and verify UNL validator publisher lists.
 //! Validator list fetch and verification for publisher-hosted UNL data.
 //!
 //! Implements the rippled ValidatorSite + ValidatorList pattern:
