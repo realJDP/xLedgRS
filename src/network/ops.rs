@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ops support for XRPL peer networking.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkOpsSnapshot {
     pub server_state: String,
