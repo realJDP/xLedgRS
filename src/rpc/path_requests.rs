@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Path Requests support for JSON-RPC and WebSocket APIs.
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
