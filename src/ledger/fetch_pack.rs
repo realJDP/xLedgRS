@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Fetch Pack support for XRPL ledger state and SHAMap logic.
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
