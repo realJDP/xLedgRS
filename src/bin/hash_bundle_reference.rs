@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Hash Bundle Reference diagnostic utility for parity investigation.
 use std::path::PathBuf;
 
 use clap::Parser;
