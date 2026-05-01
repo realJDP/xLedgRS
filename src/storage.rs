@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Persist node metadata and connect NuDB-backed objects.
 //! Persistent storage for relational node data.
 //!
 //! rippled uses NuDB for content-addressed SHAMap nodes and SQLite for ledger
