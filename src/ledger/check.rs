@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Check support for XRPL ledger state and SHAMap logic.
 //! Check — a deferred payment instrument on the XRP Ledger.
 //!
 //! A check authorizes a destination to claim up to a specified amount of XRP.
