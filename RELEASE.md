@@ -1,5 +1,7 @@
 # xLedgRSv2Beta Public Release Bundle
 
+# xLedgRS purpose: Document the public xLedgRSv2Beta release package.
+
 This folder is the clean public-release source bundle for `xLedgRSv2Beta`.
 
 Contents:
