@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Configure TLS for XRPL peer connections.
 //! TLS configuration for XRPL peer connections.
 //!
 //! Each node generates a self-signed ECDSA-P256 certificate for the TLS layer.
