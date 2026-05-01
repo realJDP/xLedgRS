@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Amm Step transaction engine logic for ledger replay.
 //! Single AMM liquidity step for Payment/OfferCreate.
 //!
 //! This module intentionally does not implement AMM transaction lifecycle.
