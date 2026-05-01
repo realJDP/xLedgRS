@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Payment transaction engine logic for ledger replay.
 //! Payment — XRP direct + IOU/cross-currency via RippleCalc flow engine.
 
 use super::amm_step;
