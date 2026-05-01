@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Amount support for transaction parsing and submission.
 //! XRPL Amount type — XRP (drops) or IOU (value + currency + issuer).
 //!
 //! Binary encoding:
