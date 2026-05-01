@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Account Delete transaction engine logic for ledger replay.
 //! AccountDelete — IMPLEMENTED
 
 use super::ApplyResult;
