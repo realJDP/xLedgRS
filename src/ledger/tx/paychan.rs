@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Paychan transaction engine logic for ledger replay.
 //! PaymentChannel — IMPLEMENTED
 
 use super::ApplyResult;
