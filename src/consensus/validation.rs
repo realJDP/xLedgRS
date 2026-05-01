@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Validation support for XRPL consensus and validation.
 //! Validator validations — signed attestations that a ledger hash is final.
 //!
 //! After consensus on a transaction set, each validator applies the transactions
