@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Parse support for transaction parsing and submission.
 //! Binary transaction parser — deserialize a signed tx blob into its fields.
 //!
 //! Walks the XRPL STObject binary format field-by-field, extracting the fields
