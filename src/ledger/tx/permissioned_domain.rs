@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Permissioned Domain transaction engine logic for ledger replay.
 //! PermissionedDomain — PermissionedDomainSet (type 62) and PermissionedDomainDelete (type 63).
 //!
 //! Implements directory maintenance and owner_count accounting per rippled
