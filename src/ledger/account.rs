@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Account support for XRPL ledger state and SHAMap logic.
 //! AccountRoot — the on-ledger state of a single XRPL account.
 //!
 //! AccountRoot objects are stored in the account-state SHAMap.  Each leaf's
