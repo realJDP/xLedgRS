@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Inbound support for XRPL ledger state and SHAMap logic.
 //! InboundLedger — per-hash ledger acquisition, modeled after rippled's
 //! InboundLedger / InboundLedgers.
 //!
