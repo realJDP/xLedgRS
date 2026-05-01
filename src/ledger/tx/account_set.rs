@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Account Set transaction engine logic for ledger replay.
 //! AccountSet / SetRegularKey — IMPLEMENTED
 
 use super::ApplyResult;
