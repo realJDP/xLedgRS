@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Peerfinder support for XRPL peer networking.
 //! Peerfinder-style bootcache/livecache and slot-manager support.
 //!
 //! xLedgRSv2Beta keeps durable peer discovery state together with manager-owned
