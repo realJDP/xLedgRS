@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Wire peers, sync, consensus, RPC, and node state together.
 //! The Node — ties all subsystems together and runs the main event loop.
 //!
 //! Responsibilities:
