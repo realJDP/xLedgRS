@@ -1,3 +1,8 @@
+//! Bootstrap target selection for state-tree sync.
+//!
+//! Chooses the ledger/hash pair used to kick off acquisition from peers while
+//! avoiding stale or unsupported ranges.
+
 pub fn choose_sync_kickstart_target(
     inactive_target: Option<(u32, [u8; 32])>,
     latest_seq: u32,
