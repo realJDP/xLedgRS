@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Parity test coverage for release and parity safety.
 //! Parity tests — verify xLedgRSv2Beta behavior matches rippled's expected outcomes.
 //!
 //! Fixtures are derived from rippled's jtx and app test suites.
