@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Consensus Control piece of the live node runtime.
 use super::*;
 
 impl Node {
