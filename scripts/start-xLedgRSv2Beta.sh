@@ -1,4 +1,5 @@
 #!/bin/bash
+# xLedgRS purpose: Start a follower node with release defaults.
 set -euo pipefail
 
 CONFIG_FILE="${XLEDGRSV2BETA_CONFIG:-$HOME/xLedgRSv2Beta.cfg}"
