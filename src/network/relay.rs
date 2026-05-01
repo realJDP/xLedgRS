@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Relay support for XRPL peer networking.
 //! Peer message relay helpers for broadcasting consensus and transaction
 //! messages over RTXP.
 //!
