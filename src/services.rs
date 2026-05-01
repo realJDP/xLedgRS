@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Bundle shared runtime services used by node subsystems.
 //! Shared runtime services for the node's live service graph.
 //!
 //! This groups runtime services into one bundle so they can be wired,
