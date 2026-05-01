@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Amm transaction engine logic for ledger replay.
 //! AMM — AMMClawback (31), AMMCreate (35), AMMDeposit (36), AMMWithdraw (37),
 //!       AMMVote (38), AMMBid (39), AMMDelete (40).
 //!
