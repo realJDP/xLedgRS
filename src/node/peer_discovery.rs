@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Peer Discovery piece of the live node runtime.
 use super::*;
 
 impl Node {
