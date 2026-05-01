@@ -1,4 +1,5 @@
 #!/bin/bash
+# xLedgRS purpose: Run operator checkpoint hooks after sync completes.
 set -euo pipefail
 
 SYNC_SEQ="${XLEDGRSV2BETA_SYNC_LEDGER_SEQ:?missing XLEDGRSV2BETA_SYNC_LEDGER_SEQ}"
