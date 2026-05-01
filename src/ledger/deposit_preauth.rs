@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Deposit Preauth support for XRPL ledger state and SHAMap logic.
 //! DepositPreauth — pre-authorization for deposits.
 //!
 //! Account A authorizes account B to send payments to A even when A has
