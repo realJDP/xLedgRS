@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Shared State piece of the live node runtime.
 use super::*;
 
 impl SharedState {
