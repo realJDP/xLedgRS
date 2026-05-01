@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Runtime Helpers piece of the live node runtime.
 use super::*;
 use prost::Message as ProstMessage;
 
