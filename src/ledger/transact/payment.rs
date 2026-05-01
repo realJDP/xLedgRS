@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Payment legacy transactor for XRPL transaction apply.
 use super::{legacy_path_not_supported, TecCode, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::{LedgerEntryType, SLE};
