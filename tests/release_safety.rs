@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Release Safety test coverage for release and parity safety.
 use std::fs;
 use std::path::{Path, PathBuf};
 
