@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Nftoken legacy transactor for XRPL transaction apply.
 use super::{check_reserve, legacy_path_not_supported, owner_dir, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::{LedgerEntryType, SLE};
