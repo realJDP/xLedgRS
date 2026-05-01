@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Nftoken transaction engine logic for ledger replay.
 //! NFToken — IMPLEMENTED
 
 use super::ApplyResult;
