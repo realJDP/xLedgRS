@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Master support for XRPL ledger state and SHAMap logic.
 //! Validated-ledger bookkeeping and recent validation history.
 
 use std::collections::{HashMap, VecDeque};
