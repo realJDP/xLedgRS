@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Peer support for XRPL peer networking.
 //! Peer connection state machine.
 //!
 //! Tracks the lifecycle of a single peer connection without doing any I/O.
