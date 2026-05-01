@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Mod helpers for XRPL keys, signing, and addresses.
 //! Cryptography primitives for the XRP Ledger.
 //!
 //! Covers:
