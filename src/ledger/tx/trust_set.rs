@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Trust Set transaction engine logic for ledger replay.
 //! TrustSet — IMPLEMENTED
 
 use super::ApplyResult;
