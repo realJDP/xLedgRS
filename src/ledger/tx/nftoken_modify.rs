@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Nftoken Modify transaction engine logic for ledger replay.
 //! NFTokenModify — type 61 (amendment: DynamicNFT).
 //!
 //! Modifies the URI on an existing mutable NFToken within its NFTokenPage.
