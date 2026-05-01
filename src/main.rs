@@ -1,3 +1,8 @@
+//! Command-line entrypoint for the `xledgrs` daemon.
+//!
+//! This parses CLI/config input, handles daemon process-control flags, wires
+//! optional gRPC, and starts the live XRPL node runtime.
+
 use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
