@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Track SHAMap sync requests, responses, and progress.
 //! State-tree synchronization coordinator.
 //!
 //! The coordinator owns the SHAMap for the duration of sync and hands it off
