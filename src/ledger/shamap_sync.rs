@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Shamap Sync support for XRPL ledger state and SHAMap logic.
 //! SHAMap sync methods — addKnownNode + getMissingNodes.
 //!
 //! These implement the sync algorithm matching rippled's InboundLedger:
