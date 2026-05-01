@@ -19,10 +19,14 @@ This is a public beta release. It is intended for development, testing, protocol
 
 ## Repository Layout
 
-- `src/` runtime, ledger, networking, transaction, RPC, and consensus code
-- `cfg/` release-safe configuration templates
-- `proto/` protobuf definitions for peer and gRPC services
-- `tests/` integration, parity, and release-safety coverage
+- `cfg/` - Release-safe follower and validator configuration templates.
+- `proto/` - XRPL peer and gRPC protobuf definitions.
+- `release/` - Export filters and release-note templates for public packaging.
+- `scripts/` - Operator startup helpers and release export tooling.
+- `site/` - Static public landing-page and image assets.
+- `src/` - Runtime, ledger, networking, transaction, RPC, sync, and consensus code.
+- `tests/` - Integration, parity, and release-safety coverage.
+- `vendor/nudb-rs/` - Vendored NuDB storage implementation used by the node store.
 
 ## Prerequisites
 
