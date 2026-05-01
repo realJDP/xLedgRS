@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Vault transaction engine logic for ledger replay.
 //! Vault — VaultCreate (65), VaultSet (66), VaultDelete (67),
 //!         VaultDeposit (68), VaultWithdraw (69), VaultClawback (70).
 //!
