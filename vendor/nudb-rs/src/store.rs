@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Implement NuDB store read, write, and delete operations.
 //! NuDB Store — the main read/write interface.
 //!
 //! Matches C++ NuDB architecture:
