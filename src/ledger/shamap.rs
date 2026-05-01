@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Shamap support for XRPL ledger state and SHAMap logic.
 //! SHAMap — the radix-16 Merkle hash tree at the core of the XRP Ledger.
 //!
 //! Every closed ledger contains two SHAMaps:
