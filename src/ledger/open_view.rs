@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Open View support for XRPL ledger state and SHAMap logic.
 //! OpenView — per-ledger mutable view wrapping a closed Ledger.
 //!
 //! Buffers all mutations in a RawStateTable. Also owns the transaction
