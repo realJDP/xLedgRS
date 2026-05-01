@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Signer List Set transaction engine logic for ledger replay.
 //! SignerListSet (type 12) — create, replace, or destroy a SignerList SLE.
 //!
 //! Implements directory maintenance and owner_count accounting per rippled
