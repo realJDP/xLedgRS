@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Offer transaction engine logic for ledger replay.
 //! Offer — IMPLEMENTED
 
 use super::amm_step;
