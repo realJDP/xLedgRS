@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Loan transaction engine logic for ledger replay.
 //! Loan — LoanBrokerSet (74), LoanBrokerDelete (75), LoanBrokerCoverDeposit (76),
 //!        LoanBrokerCoverWithdraw (77), LoanBrokerCoverClawback (78),
 //!        LoanSet (80), LoanDelete (81), LoanManage (82), LoanPay (84).
