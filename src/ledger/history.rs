@@ -1,3 +1,4 @@
+//! xLedgRS purpose: History support for XRPL ledger state and SHAMap logic.
 //! Ledger history — stores closed ledger headers and their transactions.
 //!
 //! Provides O(1) lookup of:
