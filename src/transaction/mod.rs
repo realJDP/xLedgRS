@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Mod support for transaction parsing and submission.
 //! Transaction module — types, serialization, signing, and application.
 
 pub mod amount;
