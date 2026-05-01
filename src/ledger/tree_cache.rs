@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Tree Cache support for XRPL ledger state and SHAMap logic.
 //! TreeNodeCache — bounded LRU cache for SHAMap nodes.
 //!
 //! Sits between the SHAMap tree walk and the NodeStore disk backend.
