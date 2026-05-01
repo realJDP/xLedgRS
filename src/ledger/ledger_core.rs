@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ledger Core support for XRPL ledger state and SHAMap logic.
 //! Closed-ledger state and read access backed by SHAMap storage.
 //!
 //! The ledger owns the account state and transaction SHAMap trees, both backed
