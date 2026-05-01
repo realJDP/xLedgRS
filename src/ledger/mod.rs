@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Mod support for XRPL ledger state and SHAMap logic.
 //! Ledger primitives, state trees, and transaction application.
 //!
 //! View stack: `ClosedLedger` (`ReadView` + `RawView`) → `OpenView`
