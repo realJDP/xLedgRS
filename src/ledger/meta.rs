@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Meta support for XRPL ledger state and SHAMap logic.
 //! Binary transaction metadata parser.
 //!
 //! Parses XRPL binary metadata blobs to extract `AffectedNodes` entries with
