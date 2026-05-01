@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Open Ledger support for XRPL ledger state and SHAMap logic.
 //! Open-ledger queue state and transaction application tracking.
 
 use crate::crypto::sha512_first_half;
