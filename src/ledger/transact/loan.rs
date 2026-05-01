@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Loan legacy transactor for XRPL transaction apply.
 use super::{legacy_path_not_supported, TxHandler, TER};
 use crate::ledger::views::ApplyView;
 use crate::transaction::ParsedTx;
