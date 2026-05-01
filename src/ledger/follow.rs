@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Follow support for XRPL ledger state and SHAMap logic.
 //! Ledger follower — tracks validated ledgers and builds them locally.
 //!
 //! Requests liBASE (header) + liTX_NODE (transactions) in parallel for each
