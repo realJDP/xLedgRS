@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Tx Ingress piece of the live node runtime.
 use super::*;
 
 impl Node {
