@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Oracle transaction engine logic for ledger replay.
 //! Oracle transaction handlers — OracleSet (51) and OracleDelete (52).
 //!
 //! OracleSet creates or updates an Oracle SLE.  OracleDelete removes one.
