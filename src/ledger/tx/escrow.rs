@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Escrow transaction engine logic for ledger replay.
 //! Escrow — IMPLEMENTED
 //!
 //! Supports XRP escrows natively, IOU escrows via trust-line adjustments, and
