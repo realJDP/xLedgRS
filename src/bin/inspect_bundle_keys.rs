@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Inspect Bundle Keys diagnostic utility for parity investigation.
 use std::path::PathBuf;
 
 use clap::Parser;
