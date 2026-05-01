@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Rpc Server piece of the live node runtime.
 use super::http_io::{parse_forwarded_for, read_rpc_request};
 use super::*;
 
