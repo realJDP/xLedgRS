@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Expose the vendored NuDB storage API.
 //! NuDB — a pure Rust write-once, hash-indexed key-value store.
 //!
 //! Designed for content-addressable storage where keys are cryptographic hashes.
