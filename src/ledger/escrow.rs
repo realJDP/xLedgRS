@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Escrow support for XRPL ledger state and SHAMap logic.
 //! Escrow — time-locked XRP held in a ledger object.
 //!
 //! An escrow locks XRP until a time condition is met:
