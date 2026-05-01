@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Http Io piece of the live node runtime.
 use super::*;
 
 pub(super) fn parse_http_content_length(header: &[u8]) -> Option<usize> {
