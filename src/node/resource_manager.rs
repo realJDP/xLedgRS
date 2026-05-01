@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Resource Manager piece of the live node runtime.
 use super::*;
 
 impl Node {
