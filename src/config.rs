@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Parse xLedgRSv2Beta and rippled-style config files.
 //! Node configuration parsing.
 //!
 //! Supports two formats:
