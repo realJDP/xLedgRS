@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Prune support for XRPL ledger state and SHAMap logic.
 //! NuDB pruning — compact the NodeStore to only live objects.
 //!
 //! Walk the state tree from its root hash, copying all reachable nodes
