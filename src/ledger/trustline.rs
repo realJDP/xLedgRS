@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Trustline support for XRPL ledger state and SHAMap logic.
 //! RippleState — the on-ledger state of a trust line between two accounts.
 //!
 //! A trust line connects two accounts for a specific currency.  The "low"
