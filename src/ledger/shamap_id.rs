@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Shamap Id support for XRPL ledger state and SHAMap logic.
 //! SHAMapNodeID — position coordinate in the SHAMap tree.
 //!
 //! Encodes depth (0–64) + nibble path from root.
