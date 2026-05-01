@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Sync Transport piece of the live node runtime.
 use super::*;
 
 impl Node {
