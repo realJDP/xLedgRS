@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Route transaction engine handlers by XRPL transaction type.
 //! Transaction application — mutate `LedgerState` by applying a parsed transaction.
 //!
 //! Each transaction type lives in its own submodule.
