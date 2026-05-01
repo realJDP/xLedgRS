@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Load support for XRPL peer networking.
 //! Load/stall tracking for server status surfaces.
 //!
 //! xLedgRSv2Beta keeps a dedicated load-manager cycle backed by a runtime job-queue
