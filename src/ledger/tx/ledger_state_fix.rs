@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Ledger State Fix transaction engine logic for ledger replay.
 //! LedgerStateFix — type 53 (amendment: fixNFTokenPageLinks).
 //!
 //! User-submitted transaction that repairs broken NFTokenPage directory links
