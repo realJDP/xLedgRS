@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Integration test coverage for release and parity safety.
 //! Integration tests — spin up real nodes and verify they talk to each other.
 //!
 //! Each test binds on a random port (port 0) so tests never conflict.
