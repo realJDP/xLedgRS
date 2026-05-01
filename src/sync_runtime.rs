@@ -1,3 +1,8 @@
+//! Live sync runtime coordination.
+//!
+//! Connects the sync coordinator, peer transport, timers, progress snapshots,
+//! and node state transitions while a fixed ledger is being acquired.
+
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
