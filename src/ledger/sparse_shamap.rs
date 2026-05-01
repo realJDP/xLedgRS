@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Sparse Shamap support for XRPL ledger state and SHAMap logic.
 //! Sparse SHAMap — inner nodes in RAM, leaf data on disk.
 //!
 //! Stores only the tree structure and hashes in memory (~500MB-1GB for 18.7M objects).
