@@ -1,3 +1,8 @@
+//! Background processor for downloaded sync nodes.
+//!
+//! Persists acquired SHAMap nodes, detects tree completion, flushes NuDB, and
+//! prepares the verified ledger handoff to the follower.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
