@@ -1,3 +1,4 @@
+# xLedgRS purpose: List private and generated files excluded from release exports.
 .git
 target
 target*
