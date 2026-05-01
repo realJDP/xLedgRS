@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Close support for XRPL ledger state and SHAMap logic.
 //! Ledger close — drain the transaction pool, apply all transactions,
 //! and produce a new validated ledger.
 //!
