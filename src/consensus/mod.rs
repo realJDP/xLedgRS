@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Mod support for XRPL consensus and validation.
 //! XRP Ledger Consensus Protocol (XRPLCP).
 //!
 //! XRPL uses a Federated Byzantine Agreement variant where each validator
