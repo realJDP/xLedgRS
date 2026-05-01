@@ -1,3 +1,4 @@
+//! xLedgRS purpose: Sync Mesh piece of the live node runtime.
 use super::*;
 
 pub(crate) fn rotate_sync_peer_window(
