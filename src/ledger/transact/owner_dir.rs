@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Owner Dir legacy transactor for XRPL transaction apply.
 use std::sync::Arc;
 
 use crate::ledger::directory::{DirectoryNode, DIR_NODE_MAX_ENTRIES};

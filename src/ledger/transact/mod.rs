@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Route legacy transactor handlers by XRPL transaction type.
 //! Legacy view-stack transactor modeled after rippled's three-stage pipeline.
 //!
 //! Every transaction goes through:
@@ -311,11 +310,11 @@ pub struct UnsupportedHandler;
 
 impl TxHandler for UnsupportedHandler {
     fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
-        Err(TER::Malformed("temUNKNOWN"))
+        Err(TER::Malformed("tecINCOMPLETE"))
     }
 
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
-        TER::Malformed("temUNKNOWN")
+        TER::Malformed("tecINCOMPLETE")
     }
 }
 
@@ -565,7 +564,7 @@ mod tests {
             tx_type: 3,
             account: alice,
             fee: 10,
-            set_flag: Some(1), // asfRequireDest -> lsfRequireDestTag (0x00010000)
+            set_flag: Some(1), // asfRequireDest -> lsfRequireDestTag
             ..ParsedTx::default()
         };
 
@@ -580,7 +579,10 @@ mod tests {
         assert!(result.ter.is_success());
 
         let alice_sle = open.read(&keylet::account(&alice)).unwrap();
-        assert_eq!(alice_sle.flags() & 0x00010000, 0x00010000); // RequireDestTag set
+        assert_eq!(
+            alice_sle.flags() & crate::ledger::account::LSF_REQUIRE_DEST_TAG,
+            crate::ledger::account::LSF_REQUIRE_DEST_TAG
+        );
     }
 
     #[test]
@@ -714,7 +716,7 @@ mod tests {
             &UnsupportedHandler,
             ApplyFlags::NONE,
         );
-        assert!(matches!(result.ter, TER::Malformed("temUNKNOWN")));
+        assert!(matches!(result.ter, TER::Malformed("tecINCOMPLETE")));
         assert!(result.metadata.is_none());
 
         // Unsupported transactions must not consume fee or sequence.
@@ -761,6 +763,218 @@ mod tests {
         assert_eq!(alice_sle.balance_xrp(), Some(100_000_000));
         assert_eq!(alice_sle.sequence(), Some(1));
         assert_eq!(bob_sle.balance_xrp(), Some(50_000_000));
+    }
+
+    #[test]
+    fn test_legacy_check_create_accepts_iou_sendmax() {
+        let alice = [0xAA; 20];
+        let bob = [0xBB; 20];
+        let issuer = [0xCC; 20];
+
+        let mut base = setup_ledger_with_account(&alice, 100_000_000);
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&bob).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&bob, 50_000_000, 1),
+        )));
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&issuer).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&issuer, 50_000_000, 1),
+        )));
+
+        let mut open = OpenView::new(Arc::new(base));
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let send_max = crate::transaction::Amount::Iou {
+            value: crate::transaction::amount::IouValue::from_f64(5.0),
+            currency: usd,
+            issuer,
+        };
+        let tx = ParsedTx {
+            tx_type: 16,
+            account: alice,
+            fee: 10,
+            sequence: 1,
+            destination: Some(bob),
+            send_max: Some(send_max.clone()),
+            ..ParsedTx::default()
+        };
+
+        let result = apply_transaction(
+            &mut open,
+            &tx,
+            &[0x10; 32],
+            &CheckCreateHandler,
+            ApplyFlags::NONE,
+        );
+        assert!(
+            result.ter.is_success(),
+            "legacy CheckCreate returned {:?}",
+            result.ter
+        );
+
+        let check_sle = open.read(&keylet::check(&alice, 1)).unwrap();
+        assert_eq!(check_sle.find_field_raw(6, 9), Some(send_max.to_bytes()));
+        assert_eq!(check_sle.get_field_account(8, 3), Some(bob));
+
+        let alice_sle = open.read(&keylet::account(&alice)).unwrap();
+        assert_eq!(alice_sle.owner_count(), 1);
+        assert_eq!(alice_sle.sequence(), Some(2));
+    }
+
+    #[test]
+    fn test_legacy_check_cash_iou_is_explicitly_unsupported_without_mutation() {
+        let alice_key = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed_entropy(&[0xAA; 16]),
+        );
+        let bob_key = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed_entropy(&[0xBB; 16]),
+        );
+        let issuer_key = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed_entropy(&[0xCC; 16]),
+        );
+        let alice = crate::crypto::account_id(&alice_key.public_key_bytes());
+        let bob = crate::crypto::account_id(&bob_key.public_key_bytes());
+        let issuer = crate::crypto::account_id(&issuer_key.public_key_bytes());
+
+        let mut base = setup_ledger_with_account(&alice, 100_000_000);
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&bob).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&bob, 50_000_000, 1),
+        )));
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&issuer).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&issuer, 50_000_000, 1),
+        )));
+
+        let mut open = OpenView::new(Arc::new(base));
+        let usd = crate::transaction::amount::Currency::from_code("USD").unwrap();
+        let amount = crate::transaction::Amount::Iou {
+            value: crate::transaction::amount::IouValue::from_f64(5.0),
+            currency: usd,
+            issuer,
+        };
+        let create = ParsedTx {
+            tx_type: 16,
+            account: alice,
+            fee: 10,
+            sequence: 1,
+            destination: Some(bob),
+            send_max: Some(amount.clone()),
+            ..ParsedTx::default()
+        };
+        let result = apply_transaction(
+            &mut open,
+            &create,
+            &[0x11; 32],
+            &CheckCreateHandler,
+            ApplyFlags::NONE,
+        );
+        assert!(result.ter.is_success());
+
+        let cash = crate::transaction::parse_blob(
+            &crate::transaction::builder::TxBuilder::check_cash()
+                .account(&bob_key)
+                .amount(amount)
+                .fee(10)
+                .sequence(1)
+                .check_id(keylet::check(&alice, 1).key.0)
+                .sign(&bob_key)
+                .unwrap()
+                .blob,
+        )
+        .unwrap();
+        let before_bob = open.read(&keylet::account(&bob)).unwrap();
+        assert_eq!(before_bob.balance_xrp(), Some(50_000_000));
+        assert_eq!(before_bob.sequence(), Some(1));
+
+        let result = apply_transaction(
+            &mut open,
+            &cash,
+            &[0x12; 32],
+            &CheckCashHandler,
+            ApplyFlags::NONE,
+        );
+        assert!(matches!(result.ter, TER::LocalFail("tefNOT_SUPPORTED")));
+        assert!(result.metadata.is_none());
+
+        let after_bob = open.read(&keylet::account(&bob)).unwrap();
+        assert_eq!(after_bob.balance_xrp(), Some(50_000_000));
+        assert_eq!(after_bob.sequence(), Some(1));
+        assert!(open.exists(&keylet::check(&alice, 1)));
+    }
+
+    #[test]
+    fn test_legacy_check_cancel_allows_third_party_after_expiration() {
+        let alice_key = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed_entropy(&[0xAA; 16]),
+        );
+        let bob_key = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed_entropy(&[0xBB; 16]),
+        );
+        let carol_key = crate::crypto::keys::KeyPair::Secp256k1(
+            crate::crypto::keys::Secp256k1KeyPair::from_seed_entropy(&[0xCC; 16]),
+        );
+        let alice = crate::crypto::account_id(&alice_key.public_key_bytes());
+        let bob = crate::crypto::account_id(&bob_key.public_key_bytes());
+        let carol = crate::crypto::account_id(&carol_key.public_key_bytes());
+
+        let mut base = setup_ledger_with_account(&alice, 100_000_000);
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&bob).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&bob, 50_000_000, 1),
+        )));
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&carol).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&carol, 50_000_000, 1),
+        )));
+
+        let mut open = OpenView::new(Arc::new(base));
+        let create = ParsedTx {
+            tx_type: 16,
+            account: alice,
+            fee: 10,
+            sequence: 1,
+            destination: Some(bob),
+            send_max: Some(crate::transaction::Amount::Xrp(5_000_000)),
+            expiration: Some(50),
+            ..ParsedTx::default()
+        };
+        let result = apply_transaction(
+            &mut open,
+            &create,
+            &[0x13; 32],
+            &CheckCreateHandler,
+            ApplyFlags::NONE,
+        );
+        assert!(result.ter.is_success());
+
+        open.info_mut().close_time = 100;
+        let cancel = crate::transaction::parse_blob(
+            &crate::transaction::builder::TxBuilder::check_cancel()
+                .account(&carol_key)
+                .fee(10)
+                .sequence(1)
+                .check_id(keylet::check(&alice, 1).key.0)
+                .sign(&carol_key)
+                .unwrap()
+                .blob,
+        )
+        .unwrap();
+
+        let result = apply_transaction(
+            &mut open,
+            &cancel,
+            &[0x14; 32],
+            &CheckCancelHandler,
+            ApplyFlags::NONE,
+        );
+        assert!(result.ter.is_success(), "got {:?}", result.ter);
+        assert!(!open.exists(&keylet::check(&alice, 1)));
     }
 
     #[test]

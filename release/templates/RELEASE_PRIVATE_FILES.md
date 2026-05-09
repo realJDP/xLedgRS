@@ -1,7 +1,5 @@
 # Private Files Omitted From Release Export
 
-# xLedgRS purpose: Explain which private files stay out of public releases.
-
 The release export intentionally omits or replaces the following categories:
 
 - machine-specific deploy scripts with hardcoded hosts

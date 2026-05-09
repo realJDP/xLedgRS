@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peer Policy piece of the live node runtime.
 use super::*;
 
 pub(super) fn peer_reservations_map(
@@ -133,7 +132,9 @@ impl SharedState {
             self.peer_count(),
             peer_reservations_map(self.ctx.peer_reservations.as_ref()).len(),
             now,
+            None,
         );
+        self.ctx.load_snapshot = self.services.load_manager.snapshot();
         self.rebuild_known_peers();
     }
 

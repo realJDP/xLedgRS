@@ -1,7 +1,5 @@
 # xLedgRSv2Beta Public Release Bundle
 
-# xLedgRS purpose: Document the public xLedgRSv2Beta release package.
-
 This folder is the clean public-release source bundle for `xLedgRSv2Beta`.
 
 Contents:
@@ -16,16 +14,14 @@ Excluded from this copy:
 - Local agent/cache folders.
 - macOS `.DS_Store` files.
 
-Validation command used on the working source before export:
+Recommended validation commands before export:
 
 ```sh
-cargo test --target-dir /private/tmp/xLedgRSv2Beta-codex-target --lib
-```
-
-Result:
-
-```text
-1018 passed; 0 failed
+cargo fmt --check
+cargo build --release --bin xledgrs
+cargo test --lib
+cargo test --tests
+cargo test --test release_safety
 ```
 
 Release note:

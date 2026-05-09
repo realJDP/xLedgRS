@@ -1,0 +1,114 @@
+{
+  "group": "Group 2 production parity proof inventory",
+  "updated": "2026-05-08",
+  "families": [
+    {
+      "id": "server_definitions_exact_diff",
+      "findings": [39],
+      "surface": "server_definitions",
+      "source": "committed",
+      "executable": true,
+      "command": "cargo test --test group2_server_definitions_exact_diff",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "handler output must exactly match src/rpc/data/server_definitions_mainnet_3_1_2.json and hash short-circuit must not return the full catalogue"
+    },
+    {
+      "id": "dex_private_bug_b",
+      "findings": [40, 42],
+      "surface": "DEX replay",
+      "source": "private",
+      "executable": true,
+      "command": "XLEDGRSV2BETA_BUG_B_FIXTURE=<bundle> cargo test --test bug_b_tfsell_tx0",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": true,
+      "skipped_by_default": true,
+      "assertion": "byte-exact rippled post-state for captured tfSell/IOC crossing bundle"
+    },
+    {
+      "id": "dex_private_bug_c",
+      "findings": [40, 42],
+      "surface": "DEX replay",
+      "source": "private",
+      "executable": true,
+      "command": "XLEDGRSV2BETA_BUG_C_FIXTURE=<bundle> cargo test --test bug_c_book_dir",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": true,
+      "skipped_by_default": true,
+      "assertion": "byte-exact rippled post-state for captured self-cross book-directory bundle"
+    },
+    {
+      "id": "replay_fixture_no_bridge_mode",
+      "findings": [41, 47],
+      "surface": "validated replay",
+      "source": "committed",
+      "executable": true,
+      "command": "cargo run --bin replay_fixture -- --bundle <bundle> --forbid-authoritative-bridges",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "the replay harness must fail any bundle that would need AMM OfferCreate, AMM self-swap Payment, or authoritative override bridge paths"
+    },
+    {
+      "id": "bookstep_synthetic_regressions",
+      "findings": [42],
+      "surface": "Payment CLOB/BookStep",
+      "source": "synthetic",
+      "executable": true,
+      "command": "cargo test --test worker5_flow_parity",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "local synthetic payment flow regressions remain executable, but do not replace byte-exact rippled replay bundles"
+    },
+    {
+      "id": "amm_synthetic_regressions",
+      "findings": [43],
+      "surface": "AMM lifecycle/path",
+      "source": "synthetic",
+      "executable": true,
+      "command": "cargo test --test parity amm",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "local AMM lifecycle/path regressions remain executable, but committed rippled AMMCalc/AMM/AMMExtended replay bundles are still required for production parity"
+    },
+    {
+      "id": "mpt_synthetic_regressions",
+      "findings": [44],
+      "surface": "MPT Payment",
+      "source": "synthetic",
+      "executable": true,
+      "command": "cargo test --test mainnet_mpt_payment",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "local MPT payment regressions remain executable, but do not replace rippled-captured issuer/holder/fee/partial metadata fixtures"
+    },
+    {
+      "id": "delivered_amount_pending_replay_family",
+      "findings": [45],
+      "surface": "Payment delivered_amount metadata",
+      "source": "pending",
+      "executable": false,
+      "command": "",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "needs committed rippled fixtures for direct XRP, direct IOU, BookStep, partial, MPT, and AMM payments"
+    },
+    {
+      "id": "path_find_pending_replay_family",
+      "findings": [46],
+      "surface": "path_find/ripple_path_find",
+      "source": "pending",
+      "executable": false,
+      "command": "",
+      "uses_authoritative_bridges": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "needs same-ledger rippled response fixtures for alternatives, ordering, selectors, paths_computed, and error codes"
+    }
+  ]
+}

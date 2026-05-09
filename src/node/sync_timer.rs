@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Sync Timer piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -46,15 +45,13 @@ impl Node {
             }
 
             {
-                let (peers_low, sync_active) = {
+                let (peers_needed, sync_active) = {
                     let state = self.state.read().await;
                     let sync_active = state.sync_in_progress || self.sync_runtime.sync_active();
-                    (
-                        state.peer_count() < crate::ledger::inbound::REPLY_FOLLOWUP_PEERS,
-                        sync_active,
-                    )
+                    let target_peers = self.config.sync_peer_target();
+                    (target_peers.saturating_sub(state.peer_count()), sync_active)
                 };
-                if peers_low && sync_active {
+                if peers_needed > 0 && sync_active {
                     let mut state = self.state.write().await;
                     let now_unix = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -63,7 +60,7 @@ impl Node {
                     let candidates = state.services.peerfinder.autoconnect(now_unix);
                     let mut dialed = 0;
                     for addr in candidates {
-                        if dialed >= crate::ledger::inbound::REPLY_FOLLOWUP_PEERS {
+                        if dialed >= peers_needed.min(4) {
                             break;
                         }
                         let cooled = state
@@ -73,6 +70,9 @@ impl Node {
                         if cooled || state.connected_addrs.contains(&addr) {
                             continue;
                         }
+                        state
+                            .peer_cooldowns
+                            .insert(addr, std::time::Instant::now() + Duration::from_secs(15));
                         drop(state);
                         info!("sync timer: low peers during sync, dialing {}", addr);
                         let node = self.clone();
@@ -126,11 +126,15 @@ impl Node {
                 if now_secs >= prev + 15 {
                     LAST_STATUS_BROADCAST.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                     let state = self.state.read().await;
-                    let status_msg = crate::network::relay::encode_status_change(
+                    let ledger_range = (state.ctx.ledger_seq > 0)
+                        .then_some((state.ctx.ledger_seq, state.ctx.ledger_seq));
+                    let status_msg = crate::network::relay::encode_status_change_full(
                         crate::proto::NodeStatus::NsConnected,
                         crate::proto::NodeEvent::NeAcceptedLedger,
                         state.ctx.ledger_seq,
                         &state.ctx.ledger_header.hash,
+                        Some(&state.ctx.ledger_header.parent_hash),
+                        ledger_range,
                     );
                     state.broadcast(&status_msg, None);
                     if state.services.cluster.snapshot(1).configured > 0 {
@@ -293,13 +297,35 @@ impl Node {
                 sync_runtime.trigger_timeout_blocking(&storage_clone)
             })
             .await;
-            let (reqs, sync_seq, abandon) = match trigger_result {
+            let timeout_result = match trigger_result {
                 Ok(r) => r,
                 Err(e) => {
                     error!("sync timer spawn_blocking panicked: {}", e);
                     continue;
                 }
             };
+            let crate::sync_runtime::SyncTimeoutResult {
+                reqs,
+                sync_seq,
+                abandon,
+                completed,
+            } = timeout_result;
+
+            if let Some((shamap, sync_header, sync_info)) = completed {
+                let mut pending_leaves = Vec::new();
+                if !self
+                    .finalize_completed_sync_epoch(
+                        shamap,
+                        sync_header,
+                        sync_info,
+                        &mut pending_leaves,
+                    )
+                    .await
+                {
+                    warn!("sync timer: completed tree finalization failed; awaiting resync");
+                }
+                continue;
+            }
 
             if abandon {
                 let mut state = self.state.write().await;
@@ -340,7 +366,7 @@ impl Node {
                             std::time::Instant::now(),
                         );
                     }
-                    for (i, req) in reqs.iter().enumerate() {
+                    for req in &reqs {
                         if req.msg_type == MessageType::GetObjects {
                             self.sync_send_request(req, sync_seq, None).await;
                             continue;
@@ -349,26 +375,43 @@ impl Node {
                         let timeout_peers = self.select_timeout_sync_peers(
                             &state,
                             sync_seq,
-                            crate::ledger::inbound::TIMEOUT_FOLLOWUP_PEERS,
+                            self.config.sync_tuning.sync_timeout_followup_peers,
                         );
                         drop(state);
                         if timeout_peers.is_empty() {
                             self.sync_send_request(req, sync_seq, None).await;
                         } else {
-                            let pid = timeout_peers[i % timeout_peers.len()];
-                            self.sync_send_request(req, sync_seq, Some(pid)).await;
+                            let mut sent = 0usize;
+                            for &pid in &timeout_peers {
+                                sent += self.sync_send_request(req, sync_seq, Some(pid)).await;
+                            }
+                            if sent == 0 {
+                                self.sync_send_request(req, sync_seq, None).await;
+                            }
                         }
                     }
                 } else {
                     let state = self.state.read().await;
-                    let peer_ids = self.select_sync_peers(&state, sync_seq, reqs.len().max(1));
+                    let peer_ids = self.select_sync_peers(
+                        &state,
+                        sync_seq,
+                        self.config
+                            .sync_tuning
+                            .sync_timeout_followup_peers
+                            .max(reqs.len().max(1)),
+                    );
                     drop(state);
-                    for (i, req) in reqs.iter().enumerate() {
+                    for req in &reqs {
                         if peer_ids.is_empty() {
                             self.sync_send_request(req, sync_seq, None).await;
                         } else {
-                            let pid = peer_ids[i % peer_ids.len()];
-                            self.sync_send_request(req, sync_seq, Some(pid)).await;
+                            let mut sent = 0usize;
+                            for &pid in &peer_ids {
+                                sent += self.sync_send_request(req, sync_seq, Some(pid)).await;
+                            }
+                            if sent == 0 {
+                                self.sync_send_request(req, sync_seq, None).await;
+                            }
                         }
                     }
                 }

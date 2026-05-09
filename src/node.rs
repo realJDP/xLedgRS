@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Wire peers, sync, consensus, RPC, and node state together.
 //! The Node — ties all subsystems together and runs the main event loop.
 //!
 //! Responsibilities:
@@ -95,8 +94,8 @@ use protocol_helpers::{
     transaction_accounts_from_blob,
 };
 use sync_helpers::{
-    build_li_base_nodes, compute_acquired_tx_root, is_pending_sync_anchor,
-    plan_sync_completion_outcome, resolve_get_ledger_header, should_issue_reply_followup,
+    build_li_base_nodes, is_pending_sync_anchor, plan_sync_completion_outcome,
+    resolve_get_ledger_header, should_issue_reply_followup, should_refuse_get_ledger_for_load,
     tune_sync_request_for_peer_latency,
 };
 #[cfg(test)]
@@ -121,6 +120,194 @@ static RESOURCE_MANAGER_LOOP_STARTED: std::sync::atomic::AtomicBool =
 // ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+pub struct SyncTuningConfig {
+    pub sync_parse_workers: usize,
+    pub sync_data_pipeline_capacity: usize,
+    pub sync_request_generation_capacity: usize,
+    pub sync_persistence_capacity: usize,
+    pub sync_data_queue_max: usize,
+    pub sync_data_queue_per_ledger: usize,
+    pub sync_data_queue_per_peer: usize,
+    pub sync_data_queue_bytes: usize,
+    pub sync_data_batch_size: usize,
+    pub peer_route_queue: usize,
+    pub sync_reply_followup_peers: usize,
+    pub sync_timeout_followup_peers: usize,
+    pub sync_timeout_retries: u32,
+    pub sync_idle_pump_after_ms: u64,
+    pub sync_completion_check_interval_ms: u64,
+    pub peer_idle_timeout_ms: u64,
+    pub slow_route_ms: u64,
+    pub slow_manifest_route_ms: u64,
+    pub severe_route_ms: u64,
+    pub object_fallback_after_timeouts: u32,
+    pub object_fallback_batch_size: usize,
+    pub object_fallback_empty_peer_cooldown_ms: u64,
+    pub shutdown_grace_ms: u64,
+    pub peer_route_drain_timeout_ms: u64,
+}
+
+impl Default for SyncTuningConfig {
+    fn default() -> Self {
+        Self {
+            sync_parse_workers: 4,
+            sync_data_pipeline_capacity: 1,
+            sync_request_generation_capacity: 1,
+            sync_persistence_capacity: 4,
+            sync_data_queue_max: 128,
+            sync_data_queue_per_ledger: 64,
+            sync_data_queue_per_peer: 32,
+            sync_data_queue_bytes: 64 * 1024 * 1024,
+            sync_data_batch_size: 16,
+            peer_route_queue: 256,
+            sync_reply_followup_peers: crate::ledger::inbound::REPLY_FOLLOWUP_PEERS,
+            sync_timeout_followup_peers: crate::ledger::inbound::TIMEOUT_FOLLOWUP_PEERS,
+            sync_timeout_retries: crate::ledger::inbound::LEDGER_TIMEOUT_RETRIES_MAX as u32,
+            sync_idle_pump_after_ms: 12_000,
+            sync_completion_check_interval_ms: 15_000,
+            peer_idle_timeout_ms: 90_000,
+            slow_route_ms: 100,
+            slow_manifest_route_ms: 300,
+            severe_route_ms: 500,
+            object_fallback_after_timeouts: 3,
+            object_fallback_batch_size: crate::ledger::inbound::REQ_OBJECTS_TIMEOUT,
+            object_fallback_empty_peer_cooldown_ms: 60_000,
+            shutdown_grace_ms: 500,
+            peer_route_drain_timeout_ms: 2_000,
+        }
+    }
+}
+
+impl SyncTuningConfig {
+    pub fn from_runtime(value: &crate::config::RuntimeSyncTuning) -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = value.sync_parse_workers {
+            cfg.sync_parse_workers = v;
+        }
+        if let Some(v) = value.sync_data_pipeline_capacity {
+            cfg.sync_data_pipeline_capacity = v;
+        }
+        if let Some(v) = value.sync_request_generation_capacity {
+            cfg.sync_request_generation_capacity = v;
+        }
+        if let Some(v) = value.sync_persistence_capacity {
+            cfg.sync_persistence_capacity = v;
+        }
+        if let Some(v) = value.sync_data_queue_max {
+            cfg.sync_data_queue_max = v;
+        }
+        if let Some(v) = value.sync_data_queue_per_ledger {
+            cfg.sync_data_queue_per_ledger = v;
+        }
+        if let Some(v) = value.sync_data_queue_per_peer {
+            cfg.sync_data_queue_per_peer = v;
+        }
+        if let Some(v) = value.sync_data_queue_bytes {
+            cfg.sync_data_queue_bytes = v;
+        }
+        if let Some(v) = value.sync_data_batch_size {
+            cfg.sync_data_batch_size = v;
+        }
+        if let Some(v) = value.peer_route_queue {
+            cfg.peer_route_queue = v;
+        }
+        if let Some(v) = value.sync_reply_followup_peers {
+            cfg.sync_reply_followup_peers = v;
+        }
+        if let Some(v) = value.sync_timeout_followup_peers {
+            cfg.sync_timeout_followup_peers = v;
+        }
+        if let Some(v) = value.sync_timeout_retries {
+            cfg.sync_timeout_retries = v;
+        }
+        if let Some(v) = value.sync_idle_pump_after_ms {
+            cfg.sync_idle_pump_after_ms = v;
+        }
+        if let Some(v) = value.sync_completion_check_interval_ms {
+            cfg.sync_completion_check_interval_ms = v;
+        }
+        if let Some(v) = value.peer_idle_timeout_ms {
+            cfg.peer_idle_timeout_ms = v;
+        }
+        if let Some(v) = value.slow_route_ms {
+            cfg.slow_route_ms = v;
+        }
+        if let Some(v) = value.slow_manifest_route_ms {
+            cfg.slow_manifest_route_ms = v;
+        }
+        if let Some(v) = value.severe_route_ms {
+            cfg.severe_route_ms = v;
+        }
+        if let Some(v) = value.object_fallback_after_timeouts {
+            cfg.object_fallback_after_timeouts = v;
+        }
+        if let Some(v) = value.object_fallback_batch_size {
+            cfg.object_fallback_batch_size = v;
+        }
+        if let Some(v) = value.object_fallback_empty_peer_cooldown_ms {
+            cfg.object_fallback_empty_peer_cooldown_ms = v;
+        }
+        if let Some(v) = value.shutdown_grace_ms {
+            cfg.shutdown_grace_ms = v;
+        }
+        if let Some(v) = value.peer_route_drain_timeout_ms {
+            cfg.peer_route_drain_timeout_ms = v;
+        }
+        cfg.clamped()
+    }
+
+    pub fn clamped(mut self) -> Self {
+        self.sync_parse_workers = self.sync_parse_workers.clamp(1, 32);
+        self.sync_data_pipeline_capacity = self.sync_data_pipeline_capacity.clamp(1, 1024);
+        self.sync_request_generation_capacity =
+            self.sync_request_generation_capacity.clamp(1, 1024);
+        self.sync_persistence_capacity = self.sync_persistence_capacity.clamp(1, 1024);
+        self.sync_data_queue_max = self.sync_data_queue_max.clamp(1, 1_000_000);
+        self.sync_data_queue_per_ledger = self.sync_data_queue_per_ledger.clamp(1, 1_000_000);
+        self.sync_data_queue_per_peer = self.sync_data_queue_per_peer.clamp(1, 1_000_000);
+        self.sync_data_queue_bytes = self
+            .sync_data_queue_bytes
+            .clamp(1024, 16 * 1024 * 1024 * 1024);
+        self.sync_data_batch_size = self.sync_data_batch_size.clamp(1, 4096);
+        self.peer_route_queue = self.peer_route_queue.clamp(1, 1_000_000);
+        self.sync_reply_followup_peers = self.sync_reply_followup_peers.clamp(1, 128);
+        self.sync_timeout_followup_peers = self.sync_timeout_followup_peers.clamp(1, 128);
+        self.sync_timeout_retries = self.sync_timeout_retries.clamp(1, 10_000);
+        self.sync_idle_pump_after_ms = self.sync_idle_pump_after_ms.clamp(1, 3_600_000);
+        self.sync_completion_check_interval_ms =
+            self.sync_completion_check_interval_ms.clamp(1, 3_600_000);
+        self.peer_idle_timeout_ms = self.peer_idle_timeout_ms.clamp(1_000, 3_600_000);
+        self.slow_route_ms = self.slow_route_ms.clamp(1, 60_000);
+        self.slow_manifest_route_ms = self.slow_manifest_route_ms.clamp(1, 60_000);
+        self.severe_route_ms = self.severe_route_ms.clamp(1, 60_000);
+        self.object_fallback_after_timeouts = self.object_fallback_after_timeouts.clamp(1, 10_000);
+        self.object_fallback_batch_size = self.object_fallback_batch_size.clamp(1, 4096);
+        self.object_fallback_empty_peer_cooldown_ms = self
+            .object_fallback_empty_peer_cooldown_ms
+            .clamp(1, 3_600_000);
+        self.shutdown_grace_ms = self.shutdown_grace_ms.clamp(0, 3_600_000);
+        self.peer_route_drain_timeout_ms = self.peer_route_drain_timeout_ms.clamp(1, 3_600_000);
+        self
+    }
+
+    pub fn idle_pump_after(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.sync_idle_pump_after_ms)
+    }
+
+    pub fn completion_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.sync_completion_check_interval_ms)
+    }
+
+    pub fn peer_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.peer_idle_timeout_ms)
+    }
+
+    pub fn peer_route_drain_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.peer_route_drain_timeout_ms)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// Address to listen on for peer connections.
     pub peer_addr: SocketAddr,
@@ -130,6 +317,8 @@ pub struct NodeConfig {
     pub ws_addr: SocketAddr,
     /// Maximum number of connected peers.
     pub max_peers: usize,
+    /// Maximum expensive peer-route work items processed concurrently.
+    pub route_worker_count: usize,
     /// Bootstrap peers to dial on startup.
     pub bootstrap: Vec<SocketAddr>,
     /// Whether to wrap peer connections in TLS.
@@ -157,12 +346,19 @@ pub struct NodeConfig {
     /// Whether to run the local consensus/ledger close loop.
     /// Normal follower nodes should leave this off.
     pub enable_consensus_close_loop: bool,
+    /// Explicit test/safe-mode escape hatch allowing standalone consensus to
+    /// sign proposals with the node key when no validator key is configured.
+    pub allow_node_key_consensus: bool,
     /// Optional script run at sync completion before follower starts.
     /// Used to snapshot the freshly-synced data dir for quick restore.
     pub post_sync_checkpoint_script: Option<std::path::PathBuf>,
+    /// Operator-tunable live sync and peer routing limits.
+    pub sync_tuning: SyncTuningConfig,
     /// Base58-encoded validation seed. When set, the node becomes a validator
     /// and signs proposals/validations with the derived key instead of node_key.
     pub validation_seed: Option<String>,
+    /// Hex-encoded secp256k1 validator signing secret key.
+    pub validation_secret_key: Option<String>,
     /// Base64-encoded rippled validator token. When present, the validator
     /// signing key is derived from the token payload.
     pub validator_token: Option<String>,
@@ -171,13 +367,22 @@ pub struct NodeConfig {
 impl NodeConfig {
     /// Maximum outbound peer slots. Matches rippled: ~60% of max_peers, minimum 10.
     pub fn max_outbound(&self) -> usize {
-        ((self.max_peers * 15 + 50) / 100)
+        ((self.max_peers * 60 + 50) / 100)
             .max(10)
             .min(self.max_peers)
+    }
+    /// Target peer mesh while bootstrapping state sync.
+    pub fn sync_peer_target(&self) -> usize {
+        self.max_outbound()
+            .max(crate::ledger::inbound::REPLY_FOLLOWUP_PEERS)
     }
     /// Maximum inbound peer slots. Remainder after outbound.
     pub fn max_inbound(&self) -> usize {
         self.max_peers.saturating_sub(self.max_outbound())
+    }
+    /// Expensive peer-route worker concurrency, clamped to a safe range.
+    pub fn route_worker_count(&self) -> usize {
+        self.route_worker_count.clamp(1, 16)
     }
 }
 
@@ -188,6 +393,7 @@ impl Default for NodeConfig {
             rpc_addr: "127.0.0.1:5005".parse().unwrap(),
             ws_addr: "127.0.0.1:6006".parse().unwrap(),
             max_peers: 21,
+            route_worker_count: 1,
             bootstrap: vec![],
             use_tls: true,
             data_dir: None,
@@ -201,8 +407,11 @@ impl Default for NodeConfig {
             online_delete: None,
             standalone: false,
             enable_consensus_close_loop: false,
+            allow_node_key_consensus: false,
             post_sync_checkpoint_script: None,
+            sync_tuning: SyncTuningConfig::default(),
             validation_seed: None,
+            validation_secret_key: None,
             validator_token: None,
         }
     }
@@ -246,6 +455,12 @@ pub struct SharedState {
     /// Recent sync usefulness by peer — higher means recent liAS_NODE batches
     /// from this peer contained more useful nodes.
     pub peer_sync_useful: HashMap<PeerId, u32>,
+    /// Cumulative useful sync nodes by peer for operator diagnostics.
+    pub peer_sync_useful_total: HashMap<PeerId, u64>,
+    /// Recent duplicate/zero-useful sync responses by peer.
+    pub peer_sync_duplicates: HashMap<PeerId, u32>,
+    /// Cumulative duplicate/zero-useful sync responses by peer.
+    pub peer_sync_duplicates_total: HashMap<PeerId, u64>,
     /// Last time a peer returned useful sync data for the current sync run.
     pub peer_sync_last_useful: HashMap<PeerId, std::time::Instant>,
     /// Track repeated implausible validations so bad peers don't spam logs forever.
@@ -279,6 +494,8 @@ pub struct SharedState {
     pub validated_hashes: std::collections::HashMap<u32, [u8; 32]>,
     /// Ordered list of validated seqs for ring buffer eviction.
     validated_hash_order: std::collections::VecDeque<u32>,
+    /// Trusted full validations observed when no active round is available.
+    outside_round_validations: crate::consensus::PreferredLedgerTracker,
 }
 
 impl SharedState {}
@@ -297,6 +514,9 @@ pub struct Node {
     /// Validator signing key derived from [validation_seed] config.
     /// When Some, the node signs validations & proposals with this key.
     validator_key: Option<Secp256k1KeyPair>,
+    /// Validator manifests loaded from local validator token config and safe to
+    /// advertise proactively to peers.
+    local_validator_manifests: Vec<crate::consensus::Manifest>,
     /// OpenSSL TLS configuration for peer connections (computes rippled-compatible session hash).
     openssl_tls: Option<OpenSslConfig>,
     /// Direct reference to NuDB backend for lock-free sync writes.
@@ -313,6 +533,8 @@ pub struct Node {
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Shared runtime bundle for active sync state, gating, and response queues.
     sync_runtime: Arc<crate::sync_runtime::SyncRuntime>,
+    /// Global concurrency gate for expensive peer-route work.
+    route_work_permits: Arc<tokio::sync::Semaphore>,
     /// Message dedup — separate from SharedState to avoid lock contention.
     /// SHA-256 of payload → true if seen. Cleared periodically.
     msg_dedup: Arc<std::sync::Mutex<(std::collections::HashSet<[u8; 32]>, std::time::Instant)>>,
@@ -326,6 +548,20 @@ pub struct Node {
     can_delete_target: Arc<std::sync::atomic::AtomicU32>,
     /// Per-hash ledger acquisitions — routes responses by hash, no shared channels.
     inbound_ledgers: Arc<std::sync::Mutex<crate::ledger::inbound::InboundLedgers>>,
+    /// Long-lived background tasks started by `Node::start`.
+    background_tasks: Arc<std::sync::Mutex<Vec<BackgroundTask>>>,
+}
+
+struct BackgroundTask {
+    name: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackgroundTaskJoinSummary {
+    pub completed: usize,
+    pub aborted: usize,
+    pub failed: usize,
 }
 
 /// Why sync_trigger was called — matches rippled's InboundLedger::Trigger enum.
@@ -350,6 +586,7 @@ mod tests {
     };
     use crate::network::message::{MessageType, RtxpMessage};
     use crate::network::peer::{Direction, Peer, PeerId, PeerState};
+    use base64::Engine as _;
     use prost::Message as ProstMessage;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -507,6 +744,270 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_peer_read_enqueues_expensive_route_work_without_awaiting_route() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let resource_consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let mut peer = Peer::new(PeerId(1), addr, Direction::Inbound, resource_consumer);
+        peer.state = PeerState::Active;
+        let mut dec = crate::network::message::FrameDecoder::new();
+        let (mut stream, _other) = tokio::io::duplex(1024);
+        let (route_tx, mut route_rx, _result_tx, _result_rx) = node.peer_route_channel();
+        let session_hash = [0x55; 32];
+        let mut route_seq = 0u64;
+        for msg_type in [MessageType::LedgerData, MessageType::GetObjects] {
+            let wire = RtxpMessage::new(msg_type, Vec::new()).encode();
+            let disconnect = node
+                .process_peer_frames(
+                    &mut stream,
+                    &mut peer,
+                    &mut dec,
+                    &wire,
+                    &session_hash,
+                    &route_tx,
+                    &mut route_seq,
+                    0,
+                )
+                .await;
+
+            assert!(!disconnect);
+            let job = route_rx.try_recv().expect("expensive route job");
+            assert_eq!(job.seq, route_seq - 1);
+        }
+        assert_eq!(peer.rx_count, 0);
+        let metrics = node.sync_runtime.metrics_snapshot();
+        assert_eq!(metrics.route_messages_total, 0);
+        assert_eq!(metrics.route_queue_enqueued_total, 2);
+        assert_eq!(metrics.route_queue_max_len, 1);
+        assert_eq!(metrics.route_queue_capacity, 256);
+    }
+
+    #[tokio::test]
+    async fn test_peer_read_returns_while_route_worker_is_backpressured() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let _route_permit = node
+            .route_work_permits
+            .acquire()
+            .await
+            .expect("route work permit");
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let resource_consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let mut peer = Peer::new(PeerId(1), addr, Direction::Inbound, resource_consumer);
+        peer.state = PeerState::Active;
+        let mut dec = crate::network::message::FrameDecoder::new();
+        let (mut stream, _other) = tokio::io::duplex(1024);
+        let (route_tx, route_rx, result_tx, mut result_rx) = node.peer_route_channel();
+        let route_worker = tokio::spawn(
+            node.clone()
+                .run_peer_route_worker(peer.id, route_rx, result_tx),
+        );
+        let session_hash = [0x55; 32];
+        let mut route_seq = 0u64;
+        let wire = [
+            RtxpMessage::new(MessageType::LedgerData, Vec::new()).encode(),
+            RtxpMessage::new(MessageType::GetObjects, Vec::new()).encode(),
+        ]
+        .concat();
+
+        let disconnect = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            node.process_peer_frames(
+                &mut stream,
+                &mut peer,
+                &mut dec,
+                &wire,
+                &session_hash,
+                &route_tx,
+                &mut route_seq,
+                0,
+            ),
+        )
+        .await
+        .expect("read loop should not await route worker");
+
+        assert!(!disconnect);
+        assert_eq!(route_seq, 2);
+        assert!(result_rx.try_recv().is_err());
+        let metrics = node.sync_runtime.metrics_snapshot();
+        assert_eq!(metrics.route_queue_enqueued_total, 2);
+        assert_eq!(metrics.route_messages_total, 0);
+        route_worker.abort();
+    }
+
+    #[tokio::test]
+    async fn test_peer_read_queues_messages_behind_pending_route_work() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let resource_consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let mut peer = Peer::new(PeerId(1), addr, Direction::Inbound, resource_consumer);
+        peer.state = PeerState::Active;
+        let mut dec = crate::network::message::FrameDecoder::new();
+        let (mut stream, _other) = tokio::io::duplex(1024);
+        let (route_tx, mut route_rx, _result_tx, _result_rx) = node.peer_route_channel();
+        let session_hash = [0x55; 32];
+        let mut route_seq = 1u64;
+        let wire = RtxpMessage::new(MessageType::Ping, Vec::new()).encode();
+
+        let disconnect = node
+            .process_peer_frames(
+                &mut stream,
+                &mut peer,
+                &mut dec,
+                &wire,
+                &session_hash,
+                &route_tx,
+                &mut route_seq,
+                0,
+            )
+            .await;
+
+        assert!(!disconnect);
+        let job = route_rx.try_recv().expect("message behind route work");
+        assert_eq!(job.seq, 1);
+        assert_eq!(route_seq, 2);
+        assert_eq!(peer.rx_count, 0);
+        assert_eq!(node.sync_runtime.metrics_snapshot().route_messages_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_peer_read_disconnects_instead_of_silently_dropping_ordered_route_work() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig {
+            sync_tuning: super::SyncTuningConfig {
+                peer_route_queue: 1,
+                peer_route_drain_timeout_ms: 1,
+                ..super::SyncTuningConfig::default()
+            },
+            ..NodeConfig::default()
+        }));
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let resource_consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let mut peer = Peer::new(PeerId(1), addr, Direction::Inbound, resource_consumer);
+        peer.state = PeerState::Active;
+        let mut dec = crate::network::message::FrameDecoder::new();
+        let (mut stream, _other) = tokio::io::duplex(1024);
+        let (route_tx, mut route_rx, _result_tx, _result_rx) = node.peer_route_channel();
+        let session_hash = [0x55; 32];
+        let mut route_seq = 0u64;
+        let wire = [
+            RtxpMessage::new(MessageType::LedgerData, Vec::new()).encode(),
+            RtxpMessage::new(MessageType::GetObjects, Vec::new()).encode(),
+        ]
+        .concat();
+
+        let disconnect = node
+            .process_peer_frames(
+                &mut stream,
+                &mut peer,
+                &mut dec,
+                &wire,
+                &session_hash,
+                &route_tx,
+                &mut route_seq,
+                0,
+            )
+            .await;
+
+        assert!(disconnect);
+        assert_eq!(route_seq, 1);
+        let _first = route_rx.try_recv().expect("first route job remains queued");
+        let metrics = node.sync_runtime.metrics_snapshot();
+        assert_eq!(metrics.route_queue_full_total, 1);
+        assert_eq!(metrics.route_queue_dropped_total, 1);
+    }
+
+    #[test]
+    fn test_route_worker_count_is_clamped_for_operator_config() {
+        let mut config = NodeConfig {
+            route_worker_count: 0,
+            ..NodeConfig::default()
+        };
+        assert_eq!(config.route_worker_count(), 1);
+
+        config.route_worker_count = 4;
+        assert_eq!(config.route_worker_count(), 4);
+
+        config.route_worker_count = 99;
+        assert_eq!(config.route_worker_count(), 16);
+    }
+
+    #[test]
+    fn test_sync_peer_target_uses_full_outbound_mesh() {
+        let config = NodeConfig {
+            max_peers: 30,
+            ..NodeConfig::default()
+        };
+
+        assert_eq!(config.max_outbound(), 18);
+        assert_eq!(config.sync_peer_target(), 18);
+    }
+
+    #[test]
+    fn test_sync_tuning_is_clamped_for_operator_config() {
+        let tuning = super::SyncTuningConfig {
+            sync_parse_workers: 0,
+            sync_data_queue_bytes: 1,
+            peer_route_queue: 0,
+            sync_timeout_retries: 0,
+            peer_idle_timeout_ms: 0,
+            object_fallback_batch_size: 0,
+            peer_route_drain_timeout_ms: 0,
+            ..super::SyncTuningConfig::default()
+        }
+        .clamped();
+
+        assert_eq!(tuning.sync_parse_workers, 1);
+        assert_eq!(tuning.sync_data_queue_bytes, 1024);
+        assert_eq!(tuning.peer_route_queue, 1);
+        assert_eq!(tuning.sync_timeout_retries, 1);
+        assert_eq!(
+            tuning.peer_idle_timeout(),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(tuning.object_fallback_batch_size, 1);
+        assert_eq!(
+            tuning.peer_route_drain_timeout(),
+            std::time::Duration::from_millis(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rpc_shutdown_flag_is_node_shutdown_flag() {
+        let node = Node::new(NodeConfig::default());
+        let ctx_flag = {
+            let state = node.state.read().await;
+            state.ctx.shutdown_requested.clone().expect("shutdown flag")
+        };
+
+        assert!(std::sync::Arc::ptr_eq(&ctx_flag, &node.shutdown_flag()));
+        ctx_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(node.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn test_background_tasks_join_with_bounded_abort() {
+        let node = Node::new(NodeConfig::default());
+        node.track_background_task("quick", tokio::spawn(async {}));
+        node.track_background_task(
+            "stuck",
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }),
+        );
+
+        let joined = node
+            .join_background_tasks(std::time::Duration::from_millis(10))
+            .await;
+
+        assert_eq!(joined.completed, 1);
+        assert_eq!(joined.aborted, 1);
+        assert_eq!(joined.failed, 0);
+    }
+
+    #[tokio::test]
     async fn test_handle_manifests_prefers_highest_sequence_per_master_in_batch() {
         let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
         let source_addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
@@ -637,6 +1138,65 @@ mod tests {
         assert!(relay_rx.try_recv().is_err());
     }
 
+    #[test]
+    fn validator_token_rejects_manifest_secret_identity_mismatch() {
+        let master = crate::crypto::keys::Secp256k1KeyPair::from_secret_bytes(&[1u8; 32]).unwrap();
+        let signing = crate::crypto::keys::Secp256k1KeyPair::from_secret_bytes(&[2u8; 32]).unwrap();
+        let manifest = crate::consensus::Manifest::new_signed(1, &master, &signing);
+        let payload = serde_json::json!({
+            "manifest": base64::engine::general_purpose::STANDARD.encode(manifest.to_bytes()),
+            "validation_secret_key": hex::encode([3u8; 32]),
+        });
+        let token = base64::engine::general_purpose::STANDARD.encode(payload.to_string());
+
+        let node = Node::new(NodeConfig {
+            validator_token: Some(token),
+            validation_secret_key: Some(hex::encode([3u8; 32])),
+            ..NodeConfig::default()
+        });
+
+        assert!(node.validator_key.is_none());
+        assert!(node.local_validator_manifests.is_empty());
+    }
+
+    #[test]
+    fn validator_token_accepts_matching_manifest_secret_identity() {
+        let master = crate::crypto::keys::Secp256k1KeyPair::from_secret_bytes(&[1u8; 32]).unwrap();
+        let signing = crate::crypto::keys::Secp256k1KeyPair::from_secret_bytes(&[2u8; 32]).unwrap();
+        let manifest = crate::consensus::Manifest::new_signed(1, &master, &signing);
+        let payload = serde_json::json!({
+            "manifest": base64::engine::general_purpose::STANDARD.encode(manifest.to_bytes()),
+            "validation_secret_key": hex::encode([2u8; 32]),
+        });
+        let token = base64::engine::general_purpose::STANDARD.encode(payload.to_string());
+
+        let node = Node::new(NodeConfig {
+            validator_token: Some(token),
+            validation_secret_key: Some(hex::encode([2u8; 32])),
+            ..NodeConfig::default()
+        });
+
+        assert_eq!(
+            node.validator_key
+                .as_ref()
+                .map(|key| key.public_key_bytes()),
+            Some(signing.public_key_bytes())
+        );
+        assert_eq!(node.local_validator_manifests.len(), 1);
+    }
+
+    #[test]
+    fn consensus_signing_key_requires_validator_key_or_explicit_safe_mode() {
+        let node = Node::new(NodeConfig::default());
+        assert!(node.consensus_signing_key().is_none());
+
+        let safe_node = Node::new(NodeConfig {
+            allow_node_key_consensus: true,
+            ..NodeConfig::default()
+        });
+        assert!(safe_node.consensus_signing_key().is_some());
+    }
+
     fn test_validation_message(ledger_seq: u32, ledger_hash: [u8; 32]) -> RtxpMessage {
         use prost::Message as _;
 
@@ -682,6 +1242,52 @@ mod tests {
             ..Default::default()
         };
         RtxpMessage::new(MessageType::Validation, pb.encode_to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_round_accepts_ephemeral_validation_resolved_by_shared_manifest_cache() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let master = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let signing = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let manifest = crate::consensus::Manifest::new_signed(1, &master, &signing);
+        let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
+        let consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let peer = Peer::new(PeerId(1), addr, Direction::Inbound, consumer);
+        let ledger_hash = [0xAC; 32];
+        let msg = test_signed_validation_message(&signing, 300_000, ledger_hash);
+
+        node.unl
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(master.public_key_bytes());
+        {
+            let mut state = node.state.write().await;
+            state.sync_done = true;
+            state.ctx.ledger_seq = 299_999;
+            state
+                .ctx
+                .manifest_cache
+                .as_ref()
+                .expect("manifest cache")
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(manifest);
+            state.current_round = Some(crate::consensus::ConsensusRound::new(
+                300_000,
+                vec![master.public_key_bytes()],
+                [0xAB; 32],
+                false,
+                Duration::from_secs(4),
+                1,
+            ));
+        }
+
+        let _ = node.handle_validation_message(&peer, &msg).await;
+
+        let state = node.state.read().await;
+        let round = state.current_round.as_ref().expect("round remains active");
+        assert_eq!(round.validation_count_for(&ledger_hash), 1);
     }
 
     #[tokio::test]
@@ -759,20 +1365,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trusted_validation_advances_tracking_without_current_round() {
+    async fn test_trusted_validation_without_current_round_does_not_mark_validated() {
         let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
-        let validator = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let validators = (0..5)
+            .map(|_| crate::crypto::keys::Secp256k1KeyPair::generate())
+            .collect::<Vec<_>>();
         let addr: std::net::SocketAddr = "127.0.0.1:51235".parse().unwrap();
         let consumer = crate::network::resource::ResourceManager::default()
             .new_inbound_endpoint(addr, false, None);
         let peer = Peer::new(PeerId(1), addr, Direction::Inbound, consumer);
         let ledger_hash = [0xCD; 32];
-        let msg = test_signed_validation_message(&validator, 300_000, ledger_hash);
+        let msg = test_signed_validation_message(&validators[0], 300_000, ledger_hash);
 
-        node.unl
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(validator.public_key_bytes());
+        {
+            let mut unl = node.unl.write().unwrap_or_else(|e| e.into_inner());
+            unl.clear();
+            unl.extend(
+                validators
+                    .iter()
+                    .map(|validator| validator.public_key_bytes()),
+            );
+        }
 
         {
             let mut state = node.state.write().await;
@@ -784,17 +1397,68 @@ mod tests {
                 .insert(PeerId(99), (300_000, 300_500));
             state.ctx.ledger_seq = 100_000;
             state.ctx.ledger_hash = hex::encode_upper([0xAB; 32]);
+            state.ctx.validator_list_manager = None;
             state.current_round = None;
         }
 
         let _ = node.handle_validation_message(&peer, &msg).await;
 
         let state = node.state.read().await;
-        assert_eq!(state.ctx.ledger_seq, 300_000);
-        assert_eq!(state.ctx.ledger_hash, hex::encode_upper(ledger_hash));
+        assert_eq!(state.ctx.ledger_seq, 100_000);
+        assert_eq!(state.ctx.ledger_hash, hex::encode_upper([0xAB; 32]));
+        assert_eq!(state.validated_hashes.get(&300_000), None);
+        assert_eq!(state.services.ledger_master.hash_for_seq(300_000), None);
         assert!(
             !state.sync_peer_cooldown.contains_key(&peer.id),
-            "trusted relayed validations should advance tracking without benching the peer"
+            "trusted relayed validations should not bench the peer even when they do not reach quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_validation_quorum_without_current_round_records_validated_hash() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let validators = (0..5)
+            .map(|_| crate::crypto::keys::Secp256k1KeyPair::generate())
+            .collect::<Vec<_>>();
+        let addr: std::net::SocketAddr = "127.0.0.1:51236".parse().unwrap();
+        let consumer = crate::network::resource::ResourceManager::default()
+            .new_inbound_endpoint(addr, false, None);
+        let peer = Peer::new(PeerId(1), addr, Direction::Inbound, consumer);
+        let ledger_hash = [0xCE; 32];
+
+        {
+            let mut unl = node.unl.write().unwrap_or_else(|e| e.into_inner());
+            unl.clear();
+            unl.extend(
+                validators
+                    .iter()
+                    .map(|validator| validator.public_key_bytes()),
+            );
+        }
+
+        {
+            let mut state = node.state.write().await;
+            state.sync_done = true;
+            state.peer_addrs.insert(peer.id, addr);
+            state.peer_ledger_range.insert(peer.id, (99_500, 100_500));
+            state
+                .peer_ledger_range
+                .insert(PeerId(99), (300_000, 300_500));
+            state.ctx.ledger_seq = 100_000;
+            state.ctx.validator_list_manager = None;
+            state.current_round = None;
+        }
+
+        for validator in &validators[..4] {
+            let msg = test_signed_validation_message(validator, 300_000, ledger_hash);
+            let _ = node.handle_validation_message(&peer, &msg).await;
+        }
+
+        let state = node.state.read().await;
+        assert_eq!(state.validated_hashes.get(&300_000), Some(&ledger_hash));
+        assert_eq!(
+            state.services.ledger_master.hash_for_seq(300_000),
+            Some(ledger_hash)
         );
     }
 
@@ -911,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_reply_sync_peers_prunes_below_half_of_best_useful() {
+    fn test_select_reply_sync_peers_prefers_useful_and_fills_mesh() {
         let node = Node::new(NodeConfig::default());
         let mut state = SharedState::new(crate::rpc::NodeContext::default());
         let mut peer_useful_counts = HashMap::new();
@@ -932,7 +1596,7 @@ mod tests {
         let mut selected = node.select_reply_sync_peers(&state, 5, &peer_useful_counts, 6);
         selected.sort_by_key(|pid| pid.0);
 
-        assert_eq!(selected, vec![PeerId(1), PeerId(2)]);
+        assert_eq!(selected, vec![PeerId(1), PeerId(2), PeerId(3), PeerId(4)]);
     }
 
     #[test]
@@ -1049,26 +1713,64 @@ mod tests {
     }
 
     #[test]
-    fn test_build_li_base_nodes_includes_optional_state_root_after_header() {
+    fn test_build_li_base_nodes_includes_optional_roots_after_header() {
         let header = test_header(321, 0x5A);
-        let root_wire = vec![0x11; 513];
+        let state_root_wire = vec![0x11; 513];
+        let tx_root_wire = vec![0x22; 513];
 
-        let nodes = super::build_li_base_nodes(&header, Some(root_wire.clone()));
-        assert_eq!(nodes.len(), 2);
+        let nodes = super::build_li_base_nodes(
+            &header,
+            Some(state_root_wire.clone()),
+            Some(tx_root_wire.clone()),
+        );
+        assert_eq!(nodes.len(), 3);
         assert!(nodes[0].nodeid.is_none());
         let decoded = crate::sync::parse_ledger_header_from_base(&nodes[0].nodedata)
             .expect("header should decode");
         assert_eq!(decoded.sequence, header.sequence);
         assert_eq!(decoded.account_hash, header.account_hash);
         assert_eq!(decoded.transaction_hash, header.transaction_hash);
-        assert_eq!(nodes[1].nodedata, root_wire);
+        assert_eq!(nodes[1].nodedata, state_root_wire);
         assert_eq!(
             nodes[1].nodeid.as_deref(),
             Some(&crate::ledger::shamap_id::SHAMapNodeID::root().to_wire()[..])
         );
+        assert_eq!(nodes[2].nodedata, tx_root_wire);
+        assert_eq!(
+            nodes[2].nodeid.as_deref(),
+            Some(&crate::ledger::shamap_id::SHAMapNodeID::root().to_wire()[..])
+        );
 
-        let header_only = super::build_li_base_nodes(&header, None);
+        let header_only = super::build_li_base_nodes(&header, None, None);
         assert_eq!(header_only.len(), 1);
+    }
+
+    #[test]
+    fn test_should_refuse_get_ledger_for_local_load_and_full_peer_queue() {
+        let mut load = crate::network::load::LoadSnapshot::default();
+        assert!(!super::should_refuse_get_ledger_for_load(
+            &load,
+            Some(8),
+            crate::proto::TmLedgerInfoType::LiBase as i32,
+        ));
+
+        assert!(super::should_refuse_get_ledger_for_load(
+            &load,
+            Some(0),
+            crate::proto::TmLedgerInfoType::LiBase as i32,
+        ));
+
+        load.local_fee = load.load_base * 3;
+        assert!(super::should_refuse_get_ledger_for_load(
+            &load,
+            Some(8),
+            crate::proto::TmLedgerInfoType::LiAsNode as i32,
+        ));
+        assert!(!super::should_refuse_get_ledger_for_load(
+            &load,
+            Some(0),
+            crate::proto::TmLedgerInfoType::LiTsCandidate as i32,
+        ));
     }
 
     #[test]
@@ -1088,25 +1790,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_gate_accepts_ltclosed_object_response_by_seq() {
+    fn test_sync_gate_accepts_ltclosed_object_response_without_seq() {
         let header = crate::ledger::LedgerHeader::default();
         let sync = std::sync::Mutex::new(Some(crate::sync_coordinator::SyncCoordinator::new(
             10, [0u8; 32], [0x22; 32], None, header,
         )));
-        {
-            let mut guard = sync.lock().unwrap();
-            let syncer = guard.as_mut().expect("syncer should exist");
-            syncer.peer.outstanding_object_queries.insert(77);
-        }
 
         assert!(sync_gate_accepts_response(
             &sync,
             0,
             Some(&[0xEF; 32]),
-            Some(77),
+            None,
             true,
         ));
-        assert!(!sync_gate_accepts_response(
+        assert!(sync_gate_accepts_response(
             &sync,
             0,
             Some(&[0xEF; 32]),
@@ -1116,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_gate_rejects_non_ltclosed_object_response_without_known_seq() {
+    fn test_sync_gate_accepts_non_ltclosed_object_response_by_target_hash() {
         let header = crate::ledger::LedgerHeader::default();
         let ledger_hash = [0xAB; 32];
         let sync = std::sync::Mutex::new(Some(crate::sync_coordinator::SyncCoordinator::new(
@@ -1128,24 +1825,18 @@ mod tests {
         )));
         let target_h8 = u64::from_be_bytes(ledger_hash[..8].try_into().unwrap());
 
-        {
-            let mut guard = sync.lock().unwrap();
-            let syncer = guard.as_mut().expect("syncer should exist");
-            syncer.peer.outstanding_object_queries.insert(77);
-        }
-
         assert!(sync_gate_accepts_response(
             &sync,
             target_h8,
             Some(&ledger_hash),
-            Some(77),
+            None,
             true,
         ));
         assert!(!sync_gate_accepts_response(
             &sync,
             target_h8,
-            Some(&ledger_hash),
-            Some(78),
+            Some(&[0xCD; 32]),
+            None,
             true,
         ));
     }
@@ -1176,6 +1867,21 @@ mod tests {
         assert_eq!(seq, 777);
         assert_eq!(hash, Some([0xAB; 32]));
         assert_eq!(reason, "fixed-target reacquire");
+    }
+
+    #[test]
+    fn test_stale_fixed_target_sync_retargets_to_latest_trusted_ledger() {
+        let inactive = Some((123, [0xAB; 32]));
+        let latest_hash = [0xCD; 32];
+        let (seq, hash, reason) = crate::sync_bootstrap::choose_sync_kickstart_target(
+            inactive,
+            456,
+            Some(latest_hash),
+            None,
+        );
+        assert_eq!(seq, 456);
+        assert_eq!(hash, Some(latest_hash));
+        assert_eq!(reason, "stale fixed-target retarget");
     }
 
     #[test]
@@ -1215,9 +1921,18 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_sync_kickstart_target_prefers_inactive_fixed_target() {
+    fn test_choose_sync_kickstart_target_prefers_nearby_inactive_fixed_target() {
         let latest_hash = [0x11; 32];
         let fixed_hash = [0xAB; 32];
+        assert_eq!(
+            crate::sync_bootstrap::choose_sync_kickstart_target(
+                Some((350, fixed_hash)),
+                456,
+                Some(latest_hash),
+                None,
+            ),
+            (350, Some(fixed_hash), "fixed-target reacquire"),
+        );
         assert_eq!(
             crate::sync_bootstrap::choose_sync_kickstart_target(
                 Some((123, fixed_hash)),
@@ -1225,7 +1940,7 @@ mod tests {
                 Some(latest_hash),
                 None,
             ),
-            (123, Some(fixed_hash), "fixed-target reacquire"),
+            (456, Some(latest_hash), "stale fixed-target retarget"),
         );
         assert_eq!(
             crate::sync_bootstrap::choose_sync_kickstart_target(None, 456, Some(latest_hash), None,),
@@ -1327,10 +2042,10 @@ mod tests {
     }
 
     #[test]
-    fn test_should_issue_reply_followup_requires_useful_epoch() {
+    fn test_should_issue_reply_followup_refills_zero_useful_epochs() {
         assert!(should_issue_reply_followup("Continue", true));
         assert!(should_issue_reply_followup("PassComplete", true));
-        assert!(!should_issue_reply_followup("Continue", false));
+        assert!(should_issue_reply_followup("Continue", false));
         assert!(!should_issue_reply_followup("Inactive", true));
     }
 

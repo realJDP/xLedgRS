@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peer Io piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -42,9 +41,20 @@ impl Node {
 
         let mut ip_last_connect: HashMap<std::net::IpAddr, tokio::time::Instant> = HashMap::new();
         let rate_limit = std::time::Duration::from_secs(2);
+        let mut shutdown_check = tokio::time::interval(std::time::Duration::from_millis(200));
+        shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            let (tcp, addr) = listener.accept().await?;
+            let (tcp, addr) = tokio::select! {
+                accepted = listener.accept() => accepted?,
+                _ = shutdown_check.tick() => {
+                    if self.is_shutting_down() {
+                        info!("peer listener: shutdown");
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
 
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -88,7 +98,7 @@ impl Node {
                         continue;
                     }
                 };
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     match tokio_openssl::SslStream::new(ssl, tcp) {
                         Ok(mut stream) => {
                             if let Err(e) = std::pin::Pin::new(&mut stream).accept().await {
@@ -103,11 +113,13 @@ impl Node {
                         Err(e) => warn!("TLS stream creation error from {addr}: {e}"),
                     }
                 });
+                self.track_background_task("peer_connection", handle);
             } else {
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     node.handle_peer(tcp, [0u8; 32], addr, Direction::Inbound)
                         .await;
                 });
+                self.track_background_task("peer_connection", handle);
             }
         }
     }

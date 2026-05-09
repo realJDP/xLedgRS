@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Full Below Cache support for XRPL ledger state and SHAMap logic.
 //! FullBelowCache — tracks which SHAMap subtrees are fully synced.
 //!
 //! When getMissingNodes confirms all children of a subtree are present,

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Amm legacy transactor for XRPL transaction apply.
 use super::{legacy_path_not_supported, TxHandler, TER};
 use crate::ledger::views::ApplyView;
 use crate::transaction::ParsedTx;
@@ -6,6 +5,10 @@ use crate::transaction::ParsedTx;
 pub struct AMMCreateHandler;
 
 impl TxHandler for AMMCreateHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -14,6 +17,10 @@ impl TxHandler for AMMCreateHandler {
 pub struct AMMDepositHandler;
 
 impl TxHandler for AMMDepositHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -22,6 +29,10 @@ impl TxHandler for AMMDepositHandler {
 pub struct AMMWithdrawHandler;
 
 impl TxHandler for AMMWithdrawHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -30,6 +41,10 @@ impl TxHandler for AMMWithdrawHandler {
 pub struct AMMVoteHandler;
 
 impl TxHandler for AMMVoteHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -38,6 +53,10 @@ impl TxHandler for AMMVoteHandler {
 pub struct AMMBidHandler;
 
 impl TxHandler for AMMBidHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -46,6 +65,10 @@ impl TxHandler for AMMBidHandler {
 pub struct AMMDeleteHandler;
 
 impl TxHandler for AMMDeleteHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -54,6 +77,10 @@ impl TxHandler for AMMDeleteHandler {
 pub struct AMMClawbackHandler;
 
 impl TxHandler for AMMClawbackHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }

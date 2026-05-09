@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Mptoken transaction engine logic for ledger replay.
 //! MPToken — MPTokenIssuanceCreate (54), MPTokenIssuanceDestroy (55),
 //!           MPTokenIssuanceSet (56), MPTokenAuthorize (57).
 //!
@@ -17,7 +16,7 @@ use crate::crypto::sha512_first_half;
 use crate::ledger::{directory, Key, LedgerState};
 use crate::transaction::{amount::Amount, ParsedTx};
 
-use super::ApplyResult;
+use super::{balance_before_fee, owner_reserve_requirement, ApplyResult};
 
 /// LedgerNameSpace::MPTOKEN_ISSUANCE = '~' = 0x7E.
 const MPT_ISSUANCE_SPACE: [u8; 2] = [0x00, 0x7E];
@@ -27,6 +26,12 @@ const MPTOKEN_SPACE: [u8; 2] = [0x00, 0x74];
 
 const DEFAULT_MAXIMUM_AMOUNT: u64 = 0x7FFF_FFFF_FFFF_FFFF;
 const MAX_TRANSFER_FEE: u16 = 50_000;
+const MAX_MPTOKEN_METADATA_LENGTH: usize = 1024;
+
+const SF_OWNER_NODE: u16 = 4;
+const SF_OUTSTANDING_AMOUNT: u16 = 25;
+const SF_MPT_AMOUNT: u16 = 26;
+const SF_LOCKED_AMOUNT: u16 = 29;
 
 pub(crate) const LSF_MPT_LOCKED: u32 = 0x0000_0001;
 pub(crate) const LSF_MPT_CAN_LOCK: u32 = 0x0000_0002;
@@ -39,6 +44,7 @@ pub(crate) const LSF_MPT_CAN_CLAWBACK: u32 = 0x0000_0040;
 
 const TF_MPT_UNAUTHORIZE: u32 = 0x0000_0001;
 const TF_MPT_UNLOCK: u32 = 0x0000_0002;
+const TF_PARTIAL_PAYMENT: u32 = 0x0002_0000;
 
 const CREATE_FLAG_MASK: u32 = LSF_MPT_CAN_LOCK
     | LSF_MPT_REQUIRE_AUTH
@@ -172,6 +178,99 @@ fn issuance_maximum_amount(raw: &[u8]) -> u64 {
     }
 }
 
+pub(crate) fn can_debit_mpt_amount(
+    state: &LedgerState,
+    account: &[u8; 20],
+    amount: &Amount,
+) -> bool {
+    let Some((value, mptid)) = mpt_amount_parts(amount) else {
+        return false;
+    };
+    if value == 0 {
+        return true;
+    }
+
+    let issuer = mpt_issuer(&mptid);
+    if *account == issuer {
+        return true;
+    }
+
+    let issuance_key = mpt_issuance_key(&mptid);
+    let holder_key = mptoken_key(&issuance_key.0, account);
+    state
+        .get_raw_owned(&holder_key)
+        .map(|raw| sle_uint64(&raw, SF_MPT_AMOUNT) >= value)
+        .unwrap_or(false)
+}
+
+pub(crate) fn apply_mpt_amount_delta(
+    state: &mut LedgerState,
+    account: &[u8; 20],
+    credit: bool,
+    amount: &Amount,
+) -> bool {
+    let Some((value, mptid)) = mpt_amount_parts(amount) else {
+        return false;
+    };
+    if value == 0 {
+        return true;
+    }
+
+    let issuance_key = mpt_issuance_key(&mptid);
+    let Some(issuance_raw) = state.get_raw_owned(&issuance_key) else {
+        return false;
+    };
+    let issuer = mpt_issuer(&mptid);
+    let outstanding = sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT);
+
+    if *account == issuer {
+        let next_outstanding = if credit {
+            let Some(next) = outstanding.checked_sub(value) else {
+                return false;
+            };
+            next
+        } else {
+            let maximum = issuance_maximum_amount(&issuance_raw);
+            let Some(next) = outstanding.checked_add(value) else {
+                return false;
+            };
+            if next > maximum {
+                return false;
+            }
+            next
+        };
+        state.insert_raw(
+            issuance_key,
+            patch_uint64_fields(&issuance_raw, &[(SF_OUTSTANDING_AMOUNT, next_outstanding)]),
+        );
+        return true;
+    }
+
+    let holder_key = mptoken_key(&issuance_key.0, account);
+    let holder_raw = match state.get_raw_owned(&holder_key) {
+        Some(raw) => raw,
+        None => return false,
+    };
+    let holder_amount = sle_uint64(&holder_raw, SF_MPT_AMOUNT);
+    let next_holder_amount = if credit {
+        let Some(next) = holder_amount.checked_add(value) else {
+            return false;
+        };
+        next
+    } else {
+        if holder_amount < value {
+            return false;
+        }
+        holder_amount - value
+    };
+
+    state.insert_raw(
+        holder_key,
+        patch_uint64_fields(&holder_raw, &[(SF_MPT_AMOUNT, next_holder_amount)]),
+    );
+    true
+}
+
 fn checked_transfer_fee(value: u64, fee: u16) -> Option<u64> {
     if value == 0 || fee == 0 {
         return Some(0);
@@ -180,7 +279,28 @@ fn checked_transfer_fee(value: u64, fee: u16) -> Option<u64> {
     (rounded <= u64::MAX as u128).then_some(rounded as u64)
 }
 
-fn build_mptoken_issuance_sle(tx: &ParsedTx) -> Vec<u8> {
+fn checked_transfer_debit(value: u64, fee: u16) -> Option<u64> {
+    value.checked_add(checked_transfer_fee(value, fee)?)
+}
+
+fn divide_by_transfer_rate(source: u64, fee: u16) -> Option<u64> {
+    if fee == 0 {
+        return Some(source);
+    }
+    let rate = 100_000u128 + fee as u128;
+    let mut deliver = ((source as u128).saturating_mul(100_000) + (rate / 2)) / rate;
+    if deliver > u64::MAX as u128 {
+        return None;
+    }
+
+    while deliver > 0 && checked_transfer_debit(deliver as u64, fee)? > source {
+        deliver -= 1;
+    }
+
+    Some(deliver as u64)
+}
+
+fn build_mptoken_issuance_sle(tx: &ParsedTx, owner_node: u64) -> Vec<u8> {
     let issuance_flags = tx.flags & CREATE_FLAG_MASK;
     let mut fields = vec![
         crate::ledger::meta::ParsedField {
@@ -200,12 +320,12 @@ fn build_mptoken_issuance_sle(tx: &ParsedTx) -> Vec<u8> {
         },
         crate::ledger::meta::ParsedField {
             type_code: 3,
-            field_code: 4,
-            data: 0u64.to_be_bytes().to_vec(),
+            field_code: SF_OWNER_NODE,
+            data: owner_node.to_be_bytes().to_vec(),
         },
         crate::ledger::meta::ParsedField {
             type_code: 3,
-            field_code: 25,
+            field_code: SF_OUTSTANDING_AMOUNT,
             data: 0u64.to_be_bytes().to_vec(),
         },
     ];
@@ -256,7 +376,7 @@ fn build_mptoken_issuance_sle(tx: &ParsedTx) -> Vec<u8> {
     crate::ledger::meta::build_sle(0x007e, &fields, None, None)
 }
 
-fn build_mptoken_sle(account: &[u8; 20], mptid: &[u8; 24], flags: u32) -> Vec<u8> {
+fn build_mptoken_sle(account: &[u8; 20], mptid: &[u8; 24], flags: u32, owner_node: u64) -> Vec<u8> {
     crate::ledger::meta::build_sle(
         0x007f,
         &[
@@ -272,13 +392,13 @@ fn build_mptoken_sle(account: &[u8; 20], mptid: &[u8; 24], flags: u32) -> Vec<u8
             },
             crate::ledger::meta::ParsedField {
                 type_code: 3,
-                field_code: 26,
+                field_code: SF_MPT_AMOUNT,
                 data: 0u64.to_be_bytes().to_vec(),
             },
             crate::ledger::meta::ParsedField {
                 type_code: 3,
-                field_code: 4,
-                data: 0u64.to_be_bytes().to_vec(),
+                field_code: SF_OWNER_NODE,
+                data: owner_node.to_be_bytes().to_vec(),
             },
             crate::ledger::meta::ParsedField {
                 type_code: 2,
@@ -289,25 +409,6 @@ fn build_mptoken_sle(account: &[u8; 20], mptid: &[u8; 24], flags: u32) -> Vec<u8
         None,
         None,
     )
-}
-
-fn create_holder_token(
-    state: &mut LedgerState,
-    issuance_key: &Key,
-    mptid: &[u8; 24],
-    holder: &[u8; 20],
-    flags: u32,
-) -> Vec<u8> {
-    let holder_key = mptoken_key(&issuance_key.0, holder);
-    directory::dir_add(state, holder, holder_key.0);
-    let token_raw = build_mptoken_sle(holder, mptid, flags);
-    state.insert_raw(holder_key, token_raw.clone());
-    if let Some(account) = state.get_account(holder) {
-        let mut account = account.clone();
-        account.owner_count += 1;
-        state.insert_account(account);
-    }
-    token_raw
 }
 
 /// Apply a direct MPT payment. MPTokensV1 only supports direct account-to-account
@@ -347,61 +448,89 @@ pub(crate) fn apply_direct_mpt_payment(state: &mut LedgerState, tx: &ParsedTx) -
     let sender_is_issuer = tx.account == issuer;
     let destination_is_issuer = destination == issuer;
 
-    if issuance_flags & LSF_MPT_LOCKED != 0 && !(!sender_is_issuer && destination_is_issuer) {
+    let holder_to_holder = !sender_is_issuer && !destination_is_issuer;
+
+    if holder_to_holder && issuance_flags & LSF_MPT_LOCKED != 0 {
         return ApplyResult::ClaimedCost("tecLOCKED");
     }
 
-    if !sender_is_issuer && !destination_is_issuer && issuance_flags & LSF_MPT_CAN_TRANSFER == 0 {
-        return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+    if holder_to_holder && issuance_flags & LSF_MPT_CAN_TRANSFER == 0 {
+        return ApplyResult::ClaimedCost("tecNO_AUTH");
     }
 
-    let transfer_fee = if !sender_is_issuer && !destination_is_issuer {
+    let transfer_fee = if holder_to_holder {
         issuance_transfer_fee(&issuance_raw)
     } else {
         0
     };
-    let fee_value = match checked_transfer_fee(deliver_value, transfer_fee) {
-        Some(value) => value,
-        None => return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED"),
-    };
-    let total_debit = match deliver_value.checked_add(fee_value) {
-        Some(value) => value,
-        None => return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED"),
-    };
 
-    if let Some(send_max) = tx.send_max.as_ref() {
-        let Some((send_max_value, send_max_id)) = mpt_amount_parts(send_max) else {
+    let max_source_value = if let Some(send_max) = tx.send_max.as_ref() {
+        let Some((value, send_max_id)) = mpt_amount_parts(send_max) else {
             return ApplyResult::ClaimedCost("temBAD_AMOUNT");
         };
-        if send_max_id != mptid || send_max_value < total_debit {
-            return ApplyResult::ClaimedCost("tecPATH_DRY");
+        if send_max_id != mptid {
+            return ApplyResult::ClaimedCost("temMALFORMED");
+        }
+        value
+    } else {
+        deliver_value
+    };
+
+    let mut actual_deliver = deliver_value;
+    let mut total_debit = match checked_transfer_debit(actual_deliver, transfer_fee) {
+        Some(value) => value,
+        None => return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED"),
+    };
+    if total_debit > max_source_value {
+        if tx.flags & TF_PARTIAL_PAYMENT == 0 {
+            return ApplyResult::ClaimedCost("tecPATH_PARTIAL");
+        }
+        actual_deliver = match divide_by_transfer_rate(max_source_value, transfer_fee) {
+            Some(value) if value > 0 => value,
+            Some(_) => return ApplyResult::ClaimedCost("tecPATH_PARTIAL"),
+            None => return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED"),
+        };
+        total_debit = match checked_transfer_debit(actual_deliver, transfer_fee) {
+            Some(value) => value,
+            None => return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED"),
+        };
+    }
+
+    if let Some(deliver_min) = tx.deliver_min.as_ref() {
+        let Some((deliver_min_value, deliver_min_id)) = mpt_amount_parts(deliver_min) else {
+            return ApplyResult::ClaimedCost("temBAD_AMOUNT");
+        };
+        if deliver_min_id != mptid || actual_deliver < deliver_min_value {
+            return ApplyResult::ClaimedCost("tecPATH_PARTIAL");
         }
     }
 
-    let outstanding = sle_uint64(&issuance_raw, 4);
+    let fee_value = match checked_transfer_fee(actual_deliver, transfer_fee) {
+        Some(value) => value,
+        None => return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED"),
+    };
+
+    let outstanding = sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT);
     let maximum_amount = issuance_maximum_amount(&issuance_raw);
 
     let source_key = (!sender_is_issuer).then(|| mptoken_key(&issuance_key.0, &tx.account));
     let source_raw = match source_key.as_ref() {
         Some(key) => match state.get_raw(key) {
             Some(raw) => Some(raw.to_vec()),
-            None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
+            None => return ApplyResult::ClaimedCost("tecNO_AUTH"),
         },
         None => None,
     };
     if let Some(raw) = source_raw.as_ref() {
         let flags = sle_flags(raw);
-        if flags & LSF_MPT_LOCKED != 0 && !destination_is_issuer {
+        if holder_to_holder && flags & LSF_MPT_LOCKED != 0 {
             return ApplyResult::ClaimedCost("tecLOCKED");
         }
-        if issuance_flags & LSF_MPT_REQUIRE_AUTH != 0
-            && flags & LSF_MPT_AUTHORIZED == 0
-            && !destination_is_issuer
-        {
+        if issuance_flags & LSF_MPT_REQUIRE_AUTH != 0 && flags & LSF_MPT_AUTHORIZED == 0 {
             return ApplyResult::ClaimedCost("tecNO_AUTH");
         }
-        if sle_uint64(raw, 26) < total_debit {
-            return ApplyResult::ClaimedCost("tecUNFUNDED_PAYMENT");
+        if sle_uint64(raw, SF_MPT_AMOUNT) < total_debit {
+            return ApplyResult::ClaimedCost("tecPATH_PARTIAL");
         }
     }
 
@@ -411,11 +540,14 @@ pub(crate) fn apply_direct_mpt_payment(state: &mut LedgerState, tx: &ParsedTx) -
         Some(key) => state.get_raw(key).map(|raw| raw.to_vec()),
         None => None,
     };
-    let create_destination_holder = !destination_is_issuer && existing_destination_raw.is_none();
-    if create_destination_holder && state.get_account(&destination).is_none() {
-        return ApplyResult::ClaimedCost("tecNO_DST");
-    }
     if !destination_is_issuer {
+        if existing_destination_raw.is_none() {
+            return if state.get_account(&destination).is_none() {
+                ApplyResult::ClaimedCost("tecNO_DST")
+            } else {
+                ApplyResult::ClaimedCost("tecNO_AUTH")
+            };
+        }
         if issuance_flags & LSF_MPT_REQUIRE_AUTH != 0 {
             match existing_destination_raw.as_ref() {
                 Some(raw) if sle_flags(raw) & LSF_MPT_AUTHORIZED != 0 => {}
@@ -423,53 +555,57 @@ pub(crate) fn apply_direct_mpt_payment(state: &mut LedgerState, tx: &ParsedTx) -
             }
         }
         if let Some(raw) = existing_destination_raw.as_ref() {
-            if sle_flags(raw) & LSF_MPT_LOCKED != 0 {
+            if holder_to_holder && sle_flags(raw) & LSF_MPT_LOCKED != 0 {
                 return ApplyResult::ClaimedCost("tecLOCKED");
             }
         }
     }
 
     let new_outstanding = if sender_is_issuer && !destination_is_issuer {
-        match outstanding.checked_add(deliver_value) {
+        match outstanding.checked_add(actual_deliver) {
             Some(value) if value <= maximum_amount => value,
             _ => return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED"),
         }
     } else if !sender_is_issuer && destination_is_issuer {
-        outstanding.saturating_sub(deliver_value)
+        match outstanding.checked_sub(actual_deliver) {
+            Some(value) => value,
+            None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+        }
     } else if !sender_is_issuer && !destination_is_issuer {
-        outstanding.saturating_sub(fee_value)
+        match outstanding.checked_sub(fee_value) {
+            Some(value) => value,
+            None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+        }
     } else {
         outstanding
     };
 
     if let (Some(source_key), Some(source_raw)) = (source_key.as_ref(), source_raw.as_ref()) {
-        let source_amount = sle_uint64(source_raw, 26);
+        let source_amount = sle_uint64(source_raw, SF_MPT_AMOUNT);
         state.insert_raw(
             *source_key,
-            patch_uint64_fields(source_raw, &[(26, source_amount - total_debit)]),
+            patch_uint64_fields(source_raw, &[(SF_MPT_AMOUNT, source_amount - total_debit)]),
         );
     }
 
     if let Some(destination_key) = destination_key.as_ref() {
-        let destination_raw = if let Some(raw) = existing_destination_raw.as_ref() {
-            raw.clone()
-        } else {
-            create_holder_token(state, &issuance_key, &mptid, &destination, 0)
+        let Some(destination_raw) = existing_destination_raw.as_ref() else {
+            return ApplyResult::ClaimedCost("tecNO_AUTH");
         };
-        let destination_amount = sle_uint64(&destination_raw, 26);
+        let destination_amount = sle_uint64(&destination_raw, SF_MPT_AMOUNT);
+        let Some(next_destination_amount) = destination_amount.checked_add(actual_deliver) else {
+            return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED");
+        };
         state.insert_raw(
             *destination_key,
-            patch_uint64_fields(
-                &destination_raw,
-                &[(26, destination_amount + deliver_value)],
-            ),
+            patch_uint64_fields(destination_raw, &[(SF_MPT_AMOUNT, next_destination_amount)]),
         );
     }
 
     if new_outstanding != outstanding {
         state.insert_raw(
             issuance_key,
-            patch_uint64_fields(&issuance_raw, &[(4, new_outstanding)]),
+            patch_uint64_fields(&issuance_raw, &[(SF_OUTSTANDING_AMOUNT, new_outstanding)]),
         );
     }
 
@@ -496,8 +632,17 @@ pub(crate) fn apply_mpt_clawback(state: &mut LedgerState, tx: &ParsedTx) -> Appl
     };
 
     let issuer = mpt_issuer(&mptid);
-    if tx.account != issuer || holder == issuer {
+    if tx.account == holder {
+        return ApplyResult::ClaimedCost("temMALFORMED");
+    }
+    if holder == issuer {
+        return ApplyResult::ClaimedCost("temMALFORMED");
+    }
+    if tx.account != issuer {
         return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+    }
+    if state.get_account(&holder).is_none() || state.get_account(&tx.account).is_none() {
+        return ApplyResult::ClaimedCost("terNO_ACCOUNT");
     }
 
     let issuance_key = mpt_issuance_key(&mptid);
@@ -514,20 +659,26 @@ pub(crate) fn apply_mpt_clawback(state: &mut LedgerState, tx: &ParsedTx) -> Appl
         Some(raw) => raw.to_vec(),
         None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
     };
-    let holder_amount = sle_uint64(&holder_raw, 26);
+    let holder_amount = sle_uint64(&holder_raw, SF_MPT_AMOUNT);
     if holder_amount == 0 {
-        return ApplyResult::ClaimedCost("tecUNFUNDED");
+        return ApplyResult::ClaimedCost("tecINSUFFICIENT_FUNDS");
     }
 
     let clawed = requested.min(holder_amount);
-    let outstanding = sle_uint64(&issuance_raw, 4);
+    let outstanding = sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT);
+    if outstanding < clawed {
+        return ApplyResult::ClaimedCost("tecINTERNAL");
+    }
     state.insert_raw(
         holder_key,
-        patch_uint64_fields(&holder_raw, &[(26, holder_amount - clawed)]),
+        patch_uint64_fields(&holder_raw, &[(SF_MPT_AMOUNT, holder_amount - clawed)]),
     );
     state.insert_raw(
         issuance_key,
-        patch_uint64_fields(&issuance_raw, &[(4, outstanding.saturating_sub(clawed))]),
+        patch_uint64_fields(
+            &issuance_raw,
+            &[(SF_OUTSTANDING_AMOUNT, outstanding - clawed)],
+        ),
     );
 
     ApplyResult::Success
@@ -548,18 +699,34 @@ pub(crate) fn apply_mptoken_issuance_create(
         if transfer_fee > MAX_TRANSFER_FEE {
             return ApplyResult::ClaimedCost("temBAD_TRANSFER_FEE");
         }
-        if tx.flags & LSF_MPT_CAN_TRANSFER == 0 {
+        if transfer_fee > 0 && tx.flags & LSF_MPT_CAN_TRANSFER == 0 {
             return ApplyResult::ClaimedCost("temMALFORMED");
         }
+    }
+    if matches!(tx.maximum_amount, Some(0)) {
+        return ApplyResult::ClaimedCost("temMALFORMED");
+    }
+    if let Some(maximum_amount) = tx.maximum_amount {
+        if maximum_amount > DEFAULT_MAXIMUM_AMOUNT {
+            return ApplyResult::ClaimedCost("temMALFORMED");
+        }
+    }
+    if matches!(tx.mptoken_metadata.as_ref(), Some(metadata) if metadata.is_empty() || metadata.len() > MAX_MPTOKEN_METADATA_LENGTH)
+    {
+        return ApplyResult::ClaimedCost("temMALFORMED");
     }
 
     let mptid = make_mptid(tx.sequence, &tx.account);
     let key = mpt_issuance_key(&mptid);
 
-    // Add to owner directory
-    directory::dir_add(state, &tx.account, key.0);
+    let required = owner_reserve_requirement(state, new_sender.owner_count, 1);
+    if balance_before_fee(new_sender.balance, tx.fee) < required {
+        return ApplyResult::ClaimedCost("tecINSUFFICIENT_RESERVE");
+    }
 
-    state.insert_raw(key, build_mptoken_issuance_sle(tx));
+    let owner_node = directory::dir_add(state, &tx.account, key.0);
+
+    state.insert_raw(key, build_mptoken_issuance_sle(tx, owner_node));
 
     new_sender.owner_count += 1;
 
@@ -592,12 +759,15 @@ pub(crate) fn apply_mptoken_issuance_destroy(
         Some(raw) => raw.to_vec(),
         None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
     };
-    if sle_uint64(&issuance_raw, 4) != 0 || sle_uint64(&issuance_raw, 25) != 0 {
+    if sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT) != 0
+        || sle_uint64(&issuance_raw, SF_LOCKED_AMOUNT) != 0
+    {
         return ApplyResult::ClaimedCost("tecHAS_OBLIGATIONS");
     }
 
-    // Remove from owner directory
-    directory::dir_remove(state, &tx.account, &key.0);
+    let owner_node = sle_uint64(&issuance_raw, SF_OWNER_NODE);
+    let owner_root = directory::owner_dir_key(&tx.account);
+    directory::dir_remove_root_page(state, &owner_root, owner_node, &key.0);
 
     // Remove the SLE
     state.remove_raw(&key);
@@ -628,7 +798,7 @@ pub(crate) fn apply_mptoken_issuance_set(
     let key = mpt_issuance_key(mptid);
     let existing = match state.get_raw(&key) {
         Some(raw) => raw.to_vec(),
-        None => return ApplyResult::ClaimedCost("tecNO_ENTRY"),
+        None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
     };
     let existing_flags = sle_flags(&existing);
 
@@ -637,14 +807,16 @@ pub(crate) fn apply_mptoken_issuance_set(
         if transfer_fee > MAX_TRANSFER_FEE {
             return ApplyResult::ClaimedCost("temBAD_TRANSFER_FEE");
         }
-        if existing_flags & LSF_MPT_CAN_TRANSFER == 0 {
+        if transfer_fee > 0 && existing_flags & LSF_MPT_CAN_TRANSFER == 0 {
             return ApplyResult::ClaimedCost("temMALFORMED");
         }
-        replacements.push(crate::ledger::meta::ParsedField {
-            type_code: 1,
-            field_code: 4,
-            data: transfer_fee.to_be_bytes().to_vec(),
-        });
+        if transfer_fee > 0 {
+            replacements.push(crate::ledger::meta::ParsedField {
+                type_code: 1,
+                field_code: 4,
+                data: transfer_fee.to_be_bytes().to_vec(),
+            });
+        }
     }
     if let Some(domain_id) = tx.domain_id {
         replacements.push(crate::ledger::meta::ParsedField {
@@ -654,6 +826,9 @@ pub(crate) fn apply_mptoken_issuance_set(
         });
     }
     if let Some(metadata) = &tx.mptoken_metadata {
+        if metadata.is_empty() || metadata.len() > MAX_MPTOKEN_METADATA_LENGTH {
+            return ApplyResult::ClaimedCost("temMALFORMED");
+        }
         replacements.push(crate::ledger::meta::ParsedField {
             type_code: 7,
             field_code: 30,
@@ -679,10 +854,24 @@ pub(crate) fn apply_mptoken_issuance_set(
     let mut issuance_base = existing.clone();
 
     if let Some(holder) = tx.holder {
+        if holder == tx.account {
+            return ApplyResult::ClaimedCost("temMALFORMED");
+        }
+        if !replacements.is_empty()
+            || tx.transfer_fee_field == Some(0)
+            || tx.domain_id.is_some()
+            || tx.mptoken_metadata.is_some()
+            || tx.mutable_flags.is_some()
+        {
+            return ApplyResult::ClaimedCost("temMALFORMED");
+        }
+        if state.get_account(&holder).is_none() {
+            return ApplyResult::ClaimedCost("tecNO_DST");
+        }
         let holder_key = mptoken_key(&key.0, &holder);
         let holder_raw = match state.get_raw(&holder_key) {
             Some(raw) => raw.to_vec(),
-            None => return ApplyResult::ClaimedCost("tecNO_ENTRY"),
+            None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
         };
         let mut holder_flags = sle_flags(&holder_raw);
         if tx.flags & TF_MPT_LOCK != 0 {
@@ -707,7 +896,9 @@ pub(crate) fn apply_mptoken_issuance_set(
         }
     }
 
-    if replacements.is_empty() {
+    let deletes_transfer_fee = tx.transfer_fee_field == Some(0);
+
+    if replacements.is_empty() && !deletes_transfer_fee {
         if issuance_base != existing {
             state.insert_raw(key, issuance_base);
         }
@@ -718,7 +909,13 @@ pub(crate) fn apply_mptoken_issuance_set(
         };
     }
 
-    let patched = crate::ledger::meta::patch_sle(&issuance_base, &replacements, None, None, &[]);
+    let deleted_fields = if deletes_transfer_fee {
+        &[(1u16, 4u16)][..]
+    } else {
+        &[][..]
+    };
+    let patched =
+        crate::ledger::meta::patch_sle(&issuance_base, &replacements, None, None, deleted_fields);
     state.insert_raw(key, patched);
     ApplyResult::Success
 }
@@ -741,9 +938,34 @@ pub(crate) fn apply_mptoken_authorize(
         Some(id) => id,
         None => return ApplyResult::ClaimedCost("temMALFORMED"),
     };
+    if matches!(tx.holder, Some(holder) if holder == tx.account) {
+        return ApplyResult::ClaimedCost("temMALFORMED");
+    }
 
     let issuance_key = mpt_issuance_key(mptid);
     let issuer = mpt_issuer(mptid);
+    let holder_key = mptoken_key(&issuance_key.0, &tx.account);
+
+    if tx.holder.is_none() && (tx.flags & TF_MPT_UNAUTHORIZE) != 0 {
+        let existing = match state.get_raw(&holder_key) {
+            Some(raw) => raw.to_vec(),
+            None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
+        };
+        if sle_uint64(&existing, SF_MPT_AMOUNT) != 0 || sle_uint64(&existing, SF_LOCKED_AMOUNT) != 0
+        {
+            if state.get_raw(&issuance_key).is_none() {
+                return ApplyResult::ClaimedCost("tecINTERNAL");
+            }
+            return ApplyResult::ClaimedCost("tecHAS_OBLIGATIONS");
+        }
+        let owner_node = sle_uint64(&existing, SF_OWNER_NODE);
+        let owner_root = directory::owner_dir_key(&tx.account);
+        directory::dir_remove_root_page(state, &owner_root, owner_node, &holder_key.0);
+        state.remove_raw(&holder_key);
+        new_sender.owner_count = new_sender.owner_count.saturating_sub(1);
+        return ApplyResult::Success;
+    }
+
     let issuance_raw = match state.get_raw(&issuance_key) {
         Some(raw) => raw.to_vec(),
         None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
@@ -752,16 +974,19 @@ pub(crate) fn apply_mptoken_authorize(
 
     if let Some(holder) = tx.holder {
         // ── Issuer path: authorize/unauthorize a holder ─────────────────
+        if state.get_account(&holder).is_none() {
+            return ApplyResult::ClaimedCost("tecNO_DST");
+        }
         if tx.account != issuer {
             return ApplyResult::ClaimedCost("tecNO_PERMISSION");
         }
         if issuance_flags & LSF_MPT_REQUIRE_AUTH == 0 {
-            return ApplyResult::ClaimedCost("tefNO_AUTH_REQUIRED");
+            return ApplyResult::ClaimedCost("tecNO_AUTH");
         }
         let holder_key = mptoken_key(&issuance_key.0, &holder);
         let existing = match state.get_raw(&holder_key) {
             Some(raw) => raw.to_vec(),
-            None => return ApplyResult::ClaimedCost("tecNO_ENTRY"),
+            None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
         };
         let flags = sle_flags(&existing);
         let new_flags = if tx.flags & TF_MPT_UNAUTHORIZE != 0 {
@@ -785,20 +1010,23 @@ pub(crate) fn apply_mptoken_authorize(
     } else {
         // ── Holder path: create or destroy own MPToken ──────────────────
         if tx.account == issuer {
-            return ApplyResult::ClaimedCost("temMALFORMED");
+            return ApplyResult::ClaimedCost("tecNO_PERMISSION");
         }
-        let holder_key = mptoken_key(&issuance_key.0, &tx.account);
 
         if tx.flags & TF_MPT_UNAUTHORIZE != 0 {
             // Destroy MPToken
             let existing = match state.get_raw(&holder_key) {
                 Some(raw) => raw.to_vec(),
-                None => return ApplyResult::ClaimedCost("tecNO_ENTRY"),
+                None => return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND"),
             };
-            if sle_uint64(&existing, 26) != 0 || sle_uint64(&existing, 4) != 0 {
+            if sle_uint64(&existing, SF_MPT_AMOUNT) != 0
+                || sle_uint64(&existing, SF_LOCKED_AMOUNT) != 0
+            {
                 return ApplyResult::ClaimedCost("tecHAS_OBLIGATIONS");
             }
-            directory::dir_remove(state, &tx.account, &holder_key.0);
+            let owner_node = sle_uint64(&existing, SF_OWNER_NODE);
+            let owner_root = directory::owner_dir_key(&tx.account);
+            directory::dir_remove_root_page(state, &owner_root, owner_node, &holder_key.0);
             state.remove_raw(&holder_key);
             new_sender.owner_count = new_sender.owner_count.saturating_sub(1);
         } else {
@@ -806,8 +1034,17 @@ pub(crate) fn apply_mptoken_authorize(
             if state.get_raw(&holder_key).is_some() {
                 return ApplyResult::ClaimedCost("tecDUPLICATE");
             }
-            directory::dir_add(state, &tx.account, holder_key.0);
-            state.insert_raw(holder_key, build_mptoken_sle(&tx.account, mptid, 0));
+            if new_sender.owner_count >= 2 {
+                let required = owner_reserve_requirement(state, new_sender.owner_count, 1);
+                if balance_before_fee(new_sender.balance, tx.fee) < required {
+                    return ApplyResult::ClaimedCost("tecINSUFFICIENT_RESERVE");
+                }
+            }
+            let owner_node = directory::dir_add(state, &tx.account, holder_key.0);
+            state.insert_raw(
+                holder_key,
+                build_mptoken_sle(&tx.account, mptid, 0, owner_node),
+            );
             new_sender.owner_count += 1;
         }
 

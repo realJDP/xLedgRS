@@ -1,15 +1,25 @@
-//! xLedgRS purpose: Runtime Snapshots piece of the live node runtime.
 use super::*;
 
 pub(super) struct FetchInfoSyncSnapshot {
     ledger_seq: u32,
     hash: String,
+    sync_active: bool,
+    target_account_hash: String,
+    computed_root_hash: String,
+    root_matches: bool,
     have_header: bool,
     have_state: bool,
     needed_state_hashes: Vec<String>,
     backend_fetch_errors: usize,
     timeouts: u32,
     in_flight: usize,
+    outstanding_cookies: usize,
+    outstanding_object_queries: usize,
+    recent_nodes: usize,
+    useful_idle_secs: u64,
+    response_idle_secs: u64,
+    queue_len: usize,
+    queue_bytes: usize,
     inner_nodes: usize,
     state_nodes: usize,
     pass: u32,
@@ -40,42 +50,135 @@ fn snapshot_validation_quorum(
         .unwrap_or(fallback)
 }
 
+fn readiness_blockers(state: &SharedState, sync: &FetchInfoSyncSnapshot) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !sync.have_header {
+        blockers.push("missing_header".to_string());
+    }
+    if !sync.have_state {
+        if !sync.root_matches {
+            blockers.push("state_root_mismatch".to_string());
+        } else if sync.backend_fetch_errors > 0 {
+            blockers.push("backend_fetch_errors".to_string());
+        } else if !sync.needed_state_hashes.is_empty() {
+            blockers.push("missing_state".to_string());
+        } else {
+            blockers.push("state_not_complete".to_string());
+        }
+    }
+    if sync.in_flight > 0 {
+        blockers.push("state_requests_in_flight".to_string());
+    }
+    if sync.queue_len > 0 {
+        blockers.push("queued_state_responses".to_string());
+    }
+    if state.pending_sync_anchor.is_some() {
+        blockers.push("pending_sync_anchor".to_string());
+    }
+    if !state.sync_done {
+        blockers.push("sync_not_done".to_string());
+    }
+    blockers
+}
+
 impl Node {
     pub(super) fn snapshot_sync_fetch(&self) -> Option<FetchInfoSyncSnapshot> {
-        let mut guard = self.lock_sync();
-        let syncer = guard.as_mut()?;
-
-        let report = syncer.get_missing_report(16);
-        let missing = report.missing;
-        let have_state = syncer.leaf_count() > 0
-            && missing.is_empty()
-            && report.backend_fetch_errors == 0
-            && syncer.root_hash() == syncer.account_hash();
-        let needed_state_hashes: Vec<String> = missing
-            .into_iter()
-            .map(|(_, hash)| hex::encode_upper(hash))
-            .collect();
-        let tail_stuck_hash = syncer.tail_stuck_hash();
+        let (
+            ledger_seq,
+            hash,
+            sync_active,
+            account_hash,
+            computed_root_hash,
+            timeouts,
+            in_flight,
+            outstanding_cookies,
+            outstanding_object_queries,
+            recent_nodes,
+            useful_idle_secs,
+            response_idle_secs,
+            inner_nodes,
+            state_nodes,
+            pass,
+            new_objects,
+            tail_stuck_hash,
+            tail_stuck_retries,
+            completion_snapshot,
+        ) = {
+            let mut guard = self.lock_sync();
+            let syncer = guard.as_mut()?;
+            (
+                syncer.ledger_seq(),
+                hex::encode_upper(syncer.ledger_hash()),
+                syncer.active(),
+                syncer.account_hash(),
+                syncer.root_hash(),
+                syncer.stalled_retries(),
+                syncer.in_flight(),
+                syncer.peer.outstanding_cookie_count(),
+                syncer.peer.outstanding_object_query_count(),
+                syncer.peer.recent_node_count(),
+                syncer.peer.last_new_nodes.elapsed().as_secs(),
+                syncer.peer.last_response.elapsed().as_secs(),
+                syncer.inner_count(),
+                syncer.leaf_count(),
+                syncer.pass_number(),
+                syncer.new_objects_this_pass(),
+                syncer.tail_stuck_hash(),
+                syncer.tail_stuck_retries(),
+                syncer.completion_check_snapshot(),
+            )
+        };
+        let completion = completion_snapshot
+            .map(crate::sync_coordinator::SyncCoordinator::check_completion_snapshot);
+        let (needed_state_hashes, backend_fetch_errors, missing_clear) = match completion
+            .as_ref()
+            .and_then(|result| result.blocker.as_ref())
+        {
+            Some(crate::sync_coordinator::CompletionBlocker::BackendFetchErrors { count }) => {
+                (Vec::new(), *count, false)
+            }
+            Some(crate::sync_coordinator::CompletionBlocker::MissingNodes {
+                first_hash, ..
+            }) => (vec![hex::encode_upper(first_hash)], 0, false),
+            Some(_) => (Vec::new(), 0, false),
+            None => (Vec::new(), 0, true),
+        };
+        let have_state = state_nodes > 0
+            && missing_clear
+            && backend_fetch_errors == 0
+            && computed_root_hash == account_hash;
+        let (queue_len, queue_bytes) = self.sync_runtime.sync_data_queue_stats();
 
         Some(FetchInfoSyncSnapshot {
-            ledger_seq: syncer.ledger_seq(),
-            hash: hex::encode_upper(syncer.ledger_hash()),
+            ledger_seq,
+            hash,
+            sync_active,
+            target_account_hash: hex::encode_upper(account_hash),
+            computed_root_hash: hex::encode_upper(computed_root_hash),
+            root_matches: computed_root_hash == account_hash,
             have_header: true,
             have_state,
             needed_state_hashes,
-            backend_fetch_errors: report.backend_fetch_errors,
-            timeouts: syncer.stalled_retries(),
-            in_flight: syncer.in_flight(),
-            inner_nodes: syncer.inner_count(),
-            state_nodes: syncer.leaf_count(),
-            pass: syncer.pass_number(),
-            new_objects: syncer.new_objects_this_pass(),
+            backend_fetch_errors,
+            timeouts,
+            in_flight,
+            outstanding_cookies,
+            outstanding_object_queries,
+            recent_nodes,
+            useful_idle_secs,
+            response_idle_secs,
+            queue_len,
+            queue_bytes,
+            inner_nodes,
+            state_nodes,
+            pass,
+            new_objects,
             tail_stuck_hash: if tail_stuck_hash.iter().any(|&b| b != 0) {
                 Some(hex::encode_upper(tail_stuck_hash))
             } else {
                 None
             },
-            tail_stuck_retries: syncer.tail_stuck_retries(),
+            tail_stuck_retries,
         })
     }
 
@@ -114,10 +217,30 @@ impl Node {
                 )
             })
             .count();
+        let readiness_blockers = readiness_blockers(state, &sync);
+        let ready = readiness_blockers.is_empty();
 
         crate::rpc::FetchInfoSnapshot {
             key: sync.ledger_seq.to_string(),
-            hash: sync.hash,
+            hash: sync.hash.clone(),
+            sync_active: sync.sync_active,
+            sync_in_progress: state.sync_in_progress,
+            sync_done: state.sync_done,
+            pending_sync_anchor: state
+                .pending_sync_anchor
+                .map(|(seq, hash)| format!("{}:{}", seq, hex::encode_upper(hash))),
+            target_seq: sync.ledger_seq,
+            target_hash: sync.hash,
+            target_account_hash: sync.target_account_hash,
+            computed_root_hash: sync.computed_root_hash,
+            root_matches: sync.root_matches,
+            ready,
+            readiness: if ready {
+                "ready".to_string()
+            } else {
+                "blocked".to_string()
+            },
+            readiness_blockers,
             have_header: sync.have_header,
             have_state: sync.have_state,
             have_transactions: state.pending_sync_anchor.is_none() && state.sync_done,
@@ -126,6 +249,13 @@ impl Node {
             peers,
             timeouts: sync.timeouts,
             in_flight: sync.in_flight,
+            outstanding_cookies: sync.outstanding_cookies,
+            outstanding_object_queries: sync.outstanding_object_queries,
+            recent_nodes: sync.recent_nodes,
+            useful_idle_secs: sync.useful_idle_secs,
+            response_idle_secs: sync.response_idle_secs,
+            queue_len: sync.queue_len,
+            queue_bytes: sync.queue_bytes,
             inner_nodes: sync.inner_nodes,
             state_nodes: sync.state_nodes,
             pass: sync.pass,
@@ -296,16 +426,9 @@ impl Node {
             (pool.len(), pool.canonical_set_hash(), pool.metrics.clone())
         };
         let mut ledger_master_snapshot = state.services.ledger_master.snapshot();
-        if ledger_master_snapshot.validated_seq == 0 {
-            ledger_master_snapshot.validated_seq = state.ctx.ledger_header.sequence;
-            ledger_master_snapshot.validated_hash = hex::encode_upper(state.ctx.ledger_header.hash);
-            ledger_master_snapshot.open_ledger_seq =
-                state.ctx.ledger_header.sequence.saturating_add(1);
-            ledger_master_snapshot.complete_ledgers = complete_ledgers.clone();
-            ledger_master_snapshot.last_close_time = state.ctx.ledger_header.close_time;
-            ledger_master_snapshot.queued_transactions = queued_transactions;
-            ledger_master_snapshot.candidate_set_hash = hex::encode_upper(candidate_set_hash);
-        }
+        ledger_master_snapshot.complete_ledgers = complete_ledgers.clone();
+        ledger_master_snapshot.queued_transactions = queued_transactions;
+        ledger_master_snapshot.candidate_set_hash = hex::encode_upper(candidate_set_hash);
         let mut open_ledger_snapshot = state.services.open_ledger.snapshot();
         if open_ledger_snapshot.ledger_current_index == 0 {
             open_ledger_snapshot.parent_ledger_index = state.ctx.ledger_header.sequence;
@@ -327,6 +450,52 @@ impl Node {
             .max(peer_reservations_map(state.ctx.peer_reservations.as_ref()).len());
         let resource_snapshot = state.services.resource_manager.snapshot(now, 32);
         let path_request_snapshot = state.services.path_request_snapshot();
+        let mut sync_peer_ids: Vec<_> = state
+            .peer_sync_useful
+            .keys()
+            .chain(state.peer_sync_duplicates.keys())
+            .copied()
+            .collect();
+        sync_peer_ids.sort_by_key(|pid| pid.0);
+        sync_peer_ids.dedup();
+        let mut sync_peer_usefulness: Vec<_> = sync_peer_ids
+            .into_iter()
+            .map(|pid| {
+                let address = state
+                    .peer_addrs
+                    .get(&pid)
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| format!("peer:{}", pid.0));
+                crate::rpc::SyncPeerUsefulnessSnapshot {
+                    peer_id: pid.0.to_string(),
+                    address,
+                    useful_score: state.peer_sync_useful.get(&pid).copied().unwrap_or(0),
+                    useful_nodes_total: state
+                        .peer_sync_useful_total
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or(0),
+                    duplicate_score: state.peer_sync_duplicates.get(&pid).copied().unwrap_or(0),
+                    duplicate_responses_total: state
+                        .peer_sync_duplicates_total
+                        .get(&pid)
+                        .copied()
+                        .unwrap_or(0),
+                    last_useful_secs: state
+                        .peer_sync_last_useful
+                        .get(&pid)
+                        .map(|at| now.saturating_duration_since(*at).as_secs()),
+                    latency: state.peer_latency.get(&pid).copied(),
+                    ledger_range: state.peer_ledger_range.get(&pid).copied(),
+                }
+            })
+            .collect();
+        sync_peer_usefulness.sort_by(|a, b| {
+            b.useful_score
+                .cmp(&a.useful_score)
+                .then_with(|| b.useful_nodes_total.cmp(&a.useful_nodes_total))
+                .then_with(|| a.peer_id.cmp(&b.peer_id))
+        });
         let mut ctx = NodeContext {
             network: state.ctx.network,
             network_id: state.ctx.network_id,
@@ -337,6 +506,7 @@ impl Node {
             fees: state.ctx.fees,
             ledger_state: state.ctx.ledger_state.clone(),
             tx_pool: state.ctx.tx_pool.clone(),
+            consensus_tx_sets: state.ctx.consensus_tx_sets.clone(),
             ledger_header: state.ctx.ledger_header.clone(),
             history: state.ctx.history.clone(),
             broadcast_queue: Vec::new(),
@@ -347,6 +517,8 @@ impl Node {
             validator_key: state.ctx.validator_key.clone(),
             peer_summaries,
             fetch_info,
+            sync_metrics: None,
+            sync_peer_usefulness,
             consensus_info,
             sync_clear_requested: state.ctx.sync_clear_requested.clone(),
             connect_requests: state.ctx.connect_requests.clone(),
@@ -442,11 +614,41 @@ impl Node {
             .as_ref()
             .map(|r| r.quorum())
             .unwrap_or(0);
+        let ledger_master_snapshot = state.services.ledger_master.snapshot();
+        let has_validated_head = ledger_master_snapshot.validated_seq > 0
+            && ledger_master_snapshot
+                .validated_hash
+                .chars()
+                .any(|c| c != '0');
+        let (validated_seq, validated_hash, validated_header) = if has_validated_head {
+            let seq = ledger_master_snapshot.validated_seq;
+            let hash = ledger_master_snapshot.validated_hash.clone();
+            let header = if seq == state.ctx.ledger_header.sequence
+                && hex::encode_upper(state.ctx.ledger_header.hash).eq_ignore_ascii_case(&hash)
+            {
+                state.ctx.ledger_header.clone()
+            } else {
+                state
+                    .ctx
+                    .history
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_ledger(seq)
+                    .filter(|record| {
+                        hex::encode_upper(record.header.hash).eq_ignore_ascii_case(&hash)
+                    })
+                    .map(|record| record.header.clone())
+                    .unwrap_or_default()
+            };
+            (seq, hash, header)
+        } else {
+            (0, "0".repeat(64), crate::ledger::LedgerHeader::default())
+        };
 
         crate::rpc::RpcSnapshot {
-            ledger_seq: state.ctx.ledger_seq,
-            ledger_hash: state.ctx.ledger_hash.clone(),
-            ledger_header: state.ctx.ledger_header.clone(),
+            ledger_seq: validated_seq,
+            ledger_hash: validated_hash,
+            ledger_header: validated_header,
             fees: state.ctx.fees,
             peer_count: state.peer_txs.len(),
             object_count,
@@ -483,10 +685,16 @@ impl Node {
 mod tests {
     use super::snapshot_validation_quorum;
 
+    fn validator_key_bytes() -> Vec<u8> {
+        crate::crypto::keys::Secp256k1KeyPair::generate().public_key_bytes()
+    }
+
     #[test]
     fn snapshot_validation_quorum_prefers_validator_list_manager() {
+        let first = validator_key_bytes();
+        let second = validator_key_bytes();
         let manager = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::validator_list::ValidatorListManager::new(vec![vec![1u8; 33], vec![2u8; 33]], 1),
+            crate::validator_list::ValidatorListManager::new(vec![first, second], 1),
         ));
 
         assert_eq!(snapshot_validation_quorum(Some(&manager), 0, 1_000), 2);

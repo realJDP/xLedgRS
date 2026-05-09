@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Http Io piece of the live node runtime.
 use super::*;
 
 pub(super) fn parse_http_content_length(header: &[u8]) -> Option<usize> {
@@ -35,6 +34,15 @@ pub(super) fn parse_forwarded_for(header: &[u8]) -> Option<String> {
             .find(|candidate| !candidate.is_empty())?;
         Some(first.to_string())
     })
+}
+
+pub(super) fn parse_http_request_line(header: &[u8]) -> Option<(&str, &str)> {
+    let text = std::str::from_utf8(header).ok()?;
+    let line = text.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    Some((method, target))
 }
 
 pub(super) async fn read_rpc_request(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
@@ -118,6 +126,15 @@ mod tests {
         assert_eq!(
             super::parse_forwarded_for(header),
             Some("198.51.100.10".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_request_line_returns_method_and_target() {
+        let header = b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        assert_eq!(
+            super::parse_http_request_line(header),
+            Some(("GET", "/metrics"))
         );
     }
 }

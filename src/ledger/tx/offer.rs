@@ -1,132 +1,290 @@
-//! xLedgRS purpose: Offer transaction engine logic for ledger replay.
 //! Offer — IMPLEMENTED
 
 use super::amm_step;
-use super::asset_flow::{apply_amount_delta, AssetDelta};
-use super::{load_existing_account, ApplyResult};
+use super::asset_flow::{
+    apply_amount_delta, can_debit_amount, transfer_rate_gross_debit_amount, AssetDelta,
+};
+use super::flow::{
+    amount_to_iou_value, apply_book_partial_fill_plan, ceil_in_strict_via_quality,
+    ceil_out_strict_via_quality, compare_amounts, compare_iou_values, delete_offer_from_dirs,
+    flow_with_input, iou_value_to_amount, offer_fully_consumed_by_output,
+    plan_book_exact_in_all_qualities_for_taker, plan_book_exact_out_all_qualities_for_taker,
+    quality_rate_from_u64, quote_offer_create_crossing_fill, quote_offer_for_desired_output,
+    rewrite_partial_offer_after_output_fill, zero_amount_like, BookFillPlan, BookStep, FlowAmount,
+    FlowBook, Strand,
+};
+use super::{balance_before_fee, load_existing_account, ApplyResult};
+use crate::ledger::account::{LSF_GLOBAL_FREEZE, LSF_REQUIRE_AUTH};
 use crate::ledger::directory;
-use crate::ledger::offer::{
-    amount_exponent, amount_is_zero, amount_to_i128, rate_gte, scale_amount, subtract_amount,
-    BookKey,
+use crate::ledger::offer::{amount_is_zero, rate_gte, subtract_amount, BookKey};
+use crate::ledger::trustline::{
+    LSF_HIGH_AUTH, LSF_HIGH_DEEP_FREEZE, LSF_HIGH_FREEZE, LSF_LOW_AUTH, LSF_LOW_DEEP_FREEZE,
+    LSF_LOW_FREEZE,
 };
 use crate::ledger::LedgerState;
-use crate::transaction::amount::{Amount, IouValue};
+use crate::transaction::amount::{Amount, IouValue, Issue, QUALITY_ONE};
 use crate::transaction::serialize::PREFIX_TX_SIGN;
 use crate::transaction::ParsedTx;
 
-// ── Quality-based crossing arithmetic (rippled parity) ──────────────────────
-//
-// Rippled computes offer-crossing fills using the Quality rate **stored in
-// the book directory key** at offer creation, not re-derived from the
-// offer's current (taker_pays, taker_gets). For offers that have been
-// partially filled in earlier ledgers, the two can differ by a few
-// mantissa bits of rounding. Rippled's flow:
-//
-//   Quality::ceil_out_strict(amount, limit, roundUp)
-//     → mulRoundStrict(limit, quality.rate(), in_asset, roundUp)
-//       → muldiv_round(m1, m2, 10^14, bias)  // u128 precision
-//         where bias = (10^14 - 1) to round away from zero when needed
-//
-//   Quality::ceil_in_strict(amount, limit, roundUp)
-//     → divRoundStrict(limit, quality.rate(), out_asset, roundUp)
-//       → muldiv_round(numVal, 10^17, denVal, bias)
-//         where bias = (denVal - 1) to round away from zero when needed
-//
-// The rate encoding is (exp_biased_by_100 << 56) | mantissa_56bits, matching
-// getRate(offerOut, offerIn) = offerIn/offerOut at offer-creation time.
+const TF_PASSIVE: u32 = 0x00010000;
+const TF_SELL: u32 = 0x00080000;
+const TF_HYBRID: u32 = 0x00100000;
 
-const TEN_TO_17: u128 = 100_000_000_000_000_000;
-
-/// Decode the stored rate from a book directory key. Returns the rate as an
-/// `IouValue` representing `offerIn / offerOut` (how much IN per unit OUT).
-fn quality_rate_from_book_dir(book_directory: &[u8; 32]) -> IouValue {
-    let mut q = [0u8; 8];
-    q.copy_from_slice(&book_directory[24..32]);
-    let raw = u64::from_be_bytes(q);
-    if raw == 0 {
-        return IouValue::ZERO;
-    }
-    let mantissa = (raw & 0x00FF_FFFF_FFFF_FFFF) as i64;
-    let exponent = ((raw >> 56) as i32) - 100;
-    IouValue { mantissa, exponent }
+fn round_quality_to_tick_size(quality: u64, tick_size: u8) -> u64 {
+    const MOD: [u64; 17] = [
+        10_000_000_000_000_000,
+        1_000_000_000_000_000,
+        100_000_000_000_000,
+        10_000_000_000_000,
+        1_000_000_000_000,
+        100_000_000_000,
+        10_000_000_000,
+        1_000_000_000,
+        100_000_000,
+        10_000_000,
+        1_000_000,
+        100_000,
+        10_000,
+        1_000,
+        100,
+        10,
+        1,
+    ];
+    let digits = (tick_size as usize).min(16);
+    let exponent = quality >> 56;
+    let mut mantissa = quality & 0x00FF_FFFF_FFFF_FFFF;
+    mantissa = mantissa.saturating_add(MOD[digits].saturating_sub(1));
+    mantissa -= mantissa % MOD[digits];
+    (exponent << 56) | mantissa
 }
 
-/// Normalize a u128 mantissa to the canonical 16-digit range [1e15, 1e16),
-/// adjusting exponent. Rounding direction is controlled by `round_up`:
-///   - `round_up = false`: truncate toward zero (matches rippled's
-///     canonicalizeRoundStrict for positive results with roundUp=false).
-///   - `round_up = true`: round away from zero (matches rippled's
-///     canonicalizeRoundStrict for positive results with roundUp=true).
-///
-/// The ripple Number class distinguishes these two modes strictly; using
-/// round-half-even here would leak 1 ULP of precision vs rippled at the
-/// 16-digit truncation step that follows a mulRoundStrict/divRoundStrict.
-fn normalize_u128(mantissa_abs: u128, exp: i32, round_up: bool) -> (u128, i32) {
-    if mantissa_abs == 0 {
-        return (0, 0);
-    }
-    const MAX16: u128 = 9_999_999_999_999_999;
-    const MIN16: u128 = 1_000_000_000_000_000;
-    let mut abs = mantissa_abs;
-    let mut e = exp;
-    while abs > MAX16 {
-        let rem = abs % 10;
-        abs /= 10;
-        if round_up && rem != 0 {
-            abs += 1;
-        }
-        e += 1;
-    }
-    while abs < MIN16 && abs != 0 {
-        abs *= 10;
-        e -= 1;
-    }
-    (abs, e)
-}
-
-/// Convert an Amount to an IouValue (dimensionless) for canonical arithmetic.
-/// For XRP, treats drops as the mantissa with exponent 0, then normalizes.
-fn amount_to_iou_value(a: &Amount) -> IouValue {
-    match a {
-        Amount::Xrp(drops) => {
-            let mut v = IouValue {
-                mantissa: *drops as i64,
-                exponent: 0,
-            };
-            v.normalize();
-            v
-        }
-        Amount::Iou { value, .. } => *value,
-        Amount::Mpt(_) => IouValue::ZERO,
-    }
-}
-
-/// Convert an IouValue back to an Amount using `template` to determine the
-/// output type. For XRP templates, the value is converted to drops (u64).
-/// For IOU templates, the value's canonical form is preserved.
-fn iou_value_to_amount(v: &IouValue, template: &Amount) -> Amount {
-    match template {
-        Amount::Xrp(_) => {
-            if v.mantissa <= 0 {
-                return Amount::Xrp(0);
-            }
-            let m = v.mantissa as u128;
-            let drops: u128 = if v.exponent >= 0 {
-                m.saturating_mul(10u128.saturating_pow(v.exponent as u32))
+fn amount_issue_tick_size(state: &mut LedgerState, amount: &Amount) -> u8 {
+    let Amount::Iou { issuer, .. } = amount else {
+        return 16;
+    };
+    load_existing_account(state, issuer)
+        .and_then(|account| {
+            if account.tick_size > 0 {
+                Some(account.tick_size)
             } else {
-                let scale = 10u128.saturating_pow((-v.exponent) as u32);
-                m / scale
-            };
-            Amount::Xrp(drops.min(u64::MAX as u128) as u64)
-        }
+                None
+            }
+        })
+        .unwrap_or(16)
+}
+
+fn issue_from_amount(amount: &Amount) -> Option<Issue> {
+    match amount {
+        Amount::Xrp(_) => Some(Issue::Xrp),
         Amount::Iou {
             currency, issuer, ..
-        } => Amount::Iou {
-            value: *v,
+        } => Some(Issue::Iou {
             currency: currency.clone(),
             issuer: *issuer,
-        },
-        Amount::Mpt(_) => template.clone(),
+        }),
+        Amount::Mpt(raw) => {
+            let (_, issuance) = Amount::Mpt(raw.clone()).mpt_parts()?;
+            Some(Issue::Mpt(issuance))
+        }
+    }
+}
+
+fn try_offer_create_xrp_autobridge_sell(
+    state: &mut LedgerState,
+    taker: [u8; 20],
+    remaining_gets: &Amount,
+    remaining_pays: &Amount,
+    close_time: u64,
+    domain_id: Option<[u8; 32]>,
+) -> Option<(FlowAmount, FlowAmount)> {
+    if !matches!(remaining_gets, Amount::Iou { .. })
+        || !matches!(remaining_pays, Amount::Iou { .. })
+    {
+        return None;
+    }
+
+    let in_issue = issue_from_amount(remaining_gets)?;
+    let out_issue = issue_from_amount(remaining_pays)?;
+    let first = BookStep::new(
+        FlowBook::with_domain(in_issue, Issue::Xrp, domain_id),
+        taker,
+        taker,
+    )
+    .with_close_time(close_time)
+    .with_all_qualities(true)
+    .with_offer_crossing(true);
+    let second = BookStep::new(
+        FlowBook::with_domain(Issue::Xrp, out_issue, domain_id),
+        taker,
+        taker,
+    )
+    .with_close_time(close_time)
+    .with_all_qualities(true)
+    .with_offer_crossing(true);
+    let mut strand = Strand::new(vec![Box::new(first), Box::new(second)]);
+    state.begin_tx();
+    let result = flow_with_input(state, &mut strand, FlowAmount::new(remaining_gets.clone()));
+    if !result.success {
+        state.discard_tx();
+        return None;
+    }
+    let (Some(input), Some(output)) = (result.input, result.output) else {
+        state.discard_tx();
+        return None;
+    };
+    if !rate_gte(
+        output.as_amount(),
+        input.as_amount(),
+        remaining_pays,
+        remaining_gets,
+    ) {
+        state.discard_tx();
+        return None;
+    }
+    let _commit = state.commit_tx();
+    Some((input, output))
+}
+
+fn try_offer_create_xrp_autobridge_buy(
+    state: &mut LedgerState,
+    taker: [u8; 20],
+    remaining_gets: &Amount,
+    remaining_pays: &Amount,
+    close_time: u64,
+    domain_id: Option<[u8; 32]>,
+) -> Option<(FlowAmount, FlowAmount)> {
+    if !matches!(remaining_gets, Amount::Iou { .. })
+        || !matches!(remaining_pays, Amount::Iou { .. })
+    {
+        return None;
+    }
+
+    let in_issue = issue_from_amount(remaining_gets)?;
+    let out_issue = issue_from_amount(remaining_pays)?;
+    let first_book = FlowBook::with_domain(in_issue, Issue::Xrp, domain_id);
+    let second_book = FlowBook::with_domain(Issue::Xrp, out_issue, domain_id);
+
+    let second_plan = plan_book_exact_out_all_qualities_for_taker(
+        state,
+        &second_book,
+        &FlowAmount::new(remaining_pays.clone()),
+        close_time,
+        super::flow::RIPPLE_MAX_OFFERS_CONSIDERED,
+        taker,
+        taker,
+    );
+    if !second_plan.complete {
+        return None;
+    }
+    let xrp_needed = second_plan.input.clone()?;
+
+    let first_plan = plan_book_exact_out_all_qualities_for_taker(
+        state,
+        &first_book,
+        &xrp_needed,
+        close_time,
+        super::flow::RIPPLE_MAX_OFFERS_CONSIDERED,
+        taker,
+        taker,
+    );
+    if !first_plan.complete {
+        return None;
+    }
+    let spent_input = first_plan.input.clone()?;
+    if compare_amounts(spent_input.as_amount(), remaining_gets) == std::cmp::Ordering::Greater {
+        return None;
+    }
+
+    let first_result = super::flow::apply_book_fill_plan(state, &first_plan, taker, taker).ok()?;
+    let second_result =
+        super::flow::apply_book_fill_plan(state, &second_plan, taker, taker).ok()?;
+    Some((first_result.input, second_result.output))
+}
+
+fn multiply_amount_by_rate(amount: &Amount, rate: &IouValue) -> Amount {
+    let value = amount_to_iou_value(amount).mul_round(rate, false);
+    iou_value_to_amount(&value, amount)
+}
+
+fn divide_amount_by_rate(amount: &Amount, rate: &IouValue) -> Amount {
+    let value = amount_to_iou_value(amount).div_round(rate, false);
+    iou_value_to_amount(&value, amount)
+}
+
+fn apply_offer_tick_size_rounding(
+    state: &mut LedgerState,
+    tx_flags: u32,
+    pays: &mut Amount,
+    gets: &mut Amount,
+) {
+    let tick_size = amount_issue_tick_size(state, pays).min(amount_issue_tick_size(state, gets));
+    if tick_size >= 16 {
+        return;
+    }
+
+    let quality = directory::offer_quality(gets, pays);
+    let rounded_quality = round_quality_to_tick_size(quality, tick_size);
+    let rate = quality_rate_from_u64(rounded_quality);
+    if rate.is_zero() {
+        return;
+    }
+
+    // Match rippled OfferCreate.cpp: after tick rounding, adjust the side
+    // that is not exact. For tfSell the exact side is TakerGets; otherwise
+    // the exact side is TakerPays.
+    if (tx_flags & TF_SELL) != 0 {
+        *pays = multiply_amount_by_rate(gets, &rate);
+    } else {
+        *gets = divide_amount_by_rate(pays, &rate);
+    }
+}
+
+fn quality_rate_to_iou_value(rate: u32) -> IouValue {
+    let mut value = IouValue {
+        mantissa: rate as i64,
+        exponent: -9,
+    };
+    value.normalize();
+    value
+}
+
+fn transfer_rate_adjusted_send_max(
+    state: &mut LedgerState,
+    taker: &[u8; 20],
+    send_max: &Amount,
+) -> Amount {
+    let Amount::Iou {
+        value,
+        currency,
+        issuer,
+    } = send_max
+    else {
+        return send_max.clone();
+    };
+    if taker == issuer {
+        return send_max.clone();
+    }
+
+    let transfer_rate = load_existing_account(state, issuer)
+        .map(|account| {
+            if account.transfer_rate == 0 {
+                QUALITY_ONE
+            } else {
+                account.transfer_rate
+            }
+        })
+        .unwrap_or(QUALITY_ONE);
+    if transfer_rate == QUALITY_ONE {
+        return send_max.clone();
+    }
+
+    // rippled builds the crossing threshold from sendMax inflated by the
+    // input issuer transfer rate: multiplyRound(..., roundUp=true).
+    let rate = quality_rate_to_iou_value(transfer_rate);
+    Amount::Iou {
+        value: value.mul_round(&rate, true),
+        currency: currency.clone(),
+        issuer: *issuer,
     }
 }
 
@@ -136,11 +294,30 @@ fn spendable_iou_funds_for_offer(
     issuer: &[u8; 20],
     currency: &crate::transaction::amount::Currency,
 ) -> IouValue {
+    if load_existing_account(state, issuer)
+        .map(|issuer_account| (issuer_account.flags & LSF_GLOBAL_FREEZE) != 0)
+        .unwrap_or(false)
+    {
+        return IouValue::ZERO;
+    }
+    if lp_token_underlying_frozen_for_offer(state, account, issuer) {
+        return IouValue::ZERO;
+    }
+
     let trustline = load_trustline_for_offer_funds(state, account, issuer, currency);
 
     let Some(trustline) = trustline else {
         return IouValue::ZERO;
     };
+
+    if trustline_is_frozen_by_issuer(&trustline, issuer)
+        || (trustline.flags & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE)) != 0
+    {
+        return IouValue::ZERO;
+    }
+    if !trustline_authorized_by_issuer_for_offer(state, account, issuer, &trustline) {
+        return IouValue::ZERO;
+    }
 
     let balance = trustline.balance_for(account);
     let opposite_limit = if account == &trustline.low_account {
@@ -149,6 +326,96 @@ fn spendable_iou_funds_for_offer(
         trustline.low_limit
     };
     balance.add(&opposite_limit)
+}
+
+fn lp_token_underlying_frozen_for_offer(
+    state: &mut LedgerState,
+    account: &[u8; 20],
+    lp_issuer: &[u8; 20],
+) -> bool {
+    let Some(lp_issuer_account) = load_existing_account(state, lp_issuer) else {
+        return false;
+    };
+    let Some(amm_id) = account_amm_id(&lp_issuer_account) else {
+        return false;
+    };
+    let Some((asset1, asset2)) = load_amm_assets(state, &amm_id) else {
+        return true;
+    };
+    issue_frozen_for_offer(state, account, &asset1)
+        || issue_frozen_for_offer(state, account, &asset2)
+}
+
+fn account_amm_id(account: &crate::ledger::account::AccountRoot) -> Option<[u8; 32]> {
+    let raw = account.raw_sle.as_ref()?;
+    let parsed = crate::ledger::meta::parse_sle(raw)?;
+    let field = parsed
+        .fields
+        .iter()
+        .find(|field| field.type_code == 5 && field.field_code == 14)?;
+    if field.data.len() != 32 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&field.data);
+    Some(id)
+}
+
+fn load_amm_assets(state: &LedgerState, amm_id: &[u8; 32]) -> Option<(Issue, Issue)> {
+    let key = crate::ledger::keylet::amm_id(*amm_id).key;
+    let raw = state
+        .get_raw_owned(&key)
+        .or_else(|| state.get_committed_raw_owned(&key))?;
+    let parsed = crate::ledger::meta::parse_sle(&raw)?;
+    if parsed.entry_type != 0x0079 {
+        return None;
+    }
+    let asset1 = parsed_issue(&parsed.fields, 24, 3)?;
+    let asset2 = parsed_issue(&parsed.fields, 24, 4)?;
+    Some((asset1, asset2))
+}
+
+fn parsed_issue(
+    fields: &[crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<Issue> {
+    let data = fields
+        .iter()
+        .find(|field| field.type_code == type_code && field.field_code == field_code)
+        .map(|field| field.data.as_slice())?;
+    Issue::from_bytes(data).map(|(issue, _)| issue)
+}
+
+fn issue_frozen_for_offer(state: &mut LedgerState, account: &[u8; 20], issue: &Issue) -> bool {
+    let Issue::Iou { currency, issuer } = issue else {
+        return false;
+    };
+
+    if load_existing_account(state, issuer)
+        .map(|issuer_account| (issuer_account.flags & LSF_GLOBAL_FREEZE) != 0)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let Some(line) = load_trustline_for_offer_funds(state, account, issuer, currency) else {
+        return false;
+    };
+    trustline_is_frozen_by_issuer(&line, issuer)
+}
+
+fn trustline_is_frozen_by_issuer(
+    trustline: &crate::ledger::RippleState,
+    issuer: &[u8; 20],
+) -> bool {
+    if issuer == &trustline.low_account {
+        (trustline.flags & LSF_LOW_FREEZE) != 0
+    } else if issuer == &trustline.high_account {
+        (trustline.flags & LSF_HIGH_FREEZE) != 0
+    } else {
+        false
+    }
 }
 
 fn load_trustline_for_offer_funds(
@@ -169,6 +436,93 @@ fn load_trustline_for_offer_funds(
     Some(tl)
 }
 
+fn auth_flag_for_issuer(issuer: &[u8; 20], trustline: &crate::ledger::RippleState) -> Option<u32> {
+    if issuer == &trustline.low_account {
+        Some(LSF_LOW_AUTH)
+    } else if issuer == &trustline.high_account {
+        Some(LSF_HIGH_AUTH)
+    } else {
+        None
+    }
+}
+
+fn trustline_authorized_by_issuer_for_offer(
+    state: &mut LedgerState,
+    holder: &[u8; 20],
+    issuer: &[u8; 20],
+    trustline: &crate::ledger::RippleState,
+) -> bool {
+    if holder == issuer {
+        return true;
+    }
+    let Some(issuer_account) = load_existing_account(state, issuer) else {
+        return true;
+    };
+    if (issuer_account.flags & LSF_REQUIRE_AUTH) == 0 {
+        return true;
+    }
+    auth_flag_for_issuer(issuer, trustline)
+        .map(|flag| (trustline.flags & flag) != 0)
+        .unwrap_or(false)
+}
+
+fn check_offer_global_freeze(state: &mut LedgerState, amount: &Amount) -> Option<ApplyResult> {
+    let Amount::Iou { issuer, .. } = amount else {
+        return None;
+    };
+    let issuer_acct = load_existing_account(state, issuer)?;
+    if (issuer_acct.flags & LSF_GLOBAL_FREEZE) != 0 {
+        Some(ApplyResult::ClaimedCost("tecFROZEN"))
+    } else {
+        None
+    }
+}
+
+fn check_offer_accept_asset(
+    state: &mut LedgerState,
+    account: &[u8; 20],
+    amount: &Amount,
+) -> Option<ApplyResult> {
+    let Amount::Iou {
+        currency, issuer, ..
+    } = amount
+    else {
+        return None;
+    };
+
+    let issuer_acct = match load_existing_account(state, issuer) {
+        Some(account) => account,
+        None => return Some(ApplyResult::ClaimedCost("tecNO_ISSUER")),
+    };
+
+    if issuer == account {
+        return None;
+    }
+
+    let trustline = load_trustline_for_offer_funds(state, account, issuer, currency);
+    if (issuer_acct.flags & LSF_REQUIRE_AUTH) != 0 {
+        let Some(trustline) = trustline.as_ref() else {
+            return Some(ApplyResult::ClaimedCost("tecNO_LINE"));
+        };
+        let Some(auth_flag) = auth_flag_for_issuer(issuer, trustline) else {
+            return Some(ApplyResult::ClaimedCost("tecNO_LINE"));
+        };
+        if (trustline.flags & auth_flag) == 0 {
+            return Some(ApplyResult::ClaimedCost("tecNO_AUTH"));
+        }
+    }
+
+    if let Some(trustline) = trustline {
+        if trustline_is_frozen_by_issuer(&trustline, issuer)
+            || (trustline.flags & (LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE)) != 0
+        {
+            return Some(ApplyResult::ClaimedCost("tecFROZEN"));
+        }
+    }
+
+    None
+}
+
 fn debug_offer_funding_enabled(seq: u32) -> bool {
     std::env::var("XLEDGRSV2BETA_DEBUG_OFFER_SEQS")
         .ok()
@@ -181,132 +535,8 @@ fn debug_offer_funding_enabled(seq: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn compare_iou_values(a: &IouValue, b: &IouValue) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
-    match (a.mantissa == 0, b.mantissa == 0) {
-        (true, true) => return Ordering::Equal,
-        (true, false) => return Ordering::Less,
-        (false, true) => return Ordering::Greater,
-        (false, false) => {}
-    }
-
-    if a.exponent == b.exponent {
-        return a.mantissa.cmp(&b.mantissa);
-    }
-
-    let exp_diff = a.exponent - b.exponent;
-    if exp_diff > 30 {
-        return Ordering::Greater;
-    }
-    if exp_diff < -30 {
-        return Ordering::Less;
-    }
-
-    if exp_diff > 0 {
-        (a.mantissa as i128 * 10i128.pow(exp_diff as u32)).cmp(&(b.mantissa as i128))
-    } else {
-        (a.mantissa as i128).cmp(&(b.mantissa as i128 * 10i128.pow((-exp_diff) as u32)))
-    }
-}
-
-fn compare_amounts(a: &Amount, b: &Amount) -> std::cmp::Ordering {
-    compare_iou_values(&amount_to_iou_value(a), &amount_to_iou_value(b))
-}
-
-/// Rippled's `Quality::ceil_in_strict` subset: given an offer's (in, out) and
-/// a limit on the IN side, compute the corresponding OUT side using the
-/// stored quality rate. `round_up = true` rounds away from zero on positive
-/// results, matching rippled's bias for offer crossing.
-///
-/// Returns (filled_in, filled_out) pair. If `limit_in >= offer_in`, uses
-/// the full offer unchanged. Otherwise scales the out down via
-/// `divRoundStrict(limit_in, rate)` where `rate = offer_in / offer_out`.
-fn ceil_in_strict_via_quality(
-    offer_in: &Amount,
-    offer_out: &Amount,
-    limit_in: &Amount,
-    book_directory: &[u8; 32],
-    round_up: bool,
-) -> (Amount, Amount) {
-    // Compare `limit_in` to `offer_in`. If the full offer can be taken, do so.
-    let limit_iou = amount_to_iou_value(limit_in);
-    let offer_in_iou = amount_to_iou_value(offer_in);
-    if compare_iou_values(&limit_iou, &offer_in_iou) != std::cmp::Ordering::Less {
-        return (offer_in.clone(), offer_out.clone());
-    }
-
-    // new_out = limit_in / rate, where rate = offerIn / offerOut
-    let rate = quality_rate_from_book_dir(book_directory);
-    if rate.mantissa == 0 {
-        // Fallback: no valid stored quality, return the whole offer.
-        return (offer_in.clone(), offer_out.clone());
-    }
-
-    // divRoundStrict: muldiv_round(num, 10^17, den, bias)
-    let num_val = limit_iou.mantissa.unsigned_abs() as u128;
-    let den_val = rate.mantissa.unsigned_abs() as u128;
-    let result_negative = (limit_iou.mantissa < 0) != (rate.mantissa < 0);
-    let bias: u128 = if result_negative != round_up {
-        den_val - 1
-    } else {
-        0
-    };
-    let num_scaled = num_val.saturating_mul(TEN_TO_17).saturating_add(bias);
-    let result_mantissa_u128 = num_scaled / den_val;
-    let result_exp = limit_iou.exponent - rate.exponent - 17;
-
-    let (mant_norm, exp_norm) = normalize_u128(result_mantissa_u128, result_exp, round_up);
-    let new_out_iou = IouValue {
-        mantissa: if result_negative {
-            -(mant_norm as i64)
-        } else {
-            mant_norm as i64
-        },
-        exponent: exp_norm,
-    };
-
-    let new_out = iou_value_to_amount(&new_out_iou, offer_out);
-    (limit_in.clone(), new_out)
-}
-
-/// Rippled's `Quality::ceil_out_strict` subset: given an offer's (in, out)
-/// and a limit on the OUT side, compute the corresponding IN side using the
-/// stored quality rate.
-fn ceil_out_strict_via_quality(
-    offer_in: &Amount,
-    offer_out: &Amount,
-    limit_out: &Amount,
-    book_directory: &[u8; 32],
-    round_up: bool,
-) -> (Amount, Amount) {
-    let limit_iou = amount_to_iou_value(limit_out);
-    let offer_out_iou = amount_to_iou_value(offer_out);
-    if compare_iou_values(&limit_iou, &offer_out_iou) != std::cmp::Ordering::Less {
-        return (offer_in.clone(), offer_out.clone());
-    }
-
-    let rate = quality_rate_from_book_dir(book_directory);
-    if rate.mantissa == 0 {
-        return (offer_in.clone(), offer_out.clone());
-    }
-
-    let result_negative = (limit_iou.mantissa < 0) != (rate.mantissa < 0);
-    let result_mantissa_u128 = (limit_iou.mantissa.unsigned_abs() as u128)
-        .saturating_mul(rate.mantissa.unsigned_abs() as u128);
-    let result_exp = limit_iou.exponent + rate.exponent;
-    let (mant_norm, exp_norm) = normalize_u128(result_mantissa_u128, result_exp, round_up);
-    let new_in_iou = IouValue {
-        mantissa: if result_negative {
-            -(mant_norm as i64)
-        } else {
-            mant_norm as i64
-        },
-        exponent: exp_norm,
-    };
-
-    let new_in = iou_value_to_amount(&new_in_iou, offer_in);
-    (new_in, limit_out.clone())
+fn rate_gt(a_pays: &Amount, a_gets: &Amount, b_pays: &Amount, b_gets: &Amount) -> bool {
+    rate_gte(a_pays, a_gets, b_pays, b_gets) && !rate_gte(b_pays, b_gets, a_pays, a_gets)
 }
 
 fn extract_additional_books_from_signing_payload(payload: &[u8]) -> Vec<[u8; 32]> {
@@ -361,13 +591,17 @@ fn build_standing_offer(
     book_directory: [u8; 32],
     book_node: u64,
     owner_node: u64,
+    additional_books: Vec<[u8; 32]>,
 ) -> crate::ledger::Offer {
     let mut sle_flags: u32 = 0;
-    if (tx.flags & 0x00010000) != 0 {
+    if (tx.flags & TF_PASSIVE) != 0 {
         sle_flags |= crate::ledger::offer::LSF_PASSIVE;
     }
-    if (tx.flags & 0x00080000) != 0 {
+    if (tx.flags & TF_SELL) != 0 {
         sle_flags |= crate::ledger::offer::LSF_SELL;
+    }
+    if (tx.flags & TF_HYBRID) != 0 {
+        sle_flags |= crate::ledger::offer::LSF_HYBRID;
     }
 
     crate::ledger::Offer {
@@ -381,57 +615,73 @@ fn build_standing_offer(
         owner_node,
         expiration: tx.expiration,
         domain_id: tx.domain_id,
-        additional_books: extract_additional_books_from_signing_payload(&tx.signing_payload),
+        additional_books,
         previous_txn_id: [0u8; 32],
         previous_txn_lgr_seq: 0,
         raw_sle: None,
     }
 }
 
-pub(crate) fn apply_validated_amm_offer_create(
+fn try_offer_create_amm_cross(
     state: &mut LedgerState,
-    tx: &ParsedTx,
-    close_time: u64,
-) -> Option<ApplyResult> {
-    let taker_pays = tx.taker_pays.as_ref()?;
-    let taker_gets = tx.taker_gets.as_ref()?;
-    if amount_is_zero(taker_pays) || amount_is_zero(taker_gets) {
+    taker: [u8; 20],
+    remaining_gets: &Amount,
+    remaining_pays: &Amount,
+    is_sell: bool,
+    domain_id: Option<[u8; 32]>,
+) -> Option<(FlowAmount, FlowAmount)> {
+    if domain_id.is_some() {
         return None;
     }
-    if tx.flags != 0 {
-        return None;
-    }
-    if tx.offer_sequence.is_some() {
-        return None;
-    }
-    if tx
-        .expiration
-        .is_some_and(|expiration| close_time >= expiration as u64)
-    {
-        return None;
-    }
-
-    let asset_in = amm_step::issue_from_amount(taker_gets)?;
-    let asset_out = amm_step::issue_from_amount(taker_pays)?;
+    let asset_in = amm_step::issue_from_amount(remaining_gets)?;
+    let asset_out = amm_step::issue_from_amount(remaining_pays)?;
     if asset_in == asset_out {
         return None;
     }
-    let funded_gets = offer_funded_input(state, &tx.account, taker_gets)?;
-
+    let funded_gets = offer_funded_input(state, &taker, remaining_gets)?;
     let pool = amm_step::load_amm_pool(state, &asset_in, &asset_out)?;
-    let quote = match amm_step::quote_exact_out(&pool, taker_pays) {
-        Some(exact_out) if amm_step::amount_leq(&exact_out.spent_in, &funded_gets)? => exact_out,
-        _ => amm_step::quote_exact_in(&pool, &funded_gets)?,
+
+    let quote = if is_sell {
+        amm_step::quote_exact_in(&pool, &funded_gets)?
+    } else {
+        match amm_step::quote_exact_out(&pool, remaining_pays) {
+            Some(exact_out) if amm_step::amount_leq(&exact_out.spent_in, &funded_gets)? => {
+                exact_out
+            }
+            _ => amm_step::quote_exact_in(&pool, &funded_gets)?,
+        }
     };
-    if !amm_step::amount_leq(&quote.delivered_out, taker_pays)? {
-        return None;
-    }
+
     if amount_is_zero(&quote.spent_in) || amount_is_zero(&quote.delivered_out) {
         return None;
     }
+    if compare_amounts(&quote.spent_in, remaining_gets) == std::cmp::Ordering::Greater {
+        return None;
+    }
+    if !is_sell
+        && compare_amounts(&quote.delivered_out, remaining_pays) == std::cmp::Ordering::Greater
+    {
+        return None;
+    }
+    if !rate_gte(
+        &quote.delivered_out,
+        &quote.spent_in,
+        remaining_pays,
+        remaining_gets,
+    ) {
+        return None;
+    }
 
-    amm_step::apply_swap_to_state(state, &pool, &quote, &tx.account, &tx.account);
-    Some(ApplyResult::Success)
+    state.begin_tx();
+    if !amm_step::apply_swap_to_state(state, &pool, &quote, &taker, &taker) {
+        state.discard_tx();
+        return None;
+    }
+    let _commit = state.commit_tx();
+    Some((
+        FlowAmount::new(quote.spent_in),
+        FlowAmount::new(quote.delivered_out),
+    ))
 }
 
 fn offer_funded_input(
@@ -477,6 +727,164 @@ fn offer_funded_input(
     }
 }
 
+fn offer_create_should_remove_tiny_reduced_quality_offer(
+    offer: &crate::ledger::Offer,
+    owner_funds: &Amount,
+) -> bool {
+    let in_is_xrp = matches!(offer.taker_pays, Amount::Xrp(_));
+    let out_is_xrp = matches!(offer.taker_gets, Amount::Xrp(_));
+
+    if out_is_xrp {
+        return false;
+    }
+    if !in_is_xrp
+        && compare_amounts(&offer.taker_pays, &offer.taker_gets) != std::cmp::Ordering::Less
+    {
+        return false;
+    }
+
+    let (effective_in, effective_out) = match &offer.taker_gets {
+        Amount::Iou { issuer, .. } if offer.account != *issuer => {
+            if compare_amounts(owner_funds, &offer.taker_gets) == std::cmp::Ordering::Less {
+                let Some(quote) = quote_offer_for_desired_output(offer, owner_funds, false) else {
+                    return true;
+                };
+                (quote.input, quote.output)
+            } else {
+                (offer.taker_pays.clone(), offer.taker_gets.clone())
+            }
+        }
+        _ => (offer.taker_pays.clone(), offer.taker_gets.clone()),
+    };
+
+    if amount_is_zero(&effective_in) || amount_is_zero(&effective_out) {
+        return true;
+    }
+    if amount_gt_min_positive(&effective_in) {
+        return false;
+    }
+
+    let effective_quality = directory::offer_quality(&effective_out, &effective_in);
+    effective_quality < stored_offer_quality(offer)
+}
+
+fn amount_gt_min_positive(amount: &Amount) -> bool {
+    match amount {
+        Amount::Xrp(drops) => *drops > 1,
+        Amount::Iou { value, .. } => value.mantissa > 1_000_000_000_000_000 || value.exponent > -96,
+        Amount::Mpt(_) => false,
+    }
+}
+
+fn stored_offer_quality(offer: &crate::ledger::Offer) -> u64 {
+    if offer.book_directory != [0u8; 32] {
+        let mut q = [0u8; 8];
+        q.copy_from_slice(&offer.book_directory[24..32]);
+        u64::from_be_bytes(q)
+    } else {
+        directory::offer_quality(&offer.taker_gets, &offer.taker_pays)
+    }
+}
+
+fn offer_book_has_self_cross_candidate(
+    state: &LedgerState,
+    book_key: &BookKey,
+    account: &[u8; 20],
+) -> bool {
+    state
+        .get_book(book_key)
+        .map(|book| {
+            book.iter_by_quality().any(|key| {
+                state
+                    .get_offer(key)
+                    .map(|offer| &offer.account == account)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn offer_create_plan_crosses_threshold(
+    plan: &BookFillPlan,
+    threshold_pays: &Amount,
+    threshold_gets: &Amount,
+    passive: bool,
+) -> bool {
+    !plan.fills.is_empty()
+        && plan.fills.iter().all(|fill| {
+            if passive {
+                rate_gt(&fill.output, &fill.input, threshold_pays, threshold_gets)
+            } else {
+                rate_gte(&fill.output, &fill.input, threshold_pays, threshold_gets)
+            }
+        })
+}
+
+fn try_offer_create_book_amm_flow_cross(
+    state: &mut LedgerState,
+    taker: [u8; 20],
+    remaining_gets: &Amount,
+    remaining_pays: &Amount,
+    threshold_gets: &Amount,
+    threshold_pays: &Amount,
+    is_sell: bool,
+    passive: bool,
+    close_time: u64,
+    domain_id: Option<[u8; 32]>,
+) -> Option<(FlowAmount, FlowAmount)> {
+    let in_issue = issue_from_amount(remaining_gets)?;
+    let out_issue = issue_from_amount(remaining_pays)?;
+    if in_issue == out_issue {
+        return None;
+    }
+    let book = FlowBook::with_domain(in_issue, out_issue, domain_id);
+    let book_key = BookKey::from_amounts_with_domain(remaining_gets, remaining_pays, domain_id);
+    if offer_book_has_self_cross_candidate(state, &book_key, &taker) {
+        return None;
+    }
+
+    let funded_gets = offer_funded_input(state, &taker, remaining_gets)?;
+    let plan = if is_sell {
+        plan_book_exact_in_all_qualities_for_taker(
+            state,
+            &book,
+            &FlowAmount::new(funded_gets),
+            close_time,
+            850,
+            taker,
+            taker,
+        )
+    } else {
+        plan_book_exact_out_all_qualities_for_taker(
+            state,
+            &book,
+            &FlowAmount::new(remaining_pays.clone()),
+            close_time,
+            850,
+            taker,
+            taker,
+        )
+    };
+    if !offer_create_plan_crosses_threshold(&plan, threshold_pays, threshold_gets, passive) {
+        return None;
+    }
+    if let Some(input) = plan.input.as_ref() {
+        if compare_amounts(input.as_amount(), remaining_gets) == std::cmp::Ordering::Greater {
+            return None;
+        }
+    }
+    if !is_sell {
+        if let Some(output) = plan.output.as_ref() {
+            if compare_amounts(output.as_amount(), remaining_pays) == std::cmp::Ordering::Greater {
+                return None;
+            }
+        }
+    }
+
+    let result = apply_book_partial_fill_plan(state, &plan, taker, taker).ok()?;
+    Some((result.input, result.output))
+}
+
 /// Apply an OfferCreate: attempt to cross against the opposite book,
 /// then place any unfilled remainder as a standing order.
 pub(crate) fn apply_offer_create(
@@ -484,6 +892,29 @@ pub(crate) fn apply_offer_create(
     tx: &ParsedTx,
     close_time: u64,
 ) -> ApplyResult {
+    const TF_IMMEDIATE_OR_CANCEL: u32 = 0x0002_0000;
+    const TF_FILL_OR_KILL: u32 = 0x0004_0000;
+
+    if (tx.flags & TF_IMMEDIATE_OR_CANCEL) != 0 && (tx.flags & TF_FILL_OR_KILL) != 0 {
+        return ApplyResult::ClaimedCost("temINVALID_FLAG");
+    }
+    if (tx.flags & TF_HYBRID) != 0 && tx.domain_id.is_none() {
+        return ApplyResult::ClaimedCost("temINVALID_FLAG");
+    }
+    if let Some(domain_id) = tx.domain_id {
+        if !super::permissioned_domain::account_in_domain(
+            state,
+            &tx.account,
+            &domain_id,
+            close_time,
+        ) {
+            return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+        }
+    }
+    if tx.expiration == Some(0) {
+        return ApplyResult::ClaimedCost("temBAD_EXPIRATION");
+    }
+
     let mut owner_count_deltas: std::collections::BTreeMap<[u8; 20], i32> =
         std::collections::BTreeMap::new();
     let mut released_gets_from_cancel: Option<Amount> = None;
@@ -496,14 +927,10 @@ pub(crate) fn apply_offer_create(
         Some(a) => a.clone(),
         None => return ApplyResult::ClaimedCost("temBAD_OFFER"),
     };
-    let original_pays = remaining_pays.clone();
-    let original_gets = remaining_gets.clone();
-    let original_book_key = BookKey::from_amounts(&original_pays, &original_gets);
-    let original_book_quality = directory::offer_quality(&original_gets, &original_pays);
-    let original_book_directory =
-        directory::book_dir_quality_key(&original_book_key, original_book_quality);
-
     let offer_seq = super::sequence_proxy(tx);
+    let pre_fee_balance = load_existing_account(state, &tx.account)
+        .map(|account| balance_before_fee(account.balance, tx.fee))
+        .unwrap_or(0);
 
     // Validate offer amounts are non-zero
     if amount_is_zero(&remaining_pays) || amount_is_zero(&remaining_gets) {
@@ -516,6 +943,29 @@ pub(crate) fn apply_offer_create(
         }
     }
 
+    // rippled OfferCreate::preclaim rejects offers involving globally frozen
+    // issues and verifies the maker can receive TakerPays before crossing.
+    if let Some(result) = check_offer_global_freeze(state, &remaining_pays)
+        .or_else(|| check_offer_global_freeze(state, &remaining_gets))
+    {
+        return result;
+    }
+    if let Some(result) = check_offer_accept_asset(state, &tx.account, &remaining_pays) {
+        return result;
+    }
+
+    if let Some(cancel_seq) = tx.offer_sequence {
+        if cancel_seq == 0 {
+            return ApplyResult::ClaimedCost("temBAD_SEQUENCE");
+        }
+        // The sender AccountRoot has already had Sequence applied by the
+        // legacy apply path, so use the transaction's original Sequence for
+        // non-ticketed OfferCreate preclaim parity.
+        if tx.ticket_sequence.is_none() && tx.sequence <= cancel_seq {
+            return ApplyResult::ClaimedCost("temBAD_SEQUENCE");
+        }
+    }
+
     // Explicit cancellation: if OfferSequence is set, cancel that specific old offer
     // before processing the new one (rippled OfferCreate.cpp behavior).
     if let Some(cancel_seq) = tx.offer_sequence {
@@ -524,45 +974,29 @@ pub(crate) fn apply_offer_create(
         // live only in NuDB until explicitly loaded. Without this, remove_offer
         // returns None and the cancellation is silently skipped, leaving a
         // stale offer + book directory entry. This was Bug C.
-        if state.get_offer(&cancel_key).is_none() {
-            if let Some(raw) = state.get_raw_owned(&cancel_key) {
-                if let Some(decoded) = crate::ledger::Offer::decode_from_sle(&raw) {
-                    state.hydrate_offer(decoded);
-                }
-            }
-        }
-        if let Some(old) = state.remove_offer(&cancel_key) {
-            let old_offer_key = crate::ledger::offer::shamap_key(&old.account, old.sequence);
-            let owner_root = directory::owner_dir_key(&old.account);
-            let _ = directory::dir_remove_root_page(
-                state,
-                &owner_root,
-                old.owner_node,
-                &old_offer_key.0,
-            ) || directory::dir_remove(state, &old.account, &old_offer_key.0);
-            if old.book_directory != [0u8; 32] {
-                let _ = directory::dir_remove_root_page(
-                    state,
-                    &crate::ledger::Key(old.book_directory),
-                    old.book_node,
-                    &old_offer_key.0,
-                ) || directory::dir_remove_root(
-                    state,
-                    &crate::ledger::Key(old.book_directory),
-                    &old_offer_key.0,
-                );
-            }
-            for book_directory in &old.additional_books {
-                directory::dir_remove_root(
-                    state,
-                    &crate::ledger::Key(*book_directory),
-                    &old_offer_key.0,
-                );
-            }
+        if let Some(deleted) = delete_offer_from_dirs(state, &cancel_key) {
+            let old = deleted.offer;
             *owner_count_deltas.entry(old.account).or_insert(0) -= 1;
             released_gets_from_cancel = Some(old.taker_gets.clone());
         }
     }
+
+    // rippled rounds the initial offer rate to the smallest TickSize set by
+    // either non-XRP issuer before crossing and before standing placement.
+    apply_offer_tick_size_rounding(state, tx.flags, &mut remaining_pays, &mut remaining_gets);
+    if amount_is_zero(&remaining_pays) || amount_is_zero(&remaining_gets) {
+        return ApplyResult::Success;
+    }
+
+    let original_pays = remaining_pays.clone();
+    let original_gets = remaining_gets.clone();
+    let threshold_pays = original_pays.clone();
+    let threshold_gets = transfer_rate_adjusted_send_max(state, &tx.account, &original_gets);
+    let original_book_key =
+        BookKey::from_amounts_with_domain(&original_pays, &original_gets, tx.domain_id);
+    let original_book_quality = directory::offer_quality(&original_gets, &original_pays);
+    let original_book_directory =
+        directory::book_dir_quality_key(&original_book_key, original_book_quality);
 
     // Funding check: does the account have enough of TakerGets to back the offer?
     // rippled returns tecUNFUNDED_OFFER if the account can't fund the offer.
@@ -659,7 +1093,8 @@ pub(crate) fn apply_offer_create(
     }
 
     // ── Cross against the opposite book ──────────────────────────────────────
-    let opposite_key = BookKey::from_amounts(&remaining_gets, &remaining_pays);
+    let opposite_key =
+        BookKey::from_amounts_with_domain(&remaining_gets, &remaining_pays, tx.domain_id);
 
     // Collect crossing offer keys (can't mutate state while iterating)
     let crossing_keys: Vec<crate::ledger::Key> = state
@@ -668,212 +1103,210 @@ pub(crate) fn apply_offer_create(
         .unwrap_or_default();
 
     let mut offers_to_remove = Vec::new();
+    let mut fok_preserve_removals = Vec::new();
     const MAX_CROSSING_STEPS: usize = 850; // matches rippled
     let mut steps = 0;
     let mut crossed_any = false;
+    let fok_atomic_crossing = (tx.flags & TF_FILL_OR_KILL) != 0;
+    let mut direct_flow_crossed = false;
+    if fok_atomic_crossing {
+        state.begin_tx();
+    }
 
-    for key in &crossing_keys {
-        if steps >= MAX_CROSSING_STEPS {
-            break;
+    if !fok_atomic_crossing {
+        if let Some((spent, delivered)) = try_offer_create_book_amm_flow_cross(
+            state,
+            tx.account,
+            &remaining_gets,
+            &remaining_pays,
+            &threshold_gets,
+            &threshold_pays,
+            (tx.flags & TF_SELL) != 0,
+            (tx.flags & TF_PASSIVE) != 0,
+            close_time,
+            tx.domain_id,
+        ) {
+            remaining_gets = subtract_amount(&remaining_gets, spent.as_amount());
+            remaining_pays = subtract_amount(&remaining_pays, delivered.as_amount());
+            crossed_any = true;
+            direct_flow_crossed = true;
         }
-        steps += 1;
-        let book_offer = match state.get_offer(key) {
-            Some(o) => o.clone(),
-            None => continue,
-        };
-        // Track that this account's owner count may change (consumed offer = -1)
+    }
 
-        if amount_is_zero(&book_offer.taker_gets) {
-            continue;
-        }
-        if amount_is_zero(&remaining_gets) {
-            break;
-        }
-        // Skip expired offers (rippled: OfferCreate.cpp removes expired offers during crossing)
-        if let Some(expiration) = book_offer.expiration {
-            if close_time >= expiration as u64 {
-                offers_to_remove.push(*key);
+    if !direct_flow_crossed {
+        for key in &crossing_keys {
+            if steps >= MAX_CROSSING_STEPS {
+                break;
+            }
+            steps += 1;
+            let book_offer = match state.get_offer(key) {
+                Some(o) => o.clone(),
+                None => continue,
+            };
+            // Track that this account's owner count may change (consumed offer = -1)
+
+            if amount_is_zero(&book_offer.taker_gets) {
                 continue;
             }
-        }
-        // Quality gate: stop crossing when the book offer's quality is worse
-        // than what the taker specified. tfSell does NOT bypass this check —
-        // it only affects which side constrains the fill (confirmed: rippled
-        // with tfSell still respects quality and rejects worse-rate offers).
-        //
-        // This gate must be evaluated BEFORE the self-owned check: rippled's
-        // BookStep::limitSelfCrossQuality (src/libxrpl/tx/paths/BookStep.cpp
-        // :404-409) only removes self-owned offers when `offer.quality() >=
-        // `qualityThreshold_`. Reversing the order previously caused the engine to
-        // silently cancel a previous same-account offer in the opposite book
-        // whenever the new offer walked the book, even when the prices
-        // didn't actually overlap.
-        let crosses = rate_gte(
-            &book_offer.taker_gets,
-            &book_offer.taker_pays,
-            &remaining_pays,
-            &remaining_gets,
-        );
-        if !crosses {
-            break;
-        }
-
-        // Self-owned offers at a crossing quality: rippled's
-        // limitSelfCrossQuality removes them even though no actual trade
-        // happens. Same-account "trade" would be meaningless, so the old
-        // Offer is cancelled and book traversal continues.
-        if book_offer.account == tx.account {
-            offers_to_remove.push(*key);
-            continue;
-        }
-
-        let we_want_i = amount_to_i128(&remaining_pays);
-        let they_give_i = amount_to_i128(&book_offer.taker_gets);
-        let we_can_pay_i = amount_to_i128(&remaining_gets);
-        let they_want_i = amount_to_i128(&book_offer.taker_pays);
-        let exp_want = amount_exponent(&remaining_pays);
-        let exp_give = amount_exponent(&book_offer.taker_gets);
-        let exp_can_pay = amount_exponent(&remaining_gets);
-        let exp_they_want = amount_exponent(&book_offer.taker_pays);
-
-        if they_give_i <= 0 || they_want_i <= 0 {
-            continue;
-        }
-
-        // Fill ratio is bounded by BOTH sides:
-        // 1) Remaining amount to receive (`remaining_pays / offer_gets`)
-        // 2) Remaining amount available to pay (`remaining_gets / offer_pays`)
-        //
-        // tfSell semantics (rippled CreateOffer / FlowCross): the maker has
-        // committed to spending all of `taker_gets` and will accept whatever
-        // amount of `taker_pays` the book provides. The quality gate above
-        // still applies, but
-        // within that gate the "at-least-want" receive floor is ignored and
-        // only `ratio_pay` binds. Non-`tfSell` offers keep the
-        // canonical min(receive, pay) behavior.
-        const TF_SELL: u32 = 0x00080000;
-        let is_sell = (tx.flags & TF_SELL) != 0;
-        let ratio_receive = normalize_ratio(we_want_i, exp_want, they_give_i, exp_give);
-        let ratio_pay = normalize_ratio(we_can_pay_i, exp_can_pay, they_want_i, exp_they_want);
-        let (mut fill_num, fill_den) = if is_sell {
-            ratio_pay
-        } else {
-            min_ratio(ratio_receive, ratio_pay)
-        };
-        if fill_num > fill_den {
-            fill_num = fill_den;
-        }
-
-        // For tfSell, match rippled's exact arithmetic: use the stored
-        // book-directory quality as the rate and compute filled_out via
-        // divRoundStrict (ceil_in_strict). This avoids the precision loss
-        // of re-deriving the rate from the offer's current (taker_pays,
-        // taker_gets) pair via a ratio-based scale. Non-tfSell continues to
-        // use the ratio-based scale_amount until the full Quality ceil_out
-        // path is ported.
-        let (filled_pay, filled_receive) = if is_sell {
-            let limit_in = if fill_num >= fill_den {
-                book_offer.taker_pays.clone()
-            } else {
-                scale_amount(&book_offer.taker_pays, fill_num, fill_den)
-            };
-            let (fin, fout) = ceil_in_strict_via_quality(
-                &book_offer.taker_pays,
-                &book_offer.taker_gets,
-                &limit_in,
-                &book_offer.book_directory,
-                false, // roundUp=false: taker receives rounded toward zero,
-                       // matches rippled's canonicalizeRoundStrict path
-            );
-            (fin, fout)
-        } else {
-            let desired_out = if compare_amounts(&remaining_pays, &book_offer.taker_gets)
-                == std::cmp::Ordering::Greater
-            {
-                book_offer.taker_gets.clone()
-            } else {
-                remaining_pays.clone()
-            };
-            let (pay_for_desired_out, filled_receive) = ceil_out_strict_via_quality(
-                &book_offer.taker_pays,
-                &book_offer.taker_gets,
-                &desired_out,
-                &book_offer.book_directory,
-                true,
-            );
-            if compare_amounts(&pay_for_desired_out, &remaining_gets) != std::cmp::Ordering::Greater
-            {
-                (pay_for_desired_out, filled_receive)
-            } else {
-                ceil_in_strict_via_quality(
-                    &book_offer.taker_pays,
-                    &book_offer.taker_gets,
-                    &remaining_gets,
-                    &book_offer.book_directory,
-                    false,
-                )
+            if amount_is_zero(&remaining_gets) {
+                break;
             }
-        };
-
-        if amount_is_zero(&filled_pay) || amount_is_zero(&filled_receive) {
-            continue;
-        }
-
-        // Transfer assets between the two parties
-        apply_amount_delta(state, &tx.account, AssetDelta::Credit, &filled_receive);
-        apply_amount_delta(state, &tx.account, AssetDelta::Debit, &filled_pay);
-        apply_amount_delta(state, &book_offer.account, AssetDelta::Credit, &filled_pay);
-        apply_amount_delta(
-            state,
-            &book_offer.account,
-            AssetDelta::Debit,
-            &filled_receive,
-        );
-
-        // Update the remaining want/give values.
-        remaining_pays = subtract_amount(&remaining_pays, &filled_receive);
-        remaining_gets = subtract_amount(&remaining_gets, &filled_pay);
-        crossed_any = true;
-
-        let fully_consumed =
-            compare_amounts(&filled_receive, &book_offer.taker_gets) != std::cmp::Ordering::Less;
-        if fully_consumed {
-            offers_to_remove.push(*key);
-        } else {
-            state.remove_offer(key);
-            let new_gets = subtract_amount(&book_offer.taker_gets, &filled_receive);
-            let (new_pays, _) = ceil_out_strict_via_quality(
-                &book_offer.taker_pays,
-                &book_offer.taker_gets,
-                &new_gets,
-                &book_offer.book_directory,
-                true,
-            );
-            if !amount_is_zero(&new_gets) && !amount_is_zero(&new_pays) {
-                let mut updated = book_offer.clone();
-                updated.taker_gets = new_gets;
-                updated.taker_pays = new_pays;
-                updated.raw_sle = None;
-                state.insert_offer(updated);
+            // Skip expired offers (rippled: OfferCreate.cpp removes expired offers during crossing)
+            if let Some(expiration) = book_offer.expiration {
+                if close_time >= expiration as u64 {
+                    offers_to_remove.push(*key);
+                    fok_preserve_removals.push(*key);
+                    continue;
+                }
+            }
+            // Quality gate: stop crossing when the book offer's quality is worse
+            // than what the taker specified. tfSell does NOT bypass this check —
+            // it only affects which side constrains the fill (confirmed: rippled
+            // with tfSell still respects quality and rejects worse-rate offers).
+            //
+            // This gate must be evaluated BEFORE the self-owned check: rippled's
+            // BookStep::limitSelfCrossQuality (src/libxrpl/tx/paths/BookStep.cpp
+            // :404-409) only removes self-owned offers when `offer.quality() >=
+            // `qualityThreshold_`. Reversing the order previously caused the engine to
+            // silently cancel a previous same-account offer in the opposite book
+            // whenever the new offer walked the book, even when the prices
+            // didn't actually overlap.
+            let crosses = if (tx.flags & TF_PASSIVE) != 0 {
+                // rippled increments the flow quality threshold for tfPassive,
+                // so passive offers only cross strictly better book qualities.
+                rate_gt(
+                    &book_offer.taker_gets,
+                    &book_offer.taker_pays,
+                    &threshold_pays,
+                    &threshold_gets,
+                )
             } else {
-                // Offer fully consumed (remainder is zero) — remove from owner and book directories
-                let offer_key =
-                    crate::ledger::offer::shamap_key(&book_offer.account, book_offer.sequence);
-                let removed_owner = directory::dir_remove(state, &book_offer.account, &offer_key.0);
-                *owner_count_deltas.entry(book_offer.account).or_insert(0) -= 1;
-                if book_offer.book_directory != [0u8; 32] {
-                    let removed_book = directory::dir_remove_root(
+                rate_gte(
+                    &book_offer.taker_gets,
+                    &book_offer.taker_pays,
+                    &threshold_pays,
+                    &threshold_gets,
+                )
+            };
+            if !crosses {
+                break;
+            }
+
+            // Self-owned offers at a crossing quality: rippled's
+            // limitSelfCrossQuality removes them even though no actual trade
+            // happens. Same-account "trade" would be meaningless, so the old
+            // Offer is cancelled and book traversal continues.
+            if book_offer.account == tx.account {
+                offers_to_remove.push(*key);
+                fok_preserve_removals.push(*key);
+                continue;
+            }
+
+            let funded_offer_gets =
+                match offer_funded_input(state, &book_offer.account, &book_offer.taker_gets) {
+                    Some(amount) if !amount_is_zero(&amount) => amount,
+                    _ => {
+                        offers_to_remove.push(*key);
+                        fok_preserve_removals.push(*key);
+                        continue;
+                    }
+                };
+            if offer_create_should_remove_tiny_reduced_quality_offer(
+                &book_offer,
+                &funded_offer_gets,
+            ) {
+                offers_to_remove.push(*key);
+                fok_preserve_removals.push(*key);
+                continue;
+            }
+            let remaining_send_max =
+                transfer_rate_adjusted_send_max(state, &tx.account, &remaining_gets);
+            let funded_taker_gets =
+                match offer_funded_input(state, &tx.account, &remaining_send_max) {
+                    Some(amount) if !amount_is_zero(&amount) => amount,
+                    _ => break,
+                };
+
+            let is_sell = (tx.flags & TF_SELL) != 0;
+            let Some(quote) = quote_offer_create_crossing_fill(
+                &book_offer,
+                &remaining_pays,
+                &funded_taker_gets,
+                &funded_offer_gets,
+                is_sell,
+            ) else {
+                continue;
+            };
+            let (filled_pay, filled_receive) = (quote.input, quote.output);
+
+            if amount_is_zero(&filled_pay) || amount_is_zero(&filled_receive) {
+                continue;
+            }
+
+            let taker_debit = filled_pay.clone();
+            let maker_debit = transfer_rate_gross_debit_amount(
+                state,
+                &book_offer.account,
+                &tx.account,
+                &filled_receive,
+            );
+
+            if !can_debit_amount(state, &book_offer.account, &maker_debit) {
+                offers_to_remove.push(*key);
+                fok_preserve_removals.push(*key);
+                continue;
+            }
+            if !can_debit_amount(state, &tx.account, &taker_debit) {
+                if fok_atomic_crossing {
+                    state.discard_tx();
+                    remove_offer_keys_and_decrement_owners(state, &fok_preserve_removals);
+                }
+                return ApplyResult::ClaimedCost("tecUNFUNDED_OFFER");
+            }
+
+            // Transfer assets between the two parties
+            let _ = apply_amount_delta(state, &tx.account, AssetDelta::Credit, &filled_receive);
+            let _ = apply_amount_delta(state, &tx.account, AssetDelta::Debit, &taker_debit);
+            let _ = apply_amount_delta(state, &book_offer.account, AssetDelta::Credit, &filled_pay);
+            let _ = apply_amount_delta(state, &book_offer.account, AssetDelta::Debit, &maker_debit);
+
+            // Update the remaining want/give values.
+            remaining_pays = subtract_amount(&remaining_pays, &filled_receive);
+            remaining_gets = subtract_amount(&remaining_gets, &filled_pay);
+            crossed_any = true;
+
+            if offer_fully_consumed_by_output(&book_offer, &filled_receive, &funded_offer_gets) {
+                offers_to_remove.push(*key);
+            } else {
+                state.remove_offer(key);
+                if let Some(updated) =
+                    rewrite_partial_offer_after_output_fill(&book_offer, &filled_receive)
+                {
+                    state.insert_offer(updated);
+                } else {
+                    // Offer fully consumed (remainder is zero) — remove from owner and book directories
+                    let offer_key =
+                        crate::ledger::offer::shamap_key(&book_offer.account, book_offer.sequence);
+                    let removed_owner = directory::dir_remove_owner_page(
                         state,
-                        &crate::ledger::Key(book_offer.book_directory),
+                        &book_offer.account,
+                        book_offer.owner_node,
                         &offer_key.0,
                     );
-                    if !removed_owner || !removed_book {
-                        let owner_still_has_entry = directory::owner_dir_contains_entry(
+                    *owner_count_deltas.entry(book_offer.account).or_insert(0) -= 1;
+                    if book_offer.book_directory != [0u8; 32] {
+                        let removed_book = directory::dir_remove_root(
                             state,
-                            &book_offer.account,
+                            &crate::ledger::Key(book_offer.book_directory),
                             &offer_key.0,
                         );
-                        tracing::warn!(
+                        if !removed_owner || !removed_book {
+                            let owner_still_has_entry = directory::owner_dir_contains_entry(
+                                state,
+                                &book_offer.account,
+                                &offer_key.0,
+                            );
+                            tracing::warn!(
                             "offer replay remove miss (zero remainder): account={} seq={} owner_removed={} book_removed={} owner_has_entry={}",
                             hex::encode_upper(book_offer.account),
                             book_offer.sequence,
@@ -881,98 +1314,109 @@ pub(crate) fn apply_offer_create(
                             removed_book,
                             owner_still_has_entry,
                         );
-                    }
-                } else if !removed_owner {
-                    let owner_still_has_entry = directory::owner_dir_contains_entry(
-                        state,
-                        &book_offer.account,
-                        &offer_key.0,
-                    );
-                    tracing::warn!(
+                        }
+                    } else if !removed_owner {
+                        let owner_still_has_entry = directory::owner_dir_contains_entry(
+                            state,
+                            &book_offer.account,
+                            &offer_key.0,
+                        );
+                        tracing::warn!(
                         "offer replay owner-dir remove miss (zero remainder): account={} seq={} owner_has_entry={}",
                         hex::encode_upper(book_offer.account),
                         book_offer.sequence,
                         owner_still_has_entry,
                     );
+                    }
                 }
             }
-        }
 
-        if amount_is_zero(&remaining_pays) {
-            break;
+            if amount_is_zero(&remaining_pays) {
+                break;
+            }
         }
     }
 
     // Remove consumed offers and decrement their owners' counts
     for key in &offers_to_remove {
-        // Hydrate from NuDB if not in typed map (same hydration gap as trust lines)
-        if state.get_offer(key).is_none() {
-            if let Some(raw) = state.get_raw_owned(key) {
-                if let Some(decoded) = crate::ledger::Offer::decode_from_sle(&raw) {
-                    state.hydrate_offer(decoded);
-                }
-            }
-        }
-        if let Some(removed) = state.remove_offer(key) {
-            // Remove from owner and book directories
-            let offer_key = crate::ledger::offer::shamap_key(&removed.account, removed.sequence);
-            let owner_root = directory::owner_dir_key(&removed.account);
-            let removed_owner = directory::dir_remove_root_page(
-                state,
-                &owner_root,
-                removed.owner_node,
-                &offer_key.0,
-            ) || directory::dir_remove(state, &removed.account, &offer_key.0);
+        if let Some(deleted) = delete_offer_from_dirs(state, key) {
+            let removed = deleted.offer;
             *owner_count_deltas.entry(removed.account).or_insert(0) -= 1;
-            if removed.book_directory != [0u8; 32] {
-                let removed_book = directory::dir_remove_root_page(
-                    state,
-                    &crate::ledger::Key(removed.book_directory),
-                    removed.book_node,
-                    &offer_key.0,
-                ) || directory::dir_remove_root(
-                    state,
-                    &crate::ledger::Key(removed.book_directory),
-                    &offer_key.0,
-                );
-                if !removed_owner || !removed_book {
-                    let owner_still_has_entry =
-                        directory::owner_dir_contains_entry(state, &removed.account, &offer_key.0);
-                    tracing::warn!(
-                        "offer replay remove miss (consumed): account={} seq={} owner_removed={} book_removed={} owner_has_entry={}",
-                        hex::encode_upper(removed.account),
-                        removed.sequence,
-                        removed_owner,
-                        removed_book,
-                        owner_still_has_entry,
-                    );
-                }
-            } else if !removed_owner {
+            if !deleted.owner_removed || !deleted.book_removed {
+                let offer_key =
+                    crate::ledger::offer::shamap_key(&removed.account, removed.sequence);
                 let owner_still_has_entry =
                     directory::owner_dir_contains_entry(state, &removed.account, &offer_key.0);
                 tracing::warn!(
-                    "offer replay owner-dir remove miss (consumed): account={} seq={} owner_has_entry={}",
+                    "offer replay remove miss (consumed): account={} seq={} owner_removed={} book_removed={} owner_has_entry={}",
                     hex::encode_upper(removed.account),
                     removed.sequence,
+                    deleted.owner_removed,
+                    deleted.book_removed,
                     owner_still_has_entry,
-                );
-            }
-            for book_directory in &removed.additional_books {
-                directory::dir_remove_root(
-                    state,
-                    &crate::ledger::Key(*book_directory),
-                    &offer_key.0,
                 );
             }
         }
     }
 
-    // ── OfferCreate flags (rippled: OfferCreate.cpp) ──
-    const TF_IMMEDIATE_OR_CANCEL: u32 = 0x00020000;
-    const TF_FILL_OR_KILL: u32 = 0x00040000;
+    if (tx.flags & TF_PASSIVE) == 0
+        && !amount_is_zero(&remaining_gets)
+        && !amount_is_zero(&remaining_pays)
+    {
+        let bridge_result = if (tx.flags & TF_SELL) != 0 {
+            try_offer_create_xrp_autobridge_sell(
+                state,
+                tx.account,
+                &remaining_gets,
+                &remaining_pays,
+                close_time,
+                tx.domain_id,
+            )
+        } else {
+            try_offer_create_xrp_autobridge_buy(
+                state,
+                tx.account,
+                &remaining_gets,
+                &remaining_pays,
+                close_time,
+                tx.domain_id,
+            )
+        };
+        if let Some((spent, delivered)) = bridge_result {
+            remaining_gets = subtract_amount(&remaining_gets, spent.as_amount());
+            remaining_pays = subtract_amount(&remaining_pays, delivered.as_amount());
+            crossed_any = true;
+        }
+    }
+
+    if (tx.flags & TF_PASSIVE) == 0
+        && !amount_is_zero(&remaining_gets)
+        && !amount_is_zero(&remaining_pays)
+    {
+        if let Some((spent, delivered)) = try_offer_create_amm_cross(
+            state,
+            tx.account,
+            &remaining_gets,
+            &remaining_pays,
+            (tx.flags & TF_SELL) != 0,
+            tx.domain_id,
+        ) {
+            remaining_gets = subtract_amount(&remaining_gets, spent.as_amount());
+            remaining_pays = subtract_amount(&remaining_pays, delivered.as_amount());
+            crossed_any = true;
+        }
+    }
+
+    if crossed_any
+        && (tx.flags & TF_FILL_OR_KILL) == 0
+        && offer_funded_input(state, &tx.account, &remaining_gets).is_none()
+    {
+        remaining_pays = zero_amount_like(&remaining_pays);
+        remaining_gets = zero_amount_like(&remaining_gets);
+    }
 
     if crossed_any && !amount_is_zero(&remaining_pays) && !amount_is_zero(&remaining_gets) {
-        if (tx.flags & 0x00080000) != 0 {
+        if (tx.flags & TF_SELL) != 0 {
             let (recomputed_pays, _) = ceil_out_strict_via_quality(
                 &original_pays,
                 &original_gets,
@@ -998,6 +1442,14 @@ pub(crate) fn apply_offer_create(
         && (!amount_is_zero(&remaining_pays) || !amount_is_zero(&remaining_gets))
     {
         // Offer not fully filled — return tecKILLED (fee claimed, no offer placed)
+        if fok_atomic_crossing {
+            state.discard_tx();
+            remove_offer_keys_and_decrement_owners(state, &fok_preserve_removals);
+        }
+        return ApplyResult::ClaimedCost("tecKILLED");
+    }
+
+    if (tx.flags & TF_IMMEDIATE_OR_CANCEL) != 0 && !crossed_any {
         return ApplyResult::ClaimedCost("tecKILLED");
     }
 
@@ -1006,26 +1458,57 @@ pub(crate) fn apply_offer_create(
 
     // ── Place remainder as standing offer ────────────────────────────────────
     if place_remainder && !amount_is_zero(&remaining_pays) && !amount_is_zero(&remaining_gets) {
-        let offer_key = crate::ledger::offer::shamap_key(&tx.account, offer_seq);
-        let owner_node = directory::dir_add(state, &tx.account, offer_key.0);
-        let book_key = BookKey::from_amounts(&remaining_pays, &remaining_gets);
-        // rippled preserves the offer's original uRate for the standing
-        // remainder. Recomputing from partially-filled amounts moves the
-        // residual offer into the wrong quality directory.
-        let book_quality = original_book_quality;
-        let (book_directory, book_node) =
-            directory::dir_add_book(state, &book_key, book_quality, offer_key.0);
-        let offer = build_standing_offer(
-            tx,
-            offer_seq,
-            remaining_pays,
-            remaining_gets,
-            book_directory.0,
-            book_node,
-            owner_node,
-        );
-        state.insert_offer(offer);
-        *owner_count_deltas.entry(tx.account).or_insert(0) += 1;
+        let fees = crate::ledger::read_fees(state);
+        let acct = load_existing_account(state, &tx.account);
+        let owner_count = acct.as_ref().map(|a| a.owner_count).unwrap_or(0);
+        let owner_delta = owner_count_deltas.get(&tx.account).copied().unwrap_or(0) as i64;
+        let effective_owner_count = (owner_count as i64 + owner_delta).max(0) as u64;
+        let required = fees
+            .reserve
+            .saturating_add((effective_owner_count + 1).saturating_mul(fees.increment));
+        if pre_fee_balance < required {
+            if crossed_any {
+                remaining_pays = zero_amount_like(&remaining_pays);
+                remaining_gets = zero_amount_like(&remaining_gets);
+            } else {
+                return ApplyResult::ClaimedCost("tecINSUF_RESERVE_OFFER");
+            }
+        }
+
+        if !amount_is_zero(&remaining_pays) && !amount_is_zero(&remaining_gets) {
+            let offer_key = crate::ledger::offer::shamap_key(&tx.account, offer_seq);
+            let owner_node = directory::dir_add(state, &tx.account, offer_key.0);
+            let book_key =
+                BookKey::from_amounts_with_domain(&remaining_pays, &remaining_gets, tx.domain_id);
+            // rippled preserves the offer's original uRate for the standing
+            // remainder. Recomputing from partially-filled amounts moves the
+            // residual offer into the wrong quality directory.
+            let book_quality = original_book_quality;
+            let (book_directory, book_node) =
+                directory::dir_add_book(state, &book_key, book_quality, offer_key.0);
+            let mut additional_books =
+                extract_additional_books_from_signing_payload(&tx.signing_payload);
+            if (tx.flags & TF_HYBRID) != 0 && tx.domain_id.is_some() {
+                let open_book_key = BookKey::from_amounts(&remaining_pays, &remaining_gets);
+                let (open_book_directory, _) =
+                    directory::dir_add_book(state, &open_book_key, book_quality, offer_key.0);
+                if !additional_books.contains(&open_book_directory.0) {
+                    additional_books.push(open_book_directory.0);
+                }
+            }
+            let offer = build_standing_offer(
+                tx,
+                offer_seq,
+                remaining_pays,
+                remaining_gets,
+                book_directory.0,
+                book_node,
+                owner_node,
+                additional_books,
+            );
+            state.insert_offer(offer);
+            *owner_count_deltas.entry(tx.account).or_insert(0) += 1;
+        }
     }
 
     // Update owner counts via explicit deltas — NOT by recomputing from
@@ -1049,62 +1532,41 @@ pub(crate) fn apply_offer_create(
         }
     }
 
+    if fok_atomic_crossing {
+        let _commit = state.commit_tx();
+    }
+
     ApplyResult::Success
 }
 
-fn normalize_ratio(num: i128, num_exp: i32, den: i128, den_exp: i32) -> (i128, i128) {
-    if den <= 0 {
-        return (0, 1);
-    }
-    if num <= 0 {
-        return (0, 1);
-    }
-    if num_exp == den_exp {
-        return (num, den);
-    }
-    if num_exp > den_exp {
-        let shift = (num_exp - den_exp).min(38) as u32;
-        (num.saturating_mul(10i128.pow(shift)), den)
-    } else {
-        let shift = (den_exp - num_exp).min(38) as u32;
-        (num, den.saturating_mul(10i128.pow(shift)))
+fn remove_offer_keys_and_decrement_owners(state: &mut LedgerState, keys: &[crate::ledger::Key]) {
+    for key in keys {
+        if let Some(deleted) = delete_offer_from_dirs(state, key) {
+            decrement_account_owner_count(state, &deleted.offer.account);
+        }
     }
 }
 
-fn min_ratio(a: (i128, i128), b: (i128, i128)) -> (i128, i128) {
-    let (an, ad) = a;
-    let (bn, bd) = b;
-    if an <= 0 || ad <= 0 {
-        return (0, 1);
-    }
-    if bn <= 0 || bd <= 0 {
-        return (0, 1);
-    }
-    match an.checked_mul(bd).zip(bn.checked_mul(ad)) {
-        Some((lhs, rhs)) => {
-            if lhs <= rhs {
-                a
-            } else {
-                b
-            }
-        }
-        None => {
-            // Rare overflow on cross-multiply: fall back to conservative lower bound.
-            if an.saturating_mul(bd) <= bn.saturating_mul(ad) {
-                a
-            } else {
-                b
-            }
-        }
+fn decrement_account_owner_count(state: &mut LedgerState, account: &[u8; 20]) {
+    if let Some(acct) = load_existing_account(state, account) {
+        let mut updated = acct.clone();
+        updated.owner_count = updated.owner_count.saturating_sub(1);
+        state.insert_account(updated);
     }
 }
 
 /// Apply an OfferCancel: remove a standing offer from the DEX.
 pub(crate) fn apply_offer_cancel(state: &mut LedgerState, tx: &ParsedTx) -> ApplyResult {
     let target_seq = match tx.offer_sequence {
+        Some(0) | None => return ApplyResult::ClaimedCost("temBAD_SEQUENCE"),
         Some(s) => s,
-        None => return ApplyResult::ClaimedCost("temMALFORMED"),
     };
+
+    if let Some(acct) = load_existing_account(state, &tx.account) {
+        if acct.sequence <= target_seq {
+            return ApplyResult::ClaimedCost("temBAD_SEQUENCE");
+        }
+    }
 
     let key = crate::ledger::offer::shamap_key(&tx.account, target_seq);
     if state.get_offer(&key).is_none() {
@@ -1117,11 +1579,9 @@ pub(crate) fn apply_offer_cancel(state: &mut LedgerState, tx: &ParsedTx) -> Appl
             }
         }
     }
-    if let Some(_removed) = state.remove_offer(&key) {
-        let owner_root = directory::owner_dir_key(&tx.account);
-        if !(directory::dir_remove_root_page(state, &owner_root, _removed.owner_node, &key.0)
-            || directory::dir_remove(state, &tx.account, &key.0))
-        {
+    if let Some(deleted) = delete_offer_from_dirs(state, &key) {
+        let removed = deleted.offer;
+        if !deleted.owner_removed {
             let owner_still_has_entry =
                 directory::owner_dir_contains_entry(state, &tx.account, &key.0);
             tracing::warn!(
@@ -1131,36 +1591,18 @@ pub(crate) fn apply_offer_cancel(state: &mut LedgerState, tx: &ParsedTx) -> Appl
                 owner_still_has_entry,
             );
         }
-        if _removed.book_directory != [0u8; 32] {
-            if !(directory::dir_remove_root_page(
-                state,
-                &crate::ledger::Key(_removed.book_directory),
-                _removed.book_node,
-                &key.0,
-            ) || directory::dir_remove_root(
-                state,
-                &crate::ledger::Key(_removed.book_directory),
-                &key.0,
-            )) {
-                let owner_still_has_entry =
-                    directory::owner_dir_contains_entry(state, &tx.account, &key.0);
-                tracing::warn!(
-                    "offer cancel book-dir remove miss: account={} seq={} owner_has_entry={}",
-                    hex::encode_upper(tx.account),
-                    target_seq,
-                    owner_still_has_entry,
-                );
-            }
-        }
-        for book_directory in &_removed.additional_books {
-            directory::dir_remove_root(state, &crate::ledger::Key(*book_directory), &key.0);
+        if !deleted.book_removed {
+            let owner_still_has_entry =
+                directory::owner_dir_contains_entry(state, &tx.account, &key.0);
+            tracing::warn!(
+                "offer cancel book-dir remove miss: account={} seq={} owner_has_entry={}",
+                hex::encode_upper(tx.account),
+                target_seq,
+                owner_still_has_entry,
+            );
         }
 
-        if let Some(acct) = load_existing_account(state, &tx.account) {
-            let mut updated = acct.clone();
-            updated.owner_count = updated.owner_count.saturating_sub(1);
-            state.insert_account(updated);
-        }
+        decrement_account_owner_count(state, &removed.account);
     }
 
     ApplyResult::Success
@@ -1169,6 +1611,147 @@ pub(crate) fn apply_offer_cancel(state: &mut LedgerState, tx: &ParsedTx) -> Appl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::{AccountRoot, Offer, RippleState};
+    use crate::transaction::amount::Currency;
+
+    fn account(account_id: [u8; 20], balance: u64) -> AccountRoot {
+        AccountRoot {
+            account_id,
+            balance,
+            sequence: 1,
+            owner_count: 0,
+            flags: 0,
+            regular_key: None,
+            minted_nftokens: 0,
+            first_nftoken_sequence: 0,
+            burned_nftokens: 0,
+            transfer_rate: 0,
+            domain: Vec::new(),
+            tick_size: 0,
+            ticket_count: 0,
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        }
+    }
+
+    fn iou(currency: Currency, issuer: [u8; 20], value: f64) -> Amount {
+        Amount::Iou {
+            value: IouValue::from_f64(value),
+            currency,
+            issuer,
+        }
+    }
+
+    fn offer(account: [u8; 20], sequence: u32, pays: Amount, gets: Amount) -> Offer {
+        let book_key = BookKey::from_amounts(&pays, &gets);
+        let quality = directory::offer_quality(&gets, &pays);
+        let book_directory = directory::book_dir_quality_key(&book_key, quality).0;
+        Offer {
+            account,
+            sequence,
+            taker_pays: pays,
+            taker_gets: gets,
+            flags: 0,
+            book_directory,
+            book_node: 0,
+            owner_node: 0,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        }
+    }
+
+    fn allow_iou(
+        state: &mut LedgerState,
+        holder: [u8; 20],
+        issuer: [u8; 20],
+        currency: Currency,
+        limit: f64,
+    ) {
+        let mut line = state
+            .get_trustline(&crate::ledger::trustline::shamap_key(
+                &holder, &issuer, &currency,
+            ))
+            .cloned()
+            .unwrap_or_else(|| RippleState::new(&holder, &issuer, currency));
+        line.set_limit_for(&holder, IouValue::from_f64(limit));
+        state.insert_trustline(line);
+    }
+
+    fn fund_iou(
+        state: &mut LedgerState,
+        holder: [u8; 20],
+        issuer: [u8; 20],
+        currency: Currency,
+        value: f64,
+    ) {
+        let mut line = state
+            .get_trustline(&crate::ledger::trustline::shamap_key(
+                &holder, &issuer, &currency,
+            ))
+            .cloned()
+            .unwrap_or_else(|| RippleState::new(&holder, &issuer, currency));
+        line.transfer(&issuer, &IouValue::from_f64(value));
+        state.insert_trustline(line);
+    }
+
+    fn insert_xrp_iou_amm_pool(
+        state: &mut LedgerState,
+        amm_account: [u8; 20],
+        issuer: [u8; 20],
+        currency: Currency,
+        xrp_reserve: u64,
+        iou_reserve: f64,
+    ) {
+        let issue = Issue::Iou {
+            currency: currency.clone(),
+            issuer,
+        };
+        let amm_id = crate::ledger::tx::amm::amm_key(&Issue::Xrp, &issue);
+        let mut pseudo = account(amm_account, xrp_reserve);
+        pseudo.raw_sle = Some(crate::ledger::meta::patch_sle(
+            &pseudo.encode(),
+            &[crate::ledger::meta::ParsedField {
+                type_code: 5,
+                field_code: 14,
+                data: amm_id.0.to_vec(),
+            }],
+            None,
+            None,
+            &[],
+        ));
+        state.insert_account(pseudo);
+        state.insert_raw(
+            amm_id,
+            crate::ledger::meta::build_sle(
+                0x0079,
+                &[
+                    crate::ledger::meta::ParsedField {
+                        type_code: 8,
+                        field_code: 1,
+                        data: amm_account.to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 24,
+                        field_code: 3,
+                        data: Issue::Xrp.to_bytes(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 24,
+                        field_code: 4,
+                        data: issue.to_bytes(),
+                    },
+                ],
+                None,
+                None,
+            ),
+        );
+        fund_iou(state, amm_account, issuer, currency, iou_reserve);
+    }
 
     fn build_additional_books_payload(books: &[[u8; 32]]) -> Vec<u8> {
         let mut payload = PREFIX_TX_SIGN.to_vec();
@@ -1181,6 +1764,55 @@ mod tests {
         payload.extend_from_slice(&raw);
         payload.push(0xE1);
         payload
+    }
+
+    #[test]
+    fn offer_funding_requires_issuer_side_auth_for_taker_gets() {
+        let holder = [1u8; 20];
+        let issuer = [2u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let mut state = LedgerState::new();
+        state.insert_account(account(holder, 2_000_000));
+        let mut issuer_account = account(issuer, 2_000_000);
+        issuer_account.flags |= LSF_REQUIRE_AUTH;
+        state.insert_account(issuer_account);
+
+        let mut line = RippleState::new(&holder, &issuer, usd.clone());
+        line.transfer(&issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(line.clone());
+
+        assert_eq!(
+            spendable_iou_funds_for_offer(&mut state, &holder, &issuer, &usd),
+            IouValue::ZERO
+        );
+
+        line.flags |= auth_flag_for_issuer(&issuer, &line).unwrap();
+        state.insert_trustline(line);
+
+        assert_eq!(
+            spendable_iou_funds_for_offer(&mut state, &holder, &issuer, &usd),
+            IouValue::from_f64(10.0)
+        );
+    }
+
+    fn permissioned_domain_sle(owner: [u8; 20]) -> Vec<u8> {
+        crate::ledger::meta::build_sle(
+            0x0082,
+            &[
+                crate::ledger::meta::ParsedField {
+                    type_code: 8,
+                    field_code: 2,
+                    data: owner.to_vec(),
+                },
+                crate::ledger::meta::ParsedField {
+                    type_code: 15,
+                    field_code: 28,
+                    data: vec![0xF1],
+                },
+            ],
+            None,
+            None,
+        )
     }
 
     #[test]
@@ -1220,8 +1852,16 @@ mod tests {
             ..ParsedTx::default()
         };
 
-        let offer =
-            build_standing_offer(&tx, 42, Amount::Xrp(15), Amount::Xrp(10), [0x55; 32], 7, 9);
+        let offer = build_standing_offer(
+            &tx,
+            42,
+            Amount::Xrp(15),
+            Amount::Xrp(10),
+            [0x55; 32],
+            7,
+            9,
+            extract_additional_books_from_signing_payload(&tx.signing_payload),
+        );
 
         assert_eq!(offer.account, tx.account);
         assert_eq!(offer.sequence, 42);
@@ -1230,5 +1870,576 @@ mod tests {
         assert_eq!(offer.owner_node, 9);
         assert_eq!(offer.domain_id, Some([0x44; 32]));
         assert_eq!(offer.additional_books, books);
+    }
+
+    #[test]
+    fn offer_create_rejects_zero_offer_sequence() {
+        let mut state = LedgerState::new();
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: [1u8; 20],
+            sequence: 1,
+            offer_sequence: Some(0),
+            taker_pays: Some(Amount::Xrp(1)),
+            taker_gets: Some(Amount::Xrp(2)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(
+            apply_offer_create(&mut state, &tx, 0),
+            ApplyResult::ClaimedCost("temBAD_SEQUENCE")
+        );
+    }
+
+    #[test]
+    fn offer_create_rejects_hybrid_without_domain_id() {
+        let mut state = LedgerState::new();
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: [1u8; 20],
+            sequence: 1,
+            flags: TF_HYBRID,
+            taker_pays: Some(Amount::Xrp(1)),
+            taker_gets: Some(Amount::Xrp(2)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(
+            apply_offer_create(&mut state, &tx, 0),
+            ApplyResult::ClaimedCost("temINVALID_FLAG")
+        );
+    }
+
+    #[test]
+    fn offer_create_rejects_unknown_permissioned_domain() {
+        let mut state = LedgerState::new();
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: [1u8; 20],
+            sequence: 1,
+            domain_id: Some([0x44; 32]),
+            taker_pays: Some(Amount::Xrp(1)),
+            taker_gets: Some(iou(Currency::from_code("USD").unwrap(), [1u8; 20], 1.0)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(
+            apply_offer_create(&mut state, &tx, 0),
+            ApplyResult::ClaimedCost("tecNO_PERMISSION")
+        );
+    }
+
+    #[test]
+    fn offer_create_allows_permissioned_domain_owner() {
+        let owner = [1u8; 20];
+        let domain_id = [0x44; 32];
+        let mut state = LedgerState::new();
+        state.insert_account(account(owner, 50_000_000));
+        state.insert_raw(
+            crate::ledger::Key(domain_id),
+            permissioned_domain_sle(owner),
+        );
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: owner,
+            sequence: 1,
+            domain_id: Some(domain_id),
+            taker_pays: Some(Amount::Xrp(1_000)),
+            taker_gets: Some(iou(Currency::from_code("USD").unwrap(), owner, 1.0)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(apply_offer_create(&mut state, &tx, 0), ApplyResult::Success);
+    }
+
+    #[test]
+    fn offer_create_treats_issuer_frozen_taker_gets_as_unfunded() {
+        let maker = [1u8; 20];
+        let issuer = [2u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let mut state = LedgerState::new();
+        state.insert_account(account(maker, 1_000_000));
+        state.insert_account(account(issuer, 1_000_000));
+
+        let mut line = RippleState::new(&maker, &issuer, usd.clone());
+        line.transfer(&issuer, &IouValue::from_f64(10.0));
+        if issuer == line.low_account {
+            line.flags |= LSF_LOW_FREEZE;
+        } else {
+            line.flags |= LSF_HIGH_FREEZE;
+        }
+        state.insert_trustline(line);
+
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: maker,
+            sequence: 1,
+            taker_pays: Some(Amount::Xrp(1_000)),
+            taker_gets: Some(iou(usd, issuer, 10.0)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(
+            apply_offer_create(&mut state, &tx, 0),
+            ApplyResult::ClaimedCost("tecUNFUNDED_OFFER")
+        );
+    }
+
+    #[test]
+    fn offer_create_treats_frozen_underlying_lp_taker_gets_as_unfunded() {
+        let maker = [1u8; 20];
+        let issuer = [2u8; 20];
+        let amm_account = [3u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let usd_issue = Issue::Iou {
+            currency: usd.clone(),
+            issuer,
+        };
+        let lp_currency = crate::ledger::tx::amm::amm_lp_currency(&Currency::xrp(), &usd);
+        let amm_id = crate::ledger::tx::amm::amm_key(&Issue::Xrp, &usd_issue);
+
+        let mut state = LedgerState::new();
+        state.insert_account(account(maker, 1_000_000));
+        let mut frozen_issuer = account(issuer, 1_000_000);
+        frozen_issuer.flags |= LSF_GLOBAL_FREEZE;
+        state.insert_account(frozen_issuer);
+        let mut pseudo = account(amm_account, 0);
+        pseudo.raw_sle = Some(crate::ledger::meta::patch_sle(
+            &pseudo.encode(),
+            &[crate::ledger::meta::ParsedField {
+                type_code: 5,
+                field_code: 14,
+                data: amm_id.0.to_vec(),
+            }],
+            None,
+            None,
+            &[],
+        ));
+        state.insert_account(pseudo);
+        state.insert_raw(
+            amm_id,
+            crate::ledger::meta::build_sle(
+                0x0079,
+                &[
+                    crate::ledger::meta::ParsedField {
+                        type_code: 8,
+                        field_code: 1,
+                        data: amm_account.to_vec(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 24,
+                        field_code: 3,
+                        data: Issue::Xrp.to_bytes(),
+                    },
+                    crate::ledger::meta::ParsedField {
+                        type_code: 24,
+                        field_code: 4,
+                        data: usd_issue.to_bytes(),
+                    },
+                ],
+                None,
+                None,
+            ),
+        );
+
+        let mut lp_line = RippleState::new(&maker, &amm_account, lp_currency.clone());
+        lp_line.transfer(&amm_account, &IouValue::from_f64(10.0));
+        state.insert_trustline(lp_line);
+
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: maker,
+            sequence: 1,
+            taker_pays: Some(Amount::Xrp(1_000)),
+            taker_gets: Some(iou(lp_currency, amm_account, 10.0)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(
+            apply_offer_create(&mut state, &tx, 0),
+            ApplyResult::ClaimedCost("tecUNFUNDED_OFFER")
+        );
+    }
+
+    #[test]
+    fn offer_create_prefers_better_amm_over_worse_clob_offer() {
+        let taker = [9u8; 20];
+        let maker = [1u8; 20];
+        let issuer = [2u8; 20];
+        let amm_account = [3u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let mut state = LedgerState::new();
+        state.insert_account(account(taker, 100_000_000));
+        state.insert_account(account(maker, 1_000_000));
+        state.insert_account(account(issuer, 0));
+        allow_iou(&mut state, taker, issuer, usd.clone(), 100.0);
+        fund_iou(&mut state, maker, issuer, usd.clone(), 10.0);
+        insert_xrp_iou_amm_pool(
+            &mut state,
+            amm_account,
+            issuer,
+            usd.clone(),
+            1_000_000,
+            100.0,
+        );
+
+        let clob = offer(
+            maker,
+            1,
+            Amount::Xrp(150_000),
+            iou(usd.clone(), issuer, 10.0),
+        );
+        let clob_key = clob.key();
+        state.insert_offer(clob);
+
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: taker,
+            sequence: 1,
+            taker_pays: Some(iou(usd.clone(), issuer, 10.0)),
+            taker_gets: Some(Amount::Xrp(200_000)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(apply_offer_create(&mut state, &tx, 0), ApplyResult::Success);
+        assert!(
+            state.get_offer(&clob_key).is_some(),
+            "worse CLOB liquidity must not block a better AMM fill"
+        );
+        assert!(
+            state.get_account(&amm_account).unwrap().balance > 1_000_000,
+            "AMM should receive the taker's XRP input"
+        );
+        let line = state
+            .get_trustline_for(&taker, &issuer, &usd)
+            .expect("taker trustline");
+        assert_eq!(line.balance_for(&taker), IouValue::from_f64(10.0));
+    }
+
+    #[test]
+    fn fok_killed_preserves_stale_frozen_offer_removal() {
+        const TF_FILL_OR_KILL: u32 = 0x0004_0000;
+
+        let maker = [1u8; 20];
+        let taker = [3u8; 20];
+        let issuer = [2u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let mut state = LedgerState::new();
+        state.insert_account(account(maker, 1_000_000));
+        state.insert_account(account(taker, 100_000_000));
+        state.insert_account(account(issuer, 1_000_000));
+
+        let mut line = RippleState::new(&maker, &issuer, usd.clone());
+        line.transfer(&issuer, &IouValue::from_f64(10.0));
+        if issuer == line.low_account {
+            line.flags |= LSF_LOW_FREEZE;
+        } else {
+            line.flags |= LSF_HIGH_FREEZE;
+        }
+        state.insert_trustline(line);
+
+        let stale = offer(maker, 1, Amount::Xrp(1_000), iou(usd.clone(), issuer, 10.0));
+        let stale_key = stale.key();
+        state.insert_offer(stale);
+
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: taker,
+            sequence: 1,
+            flags: TF_FILL_OR_KILL,
+            taker_pays: Some(iou(usd, issuer, 10.0)),
+            taker_gets: Some(Amount::Xrp(1_000)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(
+            apply_offer_create(&mut state, &tx, 0),
+            ApplyResult::ClaimedCost("tecKILLED")
+        );
+        assert!(
+            state.get_offer(&stale_key).is_none(),
+            "FOK rollback should preserve stale frozen offer deletion"
+        );
+        assert!(
+            state.offers_by_account(&taker).is_empty(),
+            "killed FOK must not place a taker remainder"
+        );
+        assert_eq!(state.get_account(&taker).unwrap().balance, 100_000_000);
+    }
+
+    #[test]
+    fn sell_offer_create_can_autobridge_iou_to_iou_through_xrp() {
+        let taker = [9u8; 20];
+        let usd_issuer = [1u8; 20];
+        let eur_issuer = [2u8; 20];
+        let xrp_maker = [3u8; 20];
+        let eur_maker = [4u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let eur = Currency::from_code("EUR").unwrap();
+
+        let mut state = LedgerState::new();
+        state.insert_account(account(taker, 1_001_000));
+        state.insert_account(account(usd_issuer, 1_000));
+        state.insert_account(account(eur_issuer, 1_000));
+        state.insert_account(account(xrp_maker, 2_000_000));
+        state.insert_account(account(eur_maker, 1_001_000));
+
+        let mut taker_usd = RippleState::new(&taker, &usd_issuer, usd.clone());
+        taker_usd.transfer(&usd_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(taker_usd);
+
+        let mut xrp_maker_usd = RippleState::new(&xrp_maker, &usd_issuer, usd.clone());
+        xrp_maker_usd.set_limit_for(&xrp_maker, IouValue::from_f64(20.0));
+        state.insert_trustline(xrp_maker_usd);
+
+        let mut taker_eur = RippleState::new(&taker, &eur_issuer, eur.clone());
+        taker_eur.set_limit_for(&taker, IouValue::from_f64(20.0));
+        state.insert_trustline(taker_eur);
+
+        let mut maker_eur = RippleState::new(&eur_maker, &eur_issuer, eur.clone());
+        maker_eur.transfer(&eur_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(maker_eur);
+
+        state.insert_offer(offer(
+            xrp_maker,
+            1,
+            iou(usd.clone(), usd_issuer, 10.0),
+            Amount::Xrp(100),
+        ));
+        state.insert_offer(offer(
+            eur_maker,
+            1,
+            Amount::Xrp(100),
+            iou(eur.clone(), eur_issuer, 10.0),
+        ));
+
+        let result = try_offer_create_xrp_autobridge_sell(
+            &mut state,
+            taker,
+            &iou(usd.clone(), usd_issuer, 10.0),
+            &iou(eur.clone(), eur_issuer, 10.0),
+            0,
+            None,
+        )
+        .expect("autobridge should cross");
+
+        assert_eq!(result.0, FlowAmount::new(iou(usd, usd_issuer, 10.0)));
+        assert_eq!(
+            result.1,
+            FlowAmount::new(iou(eur.clone(), eur_issuer, 10.0))
+        );
+        let taker_eur = state
+            .get_trustline_for(&taker, &eur_issuer, &eur)
+            .expect("taker eur line");
+        assert_eq!(taker_eur.balance_for(&taker), IouValue::from_f64(10.0));
+        assert_eq!(state.get_account(&taker).unwrap().balance, 1_001_000);
+    }
+
+    #[test]
+    fn apply_offer_create_uses_sell_iou_iou_xrp_autobridge() {
+        let taker = [9u8; 20];
+        let usd_issuer = [1u8; 20];
+        let eur_issuer = [2u8; 20];
+        let xrp_maker = [3u8; 20];
+        let eur_maker = [4u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let eur = Currency::from_code("EUR").unwrap();
+
+        let mut state = LedgerState::new();
+        state.insert_account(account(taker, 50_000_000));
+        state.insert_account(account(usd_issuer, 1_000));
+        state.insert_account(account(eur_issuer, 1_000));
+        state.insert_account(account(xrp_maker, 2_000_000));
+        state.insert_account(account(eur_maker, 1_001_000));
+
+        let mut taker_usd = RippleState::new(&taker, &usd_issuer, usd.clone());
+        taker_usd.transfer(&usd_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(taker_usd);
+
+        let mut xrp_maker_usd = RippleState::new(&xrp_maker, &usd_issuer, usd.clone());
+        xrp_maker_usd.set_limit_for(&xrp_maker, IouValue::from_f64(20.0));
+        state.insert_trustline(xrp_maker_usd);
+
+        let mut taker_eur = RippleState::new(&taker, &eur_issuer, eur.clone());
+        taker_eur.set_limit_for(&taker, IouValue::from_f64(20.0));
+        state.insert_trustline(taker_eur);
+
+        let mut maker_eur = RippleState::new(&eur_maker, &eur_issuer, eur.clone());
+        maker_eur.transfer(&eur_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(maker_eur);
+
+        state.insert_offer(offer(
+            xrp_maker,
+            1,
+            iou(usd.clone(), usd_issuer, 10.0),
+            Amount::Xrp(100),
+        ));
+        state.insert_offer(offer(
+            eur_maker,
+            1,
+            Amount::Xrp(100),
+            iou(eur.clone(), eur_issuer, 10.0),
+        ));
+
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: taker,
+            sequence: 1,
+            flags: TF_SELL,
+            taker_pays: Some(iou(eur.clone(), eur_issuer, 10.0)),
+            taker_gets: Some(iou(usd.clone(), usd_issuer, 10.0)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(apply_offer_create(&mut state, &tx, 0), ApplyResult::Success);
+        assert!(
+            state.offers_by_account(&taker).is_empty(),
+            "fully sold autobridged offer must not leave a standing remainder"
+        );
+        let taker_usd = state
+            .get_trustline_for(&taker, &usd_issuer, &usd)
+            .expect("taker usd line");
+        let taker_eur = state
+            .get_trustline_for(&taker, &eur_issuer, &eur)
+            .expect("taker eur line");
+        assert_eq!(taker_usd.balance_for(&taker), IouValue::ZERO);
+        assert_eq!(taker_eur.balance_for(&taker), IouValue::from_f64(10.0));
+    }
+
+    #[test]
+    fn buy_offer_create_can_autobridge_iou_to_iou_through_xrp() {
+        let taker = [9u8; 20];
+        let usd_issuer = [1u8; 20];
+        let eur_issuer = [2u8; 20];
+        let xrp_maker = [3u8; 20];
+        let eur_maker = [4u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let eur = Currency::from_code("EUR").unwrap();
+
+        let mut state = LedgerState::new();
+        state.insert_account(account(taker, 1_001_000));
+        state.insert_account(account(usd_issuer, 1_000));
+        state.insert_account(account(eur_issuer, 1_000));
+        state.insert_account(account(xrp_maker, 2_000_000));
+        state.insert_account(account(eur_maker, 1_001_000));
+
+        let mut taker_usd = RippleState::new(&taker, &usd_issuer, usd.clone());
+        taker_usd.transfer(&usd_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(taker_usd);
+
+        let mut xrp_maker_usd = RippleState::new(&xrp_maker, &usd_issuer, usd.clone());
+        xrp_maker_usd.set_limit_for(&xrp_maker, IouValue::from_f64(20.0));
+        state.insert_trustline(xrp_maker_usd);
+
+        let mut taker_eur = RippleState::new(&taker, &eur_issuer, eur.clone());
+        taker_eur.set_limit_for(&taker, IouValue::from_f64(20.0));
+        state.insert_trustline(taker_eur);
+
+        let mut maker_eur = RippleState::new(&eur_maker, &eur_issuer, eur.clone());
+        maker_eur.transfer(&eur_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(maker_eur);
+
+        state.insert_offer(offer(
+            xrp_maker,
+            1,
+            iou(usd.clone(), usd_issuer, 10.0),
+            Amount::Xrp(100),
+        ));
+        state.insert_offer(offer(
+            eur_maker,
+            1,
+            Amount::Xrp(100),
+            iou(eur.clone(), eur_issuer, 10.0),
+        ));
+
+        let result = try_offer_create_xrp_autobridge_buy(
+            &mut state,
+            taker,
+            &iou(usd.clone(), usd_issuer, 10.0),
+            &iou(eur.clone(), eur_issuer, 10.0),
+            0,
+            None,
+        )
+        .expect("autobridge should cross exact output");
+
+        assert_eq!(result.0, FlowAmount::new(iou(usd, usd_issuer, 10.0)));
+        assert_eq!(
+            result.1,
+            FlowAmount::new(iou(eur.clone(), eur_issuer, 10.0))
+        );
+        let taker_eur = state
+            .get_trustline_for(&taker, &eur_issuer, &eur)
+            .expect("taker eur line");
+        assert_eq!(taker_eur.balance_for(&taker), IouValue::from_f64(10.0));
+    }
+
+    #[test]
+    fn apply_offer_create_uses_buy_iou_iou_xrp_autobridge() {
+        let taker = [9u8; 20];
+        let usd_issuer = [1u8; 20];
+        let eur_issuer = [2u8; 20];
+        let xrp_maker = [3u8; 20];
+        let eur_maker = [4u8; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let eur = Currency::from_code("EUR").unwrap();
+
+        let mut state = LedgerState::new();
+        state.insert_account(account(taker, 50_000_000));
+        state.insert_account(account(usd_issuer, 1_000));
+        state.insert_account(account(eur_issuer, 1_000));
+        state.insert_account(account(xrp_maker, 2_000_000));
+        state.insert_account(account(eur_maker, 1_000));
+
+        let mut taker_usd = RippleState::new(&taker, &usd_issuer, usd.clone());
+        taker_usd.transfer(&usd_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(taker_usd);
+
+        let mut xrp_maker_usd = RippleState::new(&xrp_maker, &usd_issuer, usd.clone());
+        xrp_maker_usd.set_limit_for(&xrp_maker, IouValue::from_f64(20.0));
+        state.insert_trustline(xrp_maker_usd);
+
+        let mut taker_eur = RippleState::new(&taker, &eur_issuer, eur.clone());
+        taker_eur.set_limit_for(&taker, IouValue::from_f64(20.0));
+        state.insert_trustline(taker_eur);
+
+        let mut maker_eur = RippleState::new(&eur_maker, &eur_issuer, eur.clone());
+        maker_eur.transfer(&eur_issuer, &IouValue::from_f64(10.0));
+        state.insert_trustline(maker_eur);
+
+        state.insert_offer(offer(
+            xrp_maker,
+            1,
+            iou(usd.clone(), usd_issuer, 10.0),
+            Amount::Xrp(100),
+        ));
+        state.insert_offer(offer(
+            eur_maker,
+            1,
+            Amount::Xrp(100),
+            iou(eur.clone(), eur_issuer, 10.0),
+        ));
+
+        let tx = ParsedTx {
+            tx_type: 7,
+            account: taker,
+            sequence: 1,
+            taker_pays: Some(iou(eur.clone(), eur_issuer, 10.0)),
+            taker_gets: Some(iou(usd.clone(), usd_issuer, 10.0)),
+            ..ParsedTx::default()
+        };
+
+        assert_eq!(apply_offer_create(&mut state, &tx, 0), ApplyResult::Success);
+        assert!(
+            state.offers_by_account(&taker).is_empty(),
+            "fully bought autobridged offer must not leave a standing remainder"
+        );
+        let taker_usd = state
+            .get_trustline_for(&taker, &usd_issuer, &usd)
+            .expect("taker usd line");
+        let taker_eur = state
+            .get_trustline_for(&taker, &eur_issuer, &eur)
+            .expect("taker eur line");
+        assert_eq!(taker_usd.balance_for(&taker), IouValue::ZERO);
+        assert_eq!(taker_eur.balance_for(&taker), IouValue::from_f64(10.0));
     }
 }

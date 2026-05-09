@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Relay support for XRPL peer networking.
 //! Peer message relay helpers for broadcasting consensus and transaction
 //! messages over RTXP.
 //!
@@ -63,19 +62,8 @@ pub fn decode_proposal(data: &[u8]) -> Option<Proposal> {
 /// The `validation` field in `TmValidation` carries the serialized validation
 /// object.
 pub fn encode_validation(val: &Validation) -> RtxpMessage {
-    // Build a blob containing the validation fields.
-    let mut blob = Vec::with_capacity(128);
-    blob.extend_from_slice(&val.ledger_seq.to_be_bytes());
-    blob.extend_from_slice(&val.ledger_hash);
-    blob.extend_from_slice(&val.sign_time.to_be_bytes());
-    blob.push(val.is_full() as u8);
-    blob.push(val.node_pubkey.len() as u8);
-    blob.extend_from_slice(&val.node_pubkey);
-    blob.push(val.signature.len() as u8);
-    blob.extend_from_slice(&val.signature);
-
     let pb = proto::TmValidation {
-        validation: blob,
+        validation: val.to_bytes(),
         ..Default::default()
     };
     RtxpMessage::new(MessageType::Validation, pb.encode_to_vec())
@@ -84,251 +72,7 @@ pub fn encode_validation(val: &Validation) -> RtxpMessage {
 /// Deserialize a `Validation` from an RTXP `Validation` payload.
 pub fn decode_validation(data: &[u8]) -> Option<Validation> {
     let pb = proto::TmValidation::decode(data).ok()?;
-    let blob = &pb.validation;
-
-    // The validation blob is an XRPL-serialized STObject with field headers.
-    // Parse it by walking the encoded field prefixes.
-    let mut pos = 0;
-    let mut ledger_seq: u32 = 0;
-    let mut ledger_hash = [0u8; 32];
-    let mut sign_time: u32 = 0;
-    let mut flags: u32 = 0;
-    let mut node_pubkey = Vec::new();
-    let mut signature = Vec::new();
-
-    while pos < blob.len() {
-        let header = blob[pos];
-        pos += 1;
-        let mut type_code = (header >> 4) & 0x0F;
-        let mut field_code = (header & 0x0F) as u16;
-
-        // Extended type code.
-        if type_code == 0 {
-            if pos >= blob.len() {
-                break;
-            }
-            type_code = blob[pos];
-            pos += 1;
-        }
-
-        // Extended field code.
-        if field_code == 0 {
-            if pos >= blob.len() {
-                break;
-            }
-            field_code = blob[pos] as u16;
-            pos += 1;
-        }
-
-        match type_code {
-            1 => {
-                // UInt16: 2 bytes.
-                if pos + 2 > blob.len() {
-                    break;
-                }
-                pos += 2;
-            }
-            2 => {
-                // UInt32: 4 bytes.
-                if pos + 4 > blob.len() {
-                    break;
-                }
-                let val = u32::from_be_bytes(blob[pos..pos + 4].try_into().ok()?);
-                match field_code {
-                    2 => {
-                        flags = val;
-                    }
-                    6 => {
-                        ledger_seq = val;
-                    }
-                    9 => {
-                        sign_time = val;
-                    }
-                    _ => {}
-                }
-                pos += 4;
-            }
-            3 => {
-                // UInt64: 8 bytes.
-                if pos + 8 > blob.len() {
-                    break;
-                }
-                pos += 8;
-            }
-            4 => {
-                // Hash128: 16 bytes.
-                if pos + 16 > blob.len() {
-                    break;
-                }
-                pos += 16;
-            }
-            5 => {
-                // Hash256: 32 bytes.
-                if pos + 32 > blob.len() {
-                    break;
-                }
-                match field_code {
-                    1 => {
-                        ledger_hash.copy_from_slice(&blob[pos..pos + 32]);
-                    }
-                    23 => {}
-                    _ => {}
-                }
-                pos += 32;
-            }
-            6 => {
-                // Amount: variable length (XRP = 8 bytes, IOU = 48 bytes).
-                if pos + 8 > blob.len() {
-                    break;
-                }
-                let first = blob[pos];
-                if first & 0x80 != 0 && (first & 0x40 == 0) {
-                    // XRP amount.
-                    pos += 8;
-                } else {
-                    // IOU amount.
-                    if pos + 48 > blob.len() {
-                        break;
-                    }
-                    pos += 48;
-                }
-            }
-            7 => {
-                // Blob (VL): length-prefixed.
-                if pos >= blob.len() {
-                    break;
-                }
-                let (vl_len, vl_bytes) = decode_vl_length(&blob[pos..])?;
-                pos += vl_bytes;
-                if pos + vl_len > blob.len() {
-                    break;
-                }
-                match field_code {
-                    3 => {
-                        node_pubkey = blob[pos..pos + vl_len].to_vec();
-                    }
-                    6 => {
-                        signature = blob[pos..pos + vl_len].to_vec();
-                    }
-                    _ => {}
-                }
-                pos += vl_len;
-            }
-            8 => {
-                // AccountID (VL): length-prefixed.
-                if pos >= blob.len() {
-                    break;
-                }
-                let (vl_len, vl_bytes) = decode_vl_length(&blob[pos..])?;
-                pos += vl_bytes;
-                if pos + vl_len > blob.len() {
-                    break;
-                }
-                pos += vl_len;
-            }
-            14 => {
-                // STObject: skip the nested object.
-                // Read until the end-of-object marker (0xE1).
-                while pos < blob.len() && blob[pos] != 0xE1 {
-                    pos += 1;
-                }
-                if pos < blob.len() {
-                    pos += 1;
-                } // Skip 0xE1.
-            }
-            15 => {
-                // STArray: skip the nested array.
-                while pos < blob.len() && blob[pos] != 0xF1 {
-                    pos += 1;
-                }
-                if pos < blob.len() {
-                    pos += 1;
-                } // Skip 0xF1.
-            }
-            16 => {
-                // UInt8: 1 byte.
-                if pos >= blob.len() {
-                    break;
-                }
-                pos += 1;
-            }
-            17 => {
-                // Hash160: 20 bytes.
-                if pos + 20 > blob.len() {
-                    break;
-                }
-                pos += 20;
-            }
-            18 => {
-                // PathSet: variable length, skip to end marker 0x00.
-                while pos < blob.len() && blob[pos] != 0x00 {
-                    pos += 1;
-                }
-                if pos < blob.len() {
-                    pos += 1;
-                }
-            }
-            19 => {
-                // Vector256: VL-prefixed array of 32-byte hashes.
-                if pos >= blob.len() {
-                    break;
-                }
-                let (vl_len, vl_bytes) = decode_vl_length(&blob[pos..])?;
-                pos += vl_bytes;
-                if pos + vl_len > blob.len() {
-                    break;
-                }
-                pos += vl_len;
-            }
-            _ => {
-                // Unknown type: cannot continue parsing safely.
-                break;
-            }
-        }
-    }
-
-    if ledger_seq == 0 {
-        return None;
-    }
-
-    Some(Validation {
-        ledger_seq,
-        ledger_hash,
-        sign_time,
-        flags,
-        node_pubkey,
-        signature,
-        close_time: None,
-        consensus_hash: None,
-        validated_hash: None,
-        cookie: None,
-        server_version: None,
-    })
-}
-
-/// Decode XRPL variable-length encoding. Returns (length, bytes_consumed).
-fn decode_vl_length(data: &[u8]) -> Option<(usize, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-    let b0 = data[0] as usize;
-    if b0 <= 192 {
-        Some((b0, 1))
-    } else if b0 <= 240 {
-        if data.len() < 2 {
-            return None;
-        }
-        let len = 193 + ((b0 - 193) * 256) + data[1] as usize;
-        Some((len, 2))
-    } else if b0 <= 254 {
-        if data.len() < 3 {
-            return None;
-        }
-        let len = 12481 + ((b0 - 241) * 65536) + (data[1] as usize * 256) + data[2] as usize;
-        Some((len, 3))
-    } else {
-        None
-    }
+    Validation::from_bytes(&pb.validation)
 }
 
 // ── Manifest relay ────────────────────────────────────────────────────────────
@@ -475,22 +219,24 @@ pub fn decode_endpoints(data: &[u8]) -> Vec<SocketAddr> {
 
 /// Encode a ping message.
 pub fn encode_ping(seq: u32) -> RtxpMessage {
+    let now = unix_now();
     let pb = proto::TmPing {
         r#type: proto::tm_ping::PingType::PtPing as i32,
         seq: Some(seq),
-        ping_time: None,
-        net_time: None,
+        ping_time: Some(now),
+        net_time: Some(ripple_now()),
     };
     RtxpMessage::new(MessageType::Ping, pb.encode_to_vec())
 }
 
 /// Encode a pong message (reply to a ping).
 pub fn encode_pong(seq: u32) -> RtxpMessage {
+    let now = unix_now();
     let pb = proto::TmPing {
         r#type: proto::tm_ping::PingType::PtPong as i32,
         seq: Some(seq),
-        ping_time: None,
-        net_time: None,
+        ping_time: Some(now),
+        net_time: Some(ripple_now()),
     };
     RtxpMessage::new(MessageType::Ping, pb.encode_to_vec())
 }
@@ -511,15 +257,32 @@ pub fn encode_status_change(
     seq: u32,
     hash: &[u8; 32],
 ) -> RtxpMessage {
+    encode_status_change_full(status, event, seq, hash, None, None)
+}
+
+/// Encode a status change message with the optional fields rippled peers expect
+/// when advertising ledger continuity and validated range.
+pub fn encode_status_change_full(
+    status: proto::NodeStatus,
+    event: proto::NodeEvent,
+    seq: u32,
+    hash: &[u8; 32],
+    previous_hash: Option<&[u8; 32]>,
+    ledger_range: Option<(u32, u32)>,
+) -> RtxpMessage {
+    let (first_seq, last_seq) = ledger_range
+        .filter(|(first, last)| *first > 0 && last >= first)
+        .map(|(first, last)| (Some(first), Some(last)))
+        .unwrap_or((None, None));
     let pb = proto::TmStatusChange {
         new_status: Some(status as i32),
         new_event: Some(event as i32),
         ledger_seq: Some(seq),
         ledger_hash: Some(hash.to_vec()),
-        ledger_hash_previous: None,
-        network_time: None,
-        first_seq: None,
-        last_seq: None,
+        ledger_hash_previous: previous_hash.map(|h| h.to_vec()),
+        network_time: Some(ripple_now()),
+        first_seq,
+        last_seq,
     };
     RtxpMessage::new(MessageType::StatusChange, pb.encode_to_vec())
 }
@@ -553,11 +316,18 @@ pub fn encode_cluster(
 }
 
 fn unix_now_u32() -> u32 {
+    unix_now().min(u32::MAX as u64) as u32
+}
+
+fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-        .min(u32::MAX as u64) as u32
+}
+
+fn ripple_now() -> u64 {
+    unix_now().saturating_sub(946_684_800)
 }
 
 // ── Ledger sync (rippled-compatible TMGetLedger/TMLedgerData) ─────────────────
@@ -702,7 +472,6 @@ pub fn encode_get_state_nodes_by_hash(
     ledger_hash: &[u8; 32],
     nodes: &[([u8; 32], [u8; 33])],
     ledger_seq: u32,
-    seq: u32,
 ) -> RtxpMessage {
     let objects = nodes
         .iter()
@@ -718,7 +487,40 @@ pub fn encode_get_state_nodes_by_hash(
     let pb = crate::proto::TmGetObjectByHash {
         r#type: crate::proto::tm_get_object_by_hash::ObjectType::OtStateNode as i32,
         query: true,
-        seq: Some(seq),
+        ledger_hash: if ledger_hash.iter().all(|&b| b == 0) {
+            None
+        } else {
+            Some(ledger_hash.to_vec())
+        },
+        fat: None,
+        objects,
+    };
+    RtxpMessage::new(MessageType::GetObjects, pb.encode_to_vec())
+}
+
+/// Encode a TMGetObjectByHash fetch-pack request for state-tree node hashes.
+///
+/// rippled uses otFETCH_PACK as a NodeStore rescue path. The objects are
+/// content hashes, not SHAMap node IDs; replies carry verified NodeObject bytes.
+pub fn encode_get_fetch_pack(
+    ledger_hash: &[u8; 32],
+    hashes: &[[u8; 32]],
+    ledger_seq: u32,
+) -> RtxpMessage {
+    let objects = hashes
+        .iter()
+        .map(|hash| crate::proto::TmIndexedObject {
+            hash: Some(hash.to_vec()),
+            index: None,
+            data: None,
+            ledger_seq: Some(ledger_seq),
+            node_id: None,
+        })
+        .collect();
+
+    let pb = crate::proto::TmGetObjectByHash {
+        r#type: crate::proto::tm_get_object_by_hash::ObjectType::OtFetchPack as i32,
+        query: true,
         ledger_hash: if ledger_hash.iter().all(|&b| b == 0) {
             None
         } else {
@@ -793,15 +595,26 @@ pub fn encode_get_ledger_txs_for_hash_nodes(
 /// `set_hash` is the consensus_hash from validator validations.
 /// Peers that participated in the recent consensus round will have this set.
 pub fn encode_get_tx_set(set_hash: &[u8; 32], cookie: u64) -> RtxpMessage {
+    encode_get_tx_set_nodes(set_hash, &[vec![0u8; 33]], cookie, 3)
+}
+
+/// Encode a targeted liTS_CANDIDATE SHAMap-node request.
+pub fn encode_get_tx_set_nodes(
+    set_hash: &[u8; 32],
+    node_i_ds: &[Vec<u8>],
+    cookie: u64,
+    query_depth: u32,
+) -> RtxpMessage {
     let pb = proto::TmGetLedger {
         itype: proto::TmLedgerInfoType::LiTsCandidate as i32,
         ltype: None,
         ledger_hash: Some(set_hash.to_vec()),
         ledger_seq: Some(0), // rippled requires seq=0 for liTS_CANDIDATE
-        node_i_ds: vec![vec![0u8; 33]], // root node
+        node_i_ds: node_i_ds.to_vec(),
         request_cookie: if cookie != 0 { Some(cookie) } else { None },
-        query_type: None,
-        query_depth: Some(3),
+        // rippled relays unknown candidate-set requests only when qtINDIRECT is set.
+        query_type: Some(proto::TmQueryType::QtIndirect as i32),
+        query_depth: Some(query_depth),
     };
     RtxpMessage::new(MessageType::GetLedger, pb.encode_to_vec())
 }
@@ -1018,10 +831,20 @@ mod tests {
         assert_eq!(decoded.signature, orig.signature);
     }
 
-    // validation roundtrip test removed — encode_validation uses legacy format
-    // while decode_validation now parses rippled's STObject format.
-    // Validation encoding uses the legacy format, while decoding expects
-    // rippled's STObject layout, so only decode coverage remains here.
+    #[test]
+    fn test_validation_roundtrip_signed_stobject() {
+        let kp = Secp256k1KeyPair::generate();
+        let orig = Validation::new_signed(42, [0xAB; 32], 1_712_000_000, true, &kp);
+        let msg = encode_validation(&orig);
+        assert_eq!(msg.msg_type, MessageType::Validation);
+
+        let pb = proto::TmValidation::decode(msg.payload.as_slice()).unwrap();
+        assert_eq!(pb.validation, orig.to_bytes());
+
+        let decoded = decode_validation(&msg.payload).expect("decode should succeed");
+        assert_eq!(decoded, orig);
+        assert!(decoded.verify_signature());
+    }
 
     #[test]
     fn test_manifest_roundtrip() {
@@ -1103,15 +926,42 @@ mod tests {
     fn test_ping_pong() {
         let ping_msg = encode_ping(42);
         assert_eq!(ping_msg.msg_type, MessageType::Ping);
+        let ping_pb = proto::TmPing::decode(ping_msg.payload.as_slice()).unwrap();
+        assert!(ping_pb.ping_time.unwrap_or_default() > 0);
+        assert!(ping_pb.net_time.unwrap_or_default() > 0);
         let (is_ping, seq) = decode_ping(&ping_msg.payload).unwrap();
         assert!(is_ping);
         assert_eq!(seq, 42);
 
         let pong_msg = encode_pong(42);
         assert_eq!(pong_msg.msg_type, MessageType::Ping);
+        let pong_pb = proto::TmPing::decode(pong_msg.payload.as_slice()).unwrap();
+        assert!(pong_pb.ping_time.unwrap_or_default() > 0);
+        assert!(pong_pb.net_time.unwrap_or_default() > 0);
         let (is_ping, seq) = decode_ping(&pong_msg.payload).unwrap();
         assert!(!is_ping);
         assert_eq!(seq, 42);
+    }
+
+    #[test]
+    fn test_status_change_full_sets_timing_range_and_previous_hash() {
+        let hash = [0x11; 32];
+        let previous = [0x22; 32];
+        let msg = encode_status_change_full(
+            proto::NodeStatus::NsConnected,
+            proto::NodeEvent::NeAcceptedLedger,
+            42,
+            &hash,
+            Some(&previous),
+            Some((7, 42)),
+        );
+        let pb = proto::TmStatusChange::decode(msg.payload.as_slice()).unwrap();
+        assert_eq!(pb.ledger_seq, Some(42));
+        assert_eq!(pb.ledger_hash, Some(hash.to_vec()));
+        assert_eq!(pb.ledger_hash_previous, Some(previous.to_vec()));
+        assert_eq!(pb.first_seq, Some(7));
+        assert_eq!(pb.last_seq, Some(42));
+        assert!(pb.network_time.unwrap_or_default() > 0);
     }
 
     #[test]
@@ -1182,11 +1032,26 @@ mod tests {
 
     #[test]
     fn test_encode_get_state_nodes_by_hash_omits_zero_hash() {
-        let msg = encode_get_state_nodes_by_hash(&[0u8; 32], &[([0xAB; 32], [0u8; 33])], 10, 77);
+        let msg = encode_get_state_nodes_by_hash(&[0u8; 32], &[([0xAB; 32], [0u8; 33])], 10);
         let pb = proto::TmGetObjectByHash::decode(msg.payload.as_slice()).unwrap();
         assert!(pb.ledger_hash.is_none());
-        assert_eq!(pb.seq, Some(77));
         assert_eq!(pb.objects.len(), 1);
+        assert!(pb.objects[0].node_id.is_none());
+    }
+
+    #[test]
+    fn test_encode_get_fetch_pack_uses_fetch_pack_object_type() {
+        let msg = encode_get_fetch_pack(&[0x22; 32], &[[0xAB; 32]], 10);
+        let pb = proto::TmGetObjectByHash::decode(msg.payload.as_slice()).unwrap();
+        assert_eq!(
+            pb.r#type,
+            proto::tm_get_object_by_hash::ObjectType::OtFetchPack as i32
+        );
+        assert!(pb.query);
+        assert_eq!(pb.ledger_hash, Some(vec![0x22; 32]));
+        assert_eq!(pb.objects.len(), 1);
+        assert_eq!(pb.objects[0].hash, Some(vec![0xAB; 32]));
+        assert_eq!(pb.objects[0].ledger_seq, Some(10));
         assert!(pb.objects[0].node_id.is_none());
     }
 
@@ -1245,5 +1110,18 @@ mod tests {
         assert_eq!(pb.ledger_hash, Some(vec![0xCD; 32]));
         assert_eq!(pb.query_depth, Some(0));
         assert_eq!(pb.node_i_ds.len(), 1);
+    }
+
+    #[test]
+    fn test_encode_get_tx_set_uses_rippled_candidate_shape() {
+        let msg = encode_get_tx_set(&[0xEF; 32], 0);
+        let pb = proto::TmGetLedger::decode(msg.payload.as_slice()).unwrap();
+        assert_eq!(pb.itype, proto::TmLedgerInfoType::LiTsCandidate as i32);
+        assert_eq!(pb.ledger_hash, Some(vec![0xEF; 32]));
+        assert_eq!(pb.ledger_seq, Some(0));
+        assert_eq!(pb.node_i_ds, vec![vec![0u8; 33]]);
+        assert!(pb.request_cookie.is_none());
+        assert_eq!(pb.query_type, Some(proto::TmQueryType::QtIndirect as i32));
+        assert_eq!(pb.query_depth, Some(3));
     }
 }

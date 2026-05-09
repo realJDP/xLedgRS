@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Tree Cache support for XRPL ledger state and SHAMap logic.
 //! TreeNodeCache — bounded LRU cache for SHAMap nodes.
 //!
 //! Sits between the SHAMap tree walk and the NodeStore disk backend.
@@ -161,13 +160,18 @@ impl NodeStore for CachedNodeStore {
         Ok(result)
     }
 
-    fn store_batch(&self, nodes: &[([u8; 32], Vec<u8>)]) -> std::io::Result<()> {
-        self.backend.store_batch(nodes)?;
-        let mut c = self.cache_guard();
-        for (hash, data) in nodes {
-            c.insert(*hash, data.clone());
+    fn contains(&self, hash: &[u8; 32]) -> std::io::Result<bool> {
+        {
+            let mut c = self.cache_guard();
+            if c.get(hash).is_some() {
+                return Ok(true);
+            }
         }
-        Ok(())
+        self.backend.contains(hash)
+    }
+
+    fn store_batch(&self, nodes: &[([u8; 32], Vec<u8>)]) -> std::io::Result<()> {
+        self.backend.store_batch(nodes)
     }
 
     fn mark_corrupt(&self, hash: &[u8; 32]) {

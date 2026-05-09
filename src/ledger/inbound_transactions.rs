@@ -1,9 +1,8 @@
-//! xLedgRS purpose: Inbound Transactions support for XRPL ledger state and SHAMap logic.
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_TRACKED_TRANSACTIONS: usize = 4096;
-const TRACK_RETENTION_SECS: u64 = 15 * 60;
+const MAX_TRACKED_TRANSACTIONS: usize = 1024;
+const TRACK_RETENTION_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub struct InboundTransactionSummary {

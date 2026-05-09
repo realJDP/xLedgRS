@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Amount support for transaction parsing and submission.
 //! XRPL Amount type — XRP (drops) or IOU (value + currency + issuer).
 //!
 //! Binary encoding:
@@ -17,6 +16,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub const BAD_CURRENCY_CODE: [u8; 20] = [
+    0x58, 0x52, 0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Currency {
@@ -47,8 +50,18 @@ impl Currency {
         Self { code: [0u8; 20] }
     }
 
+    pub fn bad_currency() -> Self {
+        Self {
+            code: BAD_CURRENCY_CODE,
+        }
+    }
+
     pub fn is_xrp(&self) -> bool {
         self.code == [0u8; 20]
+    }
+
+    pub fn is_bad_currency(&self) -> bool {
+        self.code == BAD_CURRENCY_CODE
     }
 
     pub fn to_ascii(&self) -> String {
@@ -165,6 +178,7 @@ pub enum Amount {
 
 impl Amount {
     const MPT_HEADER: u8 = 0x60;
+    pub const XRP_MAX_DROPS: u64 = 100_000_000_000_000_000;
 
     pub fn xrp_drops(drops: u64) -> Self {
         Amount::Xrp(drops)
@@ -253,13 +267,25 @@ impl Amount {
                 if data.len() < 33 {
                     return Err(AmountError::TooShort);
                 }
+                if data[0] != Self::MPT_HEADER {
+                    return Err(AmountError::InvalidMptHeader(data[0]));
+                }
                 Ok((Amount::Mpt(data[..33].to_vec()), 33))
             } else {
                 if data.len() < 8 {
                     return Err(AmountError::TooShort);
                 }
                 let raw = u64::from_be_bytes(data[..8].try_into().unwrap());
-                let drops = raw & 0x1FFF_FFFF_FFFF_FFFF; // strip top 3 bits (IOU/sign/MPT)
+                if (raw & 0x4000_0000_0000_0000) == 0 {
+                    return Err(AmountError::InvalidXrpSign);
+                }
+                if (raw & 0x2000_0000_0000_0000) != 0 {
+                    return Err(AmountError::InvalidXrpReservedBit);
+                }
+                let drops = raw & 0x3FFF_FFFF_FFFF_FFFF;
+                if drops > Self::XRP_MAX_DROPS {
+                    return Err(AmountError::DropsOverflow);
+                }
                 Ok((Amount::Xrp(drops), 8))
             }
         }
@@ -283,6 +309,10 @@ impl fmt::Display for Amount {
 // ── XRP encoding ─────────────────────────────────────────────────────────────
 
 fn encode_xrp_drops(drops: u64) -> Vec<u8> {
+    assert!(
+        drops <= Amount::XRP_MAX_DROPS,
+        "XRP drops exceed canonical maximum"
+    );
     // bit 63 = 0 (XRP), bit 62 = 1 (positive)
     let encoded = 0x4000_0000_0000_0000_u64 | drops;
     encoded.to_be_bytes().to_vec()
@@ -324,6 +354,105 @@ impl IouValue {
             mantissa: sign * abs as i64,
             exponent: exp,
         }
+    }
+
+    /// Parse an XRPL IOU decimal exactly from JSON text, without routing
+    /// through binary floating point. Non-zero values must fit the canonical
+    /// STAmount mantissa/exponent envelope exactly.
+    pub fn parse_decimal(s: &str) -> Result<Self, AmountError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(AmountError::InvalidDecimal(s.to_string()));
+        }
+
+        let (negative, body) = match s.as_bytes()[0] {
+            b'-' => (true, &s[1..]),
+            b'+' => (false, &s[1..]),
+            _ => (false, s),
+        };
+        if body.is_empty() {
+            return Err(AmountError::InvalidDecimal(s.to_string()));
+        }
+
+        let (mantissa_part, exp_part) = match body.find(['e', 'E']) {
+            Some(idx) => (&body[..idx], Some(&body[idx + 1..])),
+            None => (body, None),
+        };
+        let explicit_exp = match exp_part {
+            Some(exp) if exp.is_empty() => return Err(AmountError::InvalidDecimal(s.to_string())),
+            Some(exp) => exp
+                .parse::<i32>()
+                .map_err(|_| AmountError::InvalidDecimal(s.to_string()))?,
+            None => 0,
+        };
+
+        let mut digits = String::new();
+        let mut frac_len = 0i32;
+        let mut seen_dot = false;
+        let mut seen_digit = false;
+        for ch in mantissa_part.bytes() {
+            match ch {
+                b'0'..=b'9' => {
+                    seen_digit = true;
+                    digits.push(ch as char);
+                    if seen_dot {
+                        frac_len = frac_len
+                            .checked_add(1)
+                            .ok_or_else(|| AmountError::InvalidDecimal(s.to_string()))?;
+                    }
+                }
+                b'.' if !seen_dot => seen_dot = true,
+                _ => return Err(AmountError::InvalidDecimal(s.to_string())),
+            }
+        }
+        if !seen_digit {
+            return Err(AmountError::InvalidDecimal(s.to_string()));
+        }
+
+        while digits.starts_with('0') {
+            digits.remove(0);
+        }
+        if digits.is_empty() {
+            return Ok(Self::ZERO);
+        }
+
+        let mut exponent = explicit_exp
+            .checked_sub(frac_len)
+            .ok_or_else(|| AmountError::InvalidDecimal(s.to_string()))?;
+        while digits.ends_with('0') {
+            digits.pop();
+            exponent = exponent
+                .checked_add(1)
+                .ok_or_else(|| AmountError::InvalidDecimal(s.to_string()))?;
+        }
+        if digits.len() > 16 {
+            return Err(AmountError::TooManySignificantDigits);
+        }
+
+        let mut mantissa = digits
+            .parse::<i64>()
+            .map_err(|_| AmountError::InvalidDecimal(s.to_string()))?;
+        if negative {
+            mantissa = -mantissa;
+        }
+        let mut value = Self { mantissa, exponent };
+        value.normalize();
+        value.validate_canonical()?;
+        Ok(value)
+    }
+
+    pub fn validate_canonical(&self) -> Result<(), AmountError> {
+        if self.mantissa == 0 {
+            return Ok(());
+        }
+        let abs = self.mantissa.unsigned_abs();
+        if !(1_000_000_000_000_000..=9_999_999_999_999_999).contains(&abs) {
+            return Err(AmountError::InvalidIouMantissa);
+        }
+        if !(-96..=80).contains(&self.exponent) {
+            return Err(AmountError::InvalidIouExponent(self.exponent));
+        }
+        Ok(())
     }
 
     /// Encode to XRPL's 8-byte IOU amount encoding.
@@ -378,15 +507,20 @@ impl IouValue {
         if raw == 0x8000_0000_0000_0000 {
             return Ok(Self::ZERO);
         }
+        if (raw & 0x8000_0000_0000_0000) == 0 {
+            return Err(AmountError::InvalidIouHeader);
+        }
         let positive = (raw & 0x4000_0000_0000_0000) != 0;
         let biased_exp = ((raw >> 54) & 0xFF) as i32;
         let mantissa = (raw & 0x003F_FFFF_FFFF_FFFF) as i64;
         let exponent = biased_exp - 97;
         let signed_mantissa = if positive { mantissa } else { -mantissa };
-        Ok(Self {
+        let value = Self {
             mantissa: signed_mantissa,
             exponent,
-        })
+        };
+        value.validate_canonical()?;
+        Ok(value)
     }
 }
 
@@ -670,6 +804,47 @@ impl IouValue {
             *other
         }
     }
+
+    pub fn to_decimal_string(&self) -> String {
+        if self.mantissa == 0 {
+            return "0".to_string();
+        }
+        let abs = self.mantissa.unsigned_abs().to_string();
+        let sign = if self.mantissa < 0 { "-" } else { "" };
+        if self.exponent >= 0 {
+            return format!("{}{}{}", sign, abs, "0".repeat(self.exponent as usize));
+        }
+        let places = (-self.exponent) as usize;
+        if places < abs.len() {
+            let split = abs.len() - places;
+            let (int, frac) = abs.split_at(split);
+            let frac = frac.trim_end_matches('0');
+            if frac.is_empty() {
+                format!("{sign}{int}")
+            } else {
+                format!("{sign}{int}.{frac}")
+            }
+        } else {
+            let zeros = "0".repeat(places - abs.len());
+            let frac = format!("{zeros}{abs}");
+            format!("{sign}0.{}", frac.trim_end_matches('0'))
+        }
+    }
+
+    pub fn to_scientific_string(&self) -> String {
+        if self.mantissa == 0 {
+            return "0".to_string();
+        }
+        let sign = if self.mantissa < 0 { "-" } else { "" };
+        let digits = self.mantissa.unsigned_abs().to_string();
+        let exponent = self.exponent + digits.len() as i32 - 1;
+        let frac = digits[1..].trim_end_matches('0');
+        if frac.is_empty() {
+            format!("{sign}{}e{exponent}", &digits[..1])
+        } else {
+            format!("{sign}{}.{}e{exponent}", &digits[..1], frac)
+        }
+    }
 }
 
 /// Quality factor neutral value (1.0x = 1,000,000,000).
@@ -677,10 +852,7 @@ pub const QUALITY_ONE: u32 = 1_000_000_000;
 
 impl fmt::Display for IouValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.mantissa == 0 {
-            return write!(f, "0");
-        }
-        write!(f, "{}e{}", self.mantissa, self.exponent)
+        write!(f, "{}", self.to_decimal_string())
     }
 }
 
@@ -694,6 +866,22 @@ pub enum AmountError {
     InvalidCurrency(String),
     #[error("drop count exceeds maximum (1e17)")]
     DropsOverflow,
+    #[error("invalid XRP sign bit")]
+    InvalidXrpSign,
+    #[error("invalid XRP reserved bit")]
+    InvalidXrpReservedBit,
+    #[error("invalid MPT amount header: 0x{0:02X}")]
+    InvalidMptHeader(u8),
+    #[error("invalid IOU amount header")]
+    InvalidIouHeader,
+    #[error("invalid IOU mantissa")]
+    InvalidIouMantissa,
+    #[error("invalid IOU exponent: {0}")]
+    InvalidIouExponent(i32),
+    #[error("invalid decimal amount: {0}")]
+    InvalidDecimal(String),
+    #[error("IOU decimal has more than 16 significant digits")]
+    TooManySignificantDigits,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -715,6 +903,19 @@ mod tests {
                 "round-trip failed for {drops} drops"
             );
         }
+    }
+
+    #[test]
+    fn xrp_rejects_noncanonical_sign_and_max() {
+        assert!(matches!(
+            Amount::from_bytes(&0u64.to_be_bytes()),
+            Err(AmountError::InvalidXrpSign)
+        ));
+        let over_max = (0x4000_0000_0000_0000u64 | (Amount::XRP_MAX_DROPS + 1)).to_be_bytes();
+        assert!(matches!(
+            Amount::from_bytes(&over_max),
+            Err(AmountError::DropsOverflow)
+        ));
     }
 
     #[test]
@@ -744,6 +945,27 @@ mod tests {
         let decoded = IouValue::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.mantissa, val.mantissa);
         assert_eq!(decoded.exponent, val.exponent);
+    }
+
+    #[test]
+    fn iou_decimal_parse_is_exact_and_canonical() {
+        let value = IouValue::parse_decimal("123.4567890123456").unwrap();
+        assert_eq!(value.mantissa, 1_234_567_890_123_456);
+        assert_eq!(value.exponent, -13);
+        assert_eq!(value.to_decimal_string(), "123.4567890123456");
+        assert_eq!(value.to_scientific_string(), "1.234567890123456e2");
+
+        let tiny = IouValue::parse_decimal("1e-81").unwrap();
+        assert_eq!(tiny.mantissa, 1_000_000_000_000_000);
+        assert_eq!(tiny.exponent, -96);
+        assert!(matches!(
+            IouValue::parse_decimal("1e-82"),
+            Err(AmountError::InvalidIouExponent(-97))
+        ));
+        assert!(matches!(
+            IouValue::parse_decimal("1.2345678901234567"),
+            Err(AmountError::TooManySignificantDigits)
+        ));
     }
 
     #[test]
@@ -779,5 +1001,15 @@ mod tests {
         assert_eq!(consumed, 33);
         assert_eq!(decoded, amount);
         assert_eq!(decoded.mpt_parts(), Some((42, mptid)));
+    }
+
+    #[test]
+    fn mpt_amount_rejects_partial_header_match() {
+        let mut raw = vec![0x20];
+        raw.extend_from_slice(&[0u8; 32]);
+        assert!(matches!(
+            Amount::from_bytes(&raw),
+            Err(AmountError::InvalidMptHeader(0x20))
+        ));
     }
 }

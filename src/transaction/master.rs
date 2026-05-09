@@ -1,9 +1,8 @@
-//! xLedgRS purpose: Master support for transaction parsing and submission.
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_TRACKED_TXS: usize = 8192;
-const TX_RETENTION_SECS: u64 = 60 * 60;
+const MAX_TRACKED_TXS: usize = 2048;
+const TX_RETENTION_SECS: u64 = 10 * 60;
 
 #[derive(Debug, Clone)]
 pub struct TxMasterEntrySummary {

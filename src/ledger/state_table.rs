@@ -1,4 +1,3 @@
-//! xLedgRS purpose: State Table support for XRPL ledger state and SHAMap logic.
 //! State tables — mutation buffers for the view stack.
 //!
 //! RawStateTable: simple insert/replace/erase buffer (used by OpenView).

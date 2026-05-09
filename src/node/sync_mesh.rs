@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Sync Mesh piece of the live node runtime.
 use super::*;
 
 pub(crate) fn rotate_sync_peer_window(
@@ -292,6 +291,19 @@ impl Node {
         let mut rng = rand::thread_rng();
         eligible.shuffle(&mut rng);
         eligible.truncate(count.min(eligible.len()));
+
+        if eligible.len() < count {
+            for pid in self.select_sync_peers(state, seq, count) {
+                if eligible.contains(&pid) {
+                    continue;
+                }
+                eligible.push(pid);
+                if eligible.len() >= count {
+                    break;
+                }
+            }
+        }
+
         eligible
     }
 
@@ -335,7 +347,7 @@ impl Node {
                     return None;
                 }
                 let age = now.saturating_duration_since(*at);
-                if age > std::time::Duration::from_secs(30) {
+                if age > std::time::Duration::from_secs(120) {
                     return None;
                 }
                 let useful = state.peer_sync_useful.get(pid).copied().unwrap_or(0);

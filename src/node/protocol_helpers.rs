@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Protocol Helpers piece of the live node runtime.
 pub(super) fn should_close_ledger(
     any_transactions: bool,
     prev_proposers: usize,

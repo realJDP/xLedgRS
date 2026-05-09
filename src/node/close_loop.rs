@@ -1,8 +1,10 @@
-//! xLedgRS purpose: Close Loop piece of the live node runtime.
 use super::*;
+use crate::consensus::round::ConsensusState;
 use crate::consensus::{ConsensusMode, Proposal, Validation};
 use crate::network::relay;
 use std::time::{Duration, SystemTime};
+
+const RIPPLE_EPOCH_UNIX_OFFSET: u64 = 946_684_800;
 
 pub(super) struct ConsensusRoundStart {
     pub next_seq: u32,
@@ -13,6 +15,7 @@ pub(super) struct ConsensusRoundStart {
 
 pub(super) struct ConsensusEstablishOutcome {
     pub wrong_ledger_hash: Option<[u8; 32]>,
+    pub terminal_state: ConsensusState,
 }
 
 pub(super) struct ClosedLedgerRound {
@@ -24,14 +27,65 @@ pub(super) struct ClosedLedgerRound {
 }
 
 impl Node {
+    pub(super) fn effective_unl_for_parent_ledger(
+        &self,
+        state: &SharedState,
+    ) -> (Vec<Vec<u8>>, usize) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let original_unl = if let Some(manager) = state.ctx.validator_list_manager.as_ref() {
+            manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot(now)
+                .effective_unl
+        } else {
+            self.unl.read().unwrap_or_else(|e| e.into_inner()).clone()
+        };
+        let negative_unl_key = crate::ledger::keylet::negative_unl().key;
+        let negative_unl_raw = state
+            .ctx
+            .closed_ledger
+            .as_ref()
+            .and_then(|closed| closed.get_raw(&negative_unl_key))
+            .or_else(|| {
+                state
+                    .ctx
+                    .ledger_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_raw(&negative_unl_key)
+                    .map(|raw| raw.to_vec())
+            });
+        let disabled = crate::validator_list::disabled_validators_from_negative_unl_raw(
+            negative_unl_raw.as_deref(),
+        );
+        let effective = crate::validator_list::apply_negative_unl(&original_unl, &disabled);
+        (effective, original_unl.len())
+    }
+
     async fn pause_consensus_close_loop(&self, reason: &'static str) {
         info!("consensus close loop paused: {reason}");
         let mut state = self.state.write().await;
         state.current_round = None;
     }
 
-    pub(super) fn signing_key(&self) -> &Secp256k1KeyPair {
-        self.validator_key.as_ref().unwrap_or(&self.node_key)
+    pub(super) fn consensus_signing_key(&self) -> Option<&Secp256k1KeyPair> {
+        self.validator_key.as_ref().or_else(|| {
+            self.config
+                .allow_node_key_consensus
+                .then_some(&self.node_key)
+        })
+    }
+
+    pub(super) fn broadcast_local_validator_manifests(&self, state: &SharedState) {
+        if self.local_validator_manifests.is_empty() {
+            return;
+        }
+        let msg = relay::encode_manifests(&self.local_validator_manifests);
+        state.broadcast(&msg, None);
     }
 
     /// Consensus-driven ledger close loop.
@@ -75,6 +129,17 @@ impl Node {
                 continue;
             }
 
+            if establish.terminal_state != ConsensusState::Yes {
+                warn!(
+                    "consensus: not closing local ledger after {:?}; observing/acquiring network tip instead",
+                    establish.terminal_state
+                );
+                persistent_mode = ConsensusMode::Observing;
+                let mut state = self.state.write().await;
+                state.current_round = None;
+                continue;
+            }
+
             if let Some(reason) = self.consensus_close_loop_pause_reason().await {
                 self.pause_consensus_close_loop(reason).await;
                 return;
@@ -87,6 +152,10 @@ impl Node {
                     &mut prev_proposers,
                 )
                 .await;
+            let Some(closed) = closed else {
+                persistent_mode = ConsensusMode::Observing;
+                continue;
+            };
             self.finalize_validation_round(closed.seq, &mut persistent_mode)
                 .await;
             self.emit_closed_ledger_events(&closed, close_time).await;
@@ -180,42 +249,68 @@ impl Node {
         let tx_set_hash = {
             let state = self.state.read().await;
             let pool_guard = state.ctx.tx_pool.read().unwrap_or_else(|e| e.into_inner());
-            let hash = pool_guard.canonical_set_hash();
+            let hash = state
+                .ctx
+                .consensus_tx_sets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert_local_pool_snapshot(&pool_guard)
+                .hash();
             drop(pool_guard);
             hash
         };
 
         let close_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs().saturating_sub(946684800) as u32)
+            .map(|d| d.as_secs().saturating_sub(RIPPLE_EPOCH_UNIX_OFFSET) as u32)
             .unwrap_or(0);
 
         let prev_hash = {
             let state = self.state.read().await;
             state.ctx.ledger_header.hash
         };
-        let proposal = Proposal::new_signed(
-            next_seq,
-            tx_set_hash,
-            prev_hash,
-            close_time,
-            0,
-            self.signing_key(),
-        );
-        let prop_msg = relay::encode_proposal(&proposal);
-
+        let (unl_snapshot, original_unl_size) = {
+            let state = self.state.read().await;
+            self.effective_unl_for_parent_ledger(&state)
+        };
         let should_propose = persistent_mode == ConsensusMode::Proposing
-            && !self
-                .unl
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty();
+            && self.consensus_signing_key().is_some()
+            && !unl_snapshot.is_empty();
+        let prop_msg = if should_propose {
+            self.consensus_signing_key().map(|key| {
+                relay::encode_proposal(&Proposal::new_signed(
+                    next_seq,
+                    tx_set_hash,
+                    prev_hash,
+                    close_time,
+                    0,
+                    key,
+                ))
+            })
+        } else {
+            None
+        };
         {
             let mut state = self.state.write().await;
-            let unl_snapshot = self.unl.read().unwrap_or_else(|e| e.into_inner()).clone();
-            let mut round = crate::consensus::ConsensusRound::new(
-                next_seq,
+            let prevalidated_manifests = state
+                .ctx
+                .manifest_cache
+                .as_ref()
+                .map(|cache| {
+                    cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .active_manifests()
+                })
+                .unwrap_or_default();
+            let trust = crate::consensus::round::RoundTrustSnapshot::new(
                 unl_snapshot,
+                prevalidated_manifests,
+                Some(original_unl_size),
+            );
+            let mut round = crate::consensus::ConsensusRound::new_with_trust_snapshot(
+                next_seq,
+                trust,
                 prev_hash,
                 should_propose,
                 prev_round_time,
@@ -238,6 +333,9 @@ impl Node {
             }
             state.current_round = Some(round);
             if should_propose {
+                self.broadcast_local_validator_manifests(&state);
+            }
+            if let Some(prop_msg) = prop_msg.as_ref() {
                 state.broadcast(&prop_msg, None);
             }
         }
@@ -271,6 +369,7 @@ impl Node {
         let mut prop_seq = 0u32;
         let mut last_propose_time = tokio::time::Instant::now();
         let mut wrong_ledger_hash: Option<[u8; 32]> = None;
+        let mut terminal_state = ConsensusState::Yes;
         loop {
             if let Some(reason) = self.consensus_close_loop_pause_reason().await {
                 self.pause_consensus_close_loop(reason).await;
@@ -313,6 +412,10 @@ impl Node {
             };
 
             if let Some(new_hash) = new_position {
+                let Some(signing_key) = self.consensus_signing_key() else {
+                    warn!("consensus: cannot update proposal without validator signing key");
+                    continue;
+                };
                 prop_seq += 1;
                 let updated = Proposal::new_signed(
                     round_start.next_seq,
@@ -320,7 +423,7 @@ impl Node {
                     round_start.prev_hash,
                     round_start.close_time,
                     prop_seq,
-                    self.signing_key(),
+                    signing_key,
                 );
                 let msg = relay::encode_proposal(&updated);
                 let state = self.state.read().await;
@@ -335,15 +438,7 @@ impl Node {
             let cs = {
                 let mut state = self.state.write().await;
                 if let Some(ref mut round) = state.current_round {
-                    if round.unl_size() == 0 {
-                        if round.establish_elapsed() >= crate::consensus::round::MIN_CONSENSUS {
-                            crate::consensus::round::ConsensusState::Yes
-                        } else {
-                            crate::consensus::round::ConsensusState::No
-                        }
-                    } else {
-                        round.check_consensus()
-                    }
+                    round.check_consensus()
                 } else {
                     crate::consensus::round::ConsensusState::Yes
                 }
@@ -351,6 +446,7 @@ impl Node {
 
             match cs {
                 crate::consensus::round::ConsensusState::Yes => {
+                    terminal_state = ConsensusState::Yes;
                     let elapsed = phase_start.elapsed();
                     info!(
                         "consensus: reached after {:.1}s (TX + close time agreement)",
@@ -359,6 +455,7 @@ impl Node {
                     break;
                 }
                 crate::consensus::round::ConsensusState::MovedOn => {
+                    terminal_state = ConsensusState::MovedOn;
                     let elapsed = phase_start.elapsed();
                     warn!(
                         "consensus: network moved on without us after {:.1}s",
@@ -367,9 +464,10 @@ impl Node {
                     break;
                 }
                 crate::consensus::round::ConsensusState::Expired => {
+                    terminal_state = ConsensusState::Expired;
                     let elapsed = phase_start.elapsed();
                     warn!(
-                        "consensus: expired after {:.1}s — force accepting",
+                        "consensus: expired after {:.1}s — not force accepting on live consensus",
                         elapsed.as_secs_f64()
                     );
                     break;
@@ -383,6 +481,10 @@ impl Node {
                     let state = self.state.read().await;
                     state.current_round.as_ref().and_then(|r| r.our_position)
                 } {
+                    let Some(signing_key) = self.consensus_signing_key() else {
+                        warn!("consensus: cannot refresh proposal without validator signing key");
+                        continue;
+                    };
                     prop_seq += 1;
                     let refreshed = Proposal::new_signed(
                         round_start.next_seq,
@@ -390,7 +492,7 @@ impl Node {
                         round_start.prev_hash,
                         round_start.close_time,
                         prop_seq,
-                        self.signing_key(),
+                        signing_key,
                     );
                     let msg = relay::encode_proposal(&refreshed);
                     let state = self.state.read().await;
@@ -400,7 +502,10 @@ impl Node {
             }
         }
 
-        Some(ConsensusEstablishOutcome { wrong_ledger_hash })
+        Some(ConsensusEstablishOutcome {
+            wrong_ledger_hash,
+            terminal_state,
+        })
     }
 
     pub(super) async fn handle_wrong_ledger_recovery(&self, correct_hash: [u8; 32]) {
@@ -441,7 +546,7 @@ impl Node {
         close_time: u32,
         prev_round_time: &mut Duration,
         prev_proposers: &mut usize,
-    ) -> ClosedLedgerRound {
+    ) -> Option<ClosedLedgerRound> {
         let (consensus_close_time, have_ct_consensus) = {
             let state = self.state.read().await;
             if let Some(ref round) = state.current_round {
@@ -450,17 +555,20 @@ impl Node {
                 (0u64, false)
             }
         };
-        {
+        let accepted_result = {
             let mut state = self.state.write().await;
-            if let Some(ref mut round) = state.current_round {
-                if let Some(result) = round.accept() {
-                    let state_label = match result.state {
-                        crate::consensus::round::ConsensusState::Yes => "Yes",
-                        crate::consensus::round::ConsensusState::MovedOn => "MovedOn",
-                        crate::consensus::round::ConsensusState::Expired => "Expired",
-                        crate::consensus::round::ConsensusState::No => "No",
-                    };
-                    info!(
+            let result = state
+                .current_round
+                .as_mut()
+                .and_then(|round| round.accept());
+            if let Some(ref result) = result {
+                let state_label = match result.state {
+                    crate::consensus::round::ConsensusState::Yes => "Yes",
+                    crate::consensus::round::ConsensusState::MovedOn => "MovedOn",
+                    crate::consensus::round::ConsensusState::Expired => "Expired",
+                    crate::consensus::round::ConsensusState::No => "No",
+                };
+                info!(
                         "consensus: accepted ledger {} — {}/{} agree ({:.0}%) state={} round_time={:.1}s close_time_consensus={}",
                         result.ledger_seq,
                         result.agree_count,
@@ -470,11 +578,15 @@ impl Node {
                         result.round_time.as_secs_f64(),
                         have_ct_consensus,
                     );
-                    *prev_round_time = result.round_time;
-                    *prev_proposers = result.proposers;
-                }
+                *prev_round_time = result.round_time;
+                *prev_proposers = result.proposers;
             }
-        }
+            result
+        };
+        let Some(accepted_result) = accepted_result else {
+            warn!("consensus: accept requested without an accepted round");
+            return None;
+        };
         let _ = self
             .ws_events
             .send(crate::rpc::ws::WsEvent::ConsensusPhase {
@@ -486,11 +598,11 @@ impl Node {
         } else {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
+                .map(|d| d.as_secs().saturating_sub(RIPPLE_EPOCH_UNIX_OFFSET))
                 .unwrap_or(0)
         };
 
-        let (prev_header, ls_arc, mut tx_pool) = {
+        let (prev_header, ls_arc, live_tx_pool) = {
             let state = self.state.write().await;
             let prev_header = state.ctx.ledger_header.clone();
             let ls_arc = state.ctx.ledger_state.clone();
@@ -499,14 +611,54 @@ impl Node {
             (prev_header, ls_arc, tx_pool)
         };
 
+        let accepted_entries = {
+            let state = self.state.read().await;
+            let entries = state
+                .ctx
+                .consensus_tx_sets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .accepted_pool_entries(&accepted_result.tx_set_hash);
+            entries
+        };
+        let Some(accepted_entries) = accepted_entries else {
+            {
+                let state = self.state.write().await;
+                *state.ctx.tx_pool.write().unwrap_or_else(|e| e.into_inner()) = live_tx_pool;
+            }
+            warn!(
+                "consensus: accepted tx set {} is not available as an immutable candidate — requesting liTS_CANDIDATE and refusing to close/validate",
+                hex::encode_upper(&accepted_result.tx_set_hash[..8]),
+            );
+            self.request_candidate_tx_set(accepted_result.tx_set_hash)
+                .await;
+            let mut state = self.state.write().await;
+            state.current_round = None;
+            return None;
+        };
+        let (mut tx_pool, mut requeue_pool) = {
+            let accepted_hashes: std::collections::HashSet<[u8; 32]> =
+                accepted_entries.iter().map(|entry| entry.hash).collect();
+            let mut remaining = live_tx_pool.clone();
+            for hash in &accepted_hashes {
+                remaining.remove(hash);
+            }
+            let metrics = live_tx_pool.metrics.clone();
+            (
+                crate::ledger::TxPool::from_entries_with_metrics(accepted_entries, metrics),
+                Some(remaining),
+            )
+        };
+
         let result = {
             let mut ls = ls_arc.lock().unwrap_or_else(|e| e.into_inner());
-            crate::ledger::close::close_ledger(
+            crate::ledger::close::close_ledger_with_network_id(
                 &prev_header,
                 &mut ls,
                 &mut tx_pool,
                 close_time_u64,
                 have_ct_consensus,
+                self.config.network_id,
             )
         };
 
@@ -536,7 +688,12 @@ impl Node {
                     .tx_master
                     .observe_accepted(rec, crate::transaction::master::unix_now());
             }
-            if !tx_pool.is_empty() {
+            if let Some(mut remaining) = requeue_pool.take() {
+                if !tx_pool.is_empty() {
+                    remaining.extend_entries(tx_pool.snapshot_entries());
+                }
+                *state.ctx.tx_pool.write().unwrap_or_else(|e| e.into_inner()) = remaining;
+            } else if !tx_pool.is_empty() {
                 *state.ctx.tx_pool.write().unwrap_or_else(|e| e.into_inner()) = tx_pool;
             }
             let queued_transactions = state
@@ -572,7 +729,15 @@ impl Node {
         let closed_ledger = {
             let mut ls = ls_arc.lock().unwrap_or_else(|e| e.into_inner());
             let state_map = ls.snapshot_state_map();
-            let tx_map = crate::ledger::shamap::SHAMap::new_transaction();
+            let mut tx_map = crate::ledger::shamap::SHAMap::new_transaction();
+            for rec in &tx_records {
+                tx_map.insert(
+                    crate::ledger::Key(rec.hash),
+                    crate::ledger::close::encode_tx_leaf_data(&rec.blob, &rec.meta),
+                );
+            }
+            let rules =
+                crate::ledger::rules::Rules::from_amendments(crate::ledger::read_amendments(&ls));
             std::sync::Arc::new(crate::ledger::ledger_core::ClosedLedger::new(
                 crate::ledger::views::LedgerInfo {
                     seq,
@@ -590,7 +755,7 @@ impl Node {
                     reserve_base: updated_fees.reserve,
                     reserve_inc: updated_fees.increment,
                 },
-                crate::ledger::rules::Rules::new(),
+                rules,
             ))
         };
         {
@@ -635,27 +800,43 @@ impl Node {
 
         self.update_rpc_snapshot().await;
 
-        let validation = Validation::new_signed(seq, hash, close_time, true, self.signing_key());
-        let _ = self
-            .ws_events
-            .send(crate::rpc::ws::WsEvent::ValidationReceived {
-                validation: validation.clone(),
-                network_id: self.config.network_id,
-            });
-        let val_msg = relay::encode_validation(&validation);
-        {
-            let state = self.state.read().await;
-            state.broadcast(&val_msg, None);
+        if let Some(validator_key) = self.validator_key.as_ref() {
+            let sign_time = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs().saturating_sub(RIPPLE_EPOCH_UNIX_OFFSET) as u32)
+                .unwrap_or(close_time);
+            let validation = Validation::new_signed_with_close_time(
+                seq,
+                hash,
+                sign_time,
+                close_time_u64 as u32,
+                true,
+                validator_key,
+            );
+            let _ = self
+                .ws_events
+                .send(crate::rpc::ws::WsEvent::ValidationReceived {
+                    validation: validation.clone(),
+                    network_id: self.config.network_id,
+                });
+            let val_msg = relay::encode_validation(&validation);
+            {
+                let state = self.state.read().await;
+                self.broadcast_local_validator_manifests(&state);
+                state.broadcast(&val_msg, None);
+            }
+            info!("broadcast validation candidate for ledger {seq}");
+        } else {
+            info!("not broadcasting validation for ledger {seq}: validator key unavailable");
         }
-        info!("validated ledger {seq}");
 
-        ClosedLedgerRound {
+        Some(ClosedLedgerRound {
             seq,
             applied,
             ledger_hash_hex,
             tx_records,
             close_time_u64,
-        }
+        })
     }
 
     pub(super) async fn finalize_validation_round(
@@ -664,14 +845,30 @@ impl Node {
         persistent_mode: &mut ConsensusMode,
     ) {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut acquire_mismatch: Option<[u8; 32]> = None;
+        let mut promote_validated: Option<[u8; 32]> = None;
         let mut state = self.state.write().await;
+        let local_seq = state.ctx.ledger_header.sequence;
+        let local_hash = state.ctx.ledger_header.hash;
         if let Some(ref mut round) = state.current_round {
-            if let Some(validated_hash) = round.check_validated() {
+            if let Some(validated_hash) = round.check_validated_for(seq) {
                 info!(
                     "consensus: ledger {} fully validated (80%+ quorum) hash={}...",
                     seq,
                     &hex::encode_upper(validated_hash)[..16],
                 );
+                if local_seq == seq && local_hash == validated_hash {
+                    promote_validated = Some(validated_hash);
+                } else {
+                    warn!(
+                        "consensus: quorum validated ledger {} hash={} but local head is seq={} hash={} — acquiring instead of promoting",
+                        seq,
+                        &hex::encode_upper(validated_hash)[..16],
+                        local_seq,
+                        &hex::encode_upper(local_hash)[..16],
+                    );
+                    acquire_mismatch = Some(validated_hash);
+                }
                 *persistent_mode = ConsensusMode::Proposing;
                 let _ = self
                     .ws_events
@@ -685,13 +882,25 @@ impl Node {
                 *persistent_mode = ConsensusMode::Observing;
             }
         }
+        if let Some(validated_hash) = promote_validated {
+            state
+                .services
+                .ledger_master
+                .note_validated_head(seq, validated_hash);
+        }
         state.current_round = None;
+        drop(state);
+
+        if let Some(hash) = acquire_mismatch {
+            self.handle_wrong_ledger_recovery(hash).await;
+            *persistent_mode = ConsensusMode::WrongLedger;
+        }
     }
 
     pub(super) async fn emit_closed_ledger_events(
         &self,
         closed: &ClosedLedgerRound,
-        close_time: u32,
+        _round_start_close_time: u32,
     ) {
         let (validated_ledgers, peer_count, ws_fees, load_snapshot, server_status) = {
             let st = self.state.read().await;
@@ -726,7 +935,7 @@ impl Node {
             ledger_seq: closed.seq,
             ledger_hash: closed.ledger_hash_hex.clone(),
             tx_count: closed.applied,
-            ledger_time: close_time as u64,
+            ledger_time: closed.close_time_u64,
             network_id: self.config.network_id,
             validated_ledgers: validated_ledgers.clone(),
             fee_base: ws_fees.base,
@@ -767,5 +976,77 @@ impl Node {
                 accounts,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_header(seq: u32, hash: [u8; 32]) -> crate::ledger::LedgerHeader {
+        crate::ledger::LedgerHeader {
+            sequence: seq,
+            hash,
+            parent_hash: [0x10; 32],
+            close_time: seq as u64,
+            total_coins: 100_000_000_000,
+            account_hash: [0x12; 32],
+            transaction_hash: [0x13; 32],
+            parent_close_time: seq.saturating_sub(1),
+            close_time_resolution: 30,
+            close_flags: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_validation_round_acquires_same_seq_different_hash_quorum() {
+        let node = std::sync::Arc::new(Node::new(NodeConfig::default()));
+        let validators = (0..10)
+            .map(|_| crate::crypto::keys::Secp256k1KeyPair::generate())
+            .collect::<Vec<_>>();
+        let unl = validators
+            .iter()
+            .map(|kp| kp.public_key_bytes())
+            .collect::<Vec<_>>();
+        let local_hash = [0x21; 32];
+        let network_hash = [0x42; 32];
+        let mut round = crate::consensus::ConsensusRound::new(
+            7,
+            unl,
+            [0x10; 32],
+            true,
+            Duration::from_secs(4),
+            0,
+        );
+        for validator in &validators[..8] {
+            round.add_validation(crate::consensus::Validation::new_signed(
+                7,
+                network_hash,
+                0,
+                true,
+                validator,
+            ));
+        }
+
+        {
+            let mut state = node.state.write().await;
+            state.ctx.ledger_header = test_header(7, local_hash);
+            state.ctx.ledger_seq = 7;
+            state.current_round = Some(round);
+        }
+
+        let mut persistent_mode = ConsensusMode::Proposing;
+        node.finalize_validation_round(7, &mut persistent_mode)
+            .await;
+
+        assert_eq!(persistent_mode, ConsensusMode::WrongLedger);
+        let guard = node
+            .inbound_ledgers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let acquisition = guard
+            .get(&network_hash)
+            .expect("different-hash quorum should trigger acquisition");
+        assert_eq!(acquisition.ledger_seq, 0);
     }
 }

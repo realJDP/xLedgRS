@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "note": "Committed deterministic local control-plane vectors. These are harness fixtures, not rippled parity proof.",
+  "proposal": {
+    "validator_seed_entropy_hex": "0102030405060708090a0b0c0d0e0f10",
+    "ledger_seq": 70001,
+    "tx_set_hash_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "previous_ledger_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+    "close_time": 7654321,
+    "prop_seq": 4,
+    "signing_payload_hash_hex": "9894eba4c32c085a24468f46ef1da74f94df9ea7217fca10e30b6a911c322329",
+    "proposal_hash_hex": "9894eba4c32c085a24468f46ef1da74f94df9ea7217fca10e30b6a911c322329",
+    "signature_hex": "304402204d44349b188ea40ed20c7e6ec7ed9b4c331f44bfd92f2ecbfcff70e56a31e6d602203b2ebbe3c8399d4963aae706cae1b3e5903e300042093d43f72db59b98511b92"
+  },
+  "validation": {
+    "validator_seed_entropy_hex": "1112131415161718191a1b1c1d1e1f20",
+    "ledger_seq": 70001,
+    "ledger_hash_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+    "consensus_hash_hex": "4444444444444444444444444444444444444444444444444444444444444444",
+    "validated_hash_hex": "5555555555555555555555555555555555555555555555555555555555555555",
+    "sign_time": 7654350,
+    "close_time": 7654321,
+    "cookie": 1229782938247303441,
+    "server_version": 2000000000000000000,
+    "signing_payload_hash_hex": "4f5839e4cd8b4fdb115f7c78f0a7a4df18f5456c3879c2bcf60d6e5eeee624a6",
+    "validation_hash_hex": "4f5839e4cd8b4fdb115f7c78f0a7a4df18f5456c3879c2bcf60d6e5eeee624a6",
+    "signature_hex": "304402202148b0617d1151b01adff3cd71a336ad2ce681b017f64a825a5684501a4ab26b02207474ac5bc06ed0546557f3a2f53b8535f0437edb060daa5c517da081846a09d5",
+    "stobject_hex": "22800000012600011171270074cbb1290074cbce3a11111111111111113b1bc16d674ec800005133333333333333333333333333333333333333333333333333333333333333335017444444444444444444444444444444444444444444444444444444444444444450195555555555555555555555555555555555555555555555555555555555555555732102279e14f1a8b5362c53cc5a7f5db5d12cb9ac6041f563321ff8d39a4a13cf726e7646304402202148b0617d1151b01adff3cd71a336ad2ce681b017f64a825a5684501a4ab26b02207474ac5bc06ed0546557f3a2f53b8535f0437edb060daa5c517da081846a09d5"
+  },
+  "manifest": {
+    "master_seed_entropy_hex": "2122232425262728292a2b2c2d2e2f30",
+    "signing_seed_entropy_hex": "3132333435363738393a3b3c3d3e3f40",
+    "sequence": 7,
+    "signing_payload_hash_hex": "6af7d1d8696cf81d582b576c2af0ac4a37aafb6051f25dbfef4a0ca1d135f8b0",
+    "serialized_hash_hex": "97ac5e1a3452908572ef8f5d52061b847cc2c475e82d90c177a110fcf9ed5e33"
+  },
+  "accepted_set": {
+    "quorum": 3,
+    "peer_positions": [
+      {
+        "peer": "validator-a",
+        "tx_set_hash_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "peer": "validator-b",
+        "tx_set_hash_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "peer": "validator-c",
+        "tx_set_hash_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      {
+        "peer": "validator-d",
+        "tx_set_hash_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "expected_accepted_hash_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

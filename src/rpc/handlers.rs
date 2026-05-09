@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Handlers support for JSON-RPC and WebSocket APIs.
 //! RPC method handlers — one function per rippled API method.
 //!
 //! Each handler takes `&RpcRequest` params and `&NodeContext`, returns
@@ -8,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use rand::RngCore;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::crypto::base58::decode_account;
 
@@ -59,6 +58,33 @@ fn txn_not_found_searched_all(searched_all: bool) -> RpcError {
             "searched_all".to_string(),
             json!(searched_all),
         )])),
+    }
+}
+
+fn src_act_not_found() -> RpcError {
+    RpcError {
+        code: "srcActNotFound",
+        error_code: 67,
+        message: "Source account not found.".into(),
+        extra: None,
+    }
+}
+
+fn dst_act_not_found() -> RpcError {
+    RpcError {
+        code: "dstActNotFound",
+        error_code: 50,
+        message: "Destination account not found.".into(),
+        extra: None,
+    }
+}
+
+fn bad_credentials() -> RpcError {
+    RpcError {
+        code: "badCredentials",
+        error_code: 95,
+        message: "Credentials do not exist, are not accepted, or have expired.".into(),
+        extra: None,
     }
 }
 
@@ -316,6 +342,47 @@ fn parse_hex_key_marker(params: &Value) -> Result<Option<[u8; 32]>, RpcError> {
     }
 }
 
+fn parse_key_hint_marker(params: &Value) -> Result<Option<[u8; 32]>, RpcError> {
+    match params.get("marker") {
+        None => Ok(None),
+        Some(Value::String(s)) => {
+            let key = s.split_once(',').map(|(key, _)| key).unwrap_or(s);
+            let v = hex::decode(key).map_err(|_| invalid_field("marker"))?;
+            if v.len() != 32 {
+                return Err(invalid_field("marker"));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&v);
+            Ok(Some(k))
+        }
+        Some(_) => Err(invalid_field_not_string("marker")),
+    }
+}
+
+fn format_key_hint_marker(key: [u8; 32]) -> String {
+    format!("{},0", hex::encode_upper(key))
+}
+
+fn parse_account_tx_marker(params: &Value) -> Result<Option<(u32, u32)>, RpcError> {
+    match params.get("marker") {
+        None => Ok(None),
+        Some(Value::Object(obj)) => {
+            let ledger = obj
+                .get("ledger")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| invalid_field("marker"))?;
+            let seq = obj
+                .get("seq")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| invalid_field("marker"))?;
+            Ok(Some((ledger, seq)))
+        }
+        Some(_) => Err(invalid_field("marker")),
+    }
+}
+
 fn parse_ledger_data_marker(params: &Value) -> Result<Option<[u8; 32]>, RpcError> {
     match params.get("marker") {
         None => Ok(None),
@@ -340,10 +407,16 @@ fn parse_ledger_data_marker(params: &Value) -> Result<Option<[u8; 32]>, RpcError
 fn parse_ledger_data_limit(params: &Value, default: usize, max: usize) -> Result<usize, RpcError> {
     match params.get("limit") {
         None => Ok(default),
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .map(|v| (v as usize).min(max))
-            .ok_or_else(|| RpcError::invalid_params("Invalid field 'limit', not integer.")),
+        Some(Value::Number(n)) => {
+            let value = n
+                .as_u64()
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| RpcError::invalid_params("Invalid field 'limit', not integer."))?;
+            if value == 0 {
+                return Err(invalid_field("limit"));
+            }
+            Ok(value.min(max))
+        }
         Some(_) => Err(RpcError::invalid_params(
             "Invalid field 'limit', not integer.",
         )),
@@ -360,6 +433,15 @@ fn parse_limit_field(params: &Value, default: usize, max: usize) -> Result<usize
             "Invalid field 'limit', not unsigned integer.",
         )),
     }
+}
+
+fn parse_limit_field_clamped(
+    params: &Value,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, RpcError> {
+    parse_limit_field(params, default, max).map(|limit| limit.clamp(min, max))
 }
 
 fn rpc_public_key_bytes(key_pair: &crate::crypto::keys::KeyPair) -> Vec<u8> {
@@ -548,7 +630,7 @@ fn parse_paychan_from_sle(raw: &[u8]) -> Option<crate::ledger::PayChannel> {
     })
 }
 
-fn parse_ledger_index(params: &Value, current_seq: u32) -> Result<Option<u32>, RpcError> {
+fn parse_ledger_index(params: &Value, ctx: &NodeContext) -> Result<Option<u32>, RpcError> {
     let Some(raw) = params.get("ledger_index") else {
         return Ok(None);
     };
@@ -559,9 +641,12 @@ fn parse_ledger_index(params: &Value, current_seq: u32) -> Result<Option<u32>, R
             .and_then(|v| u32::try_from(v).ok())
             .map(Some)
             .ok_or_else(|| RpcError::invalid_params("invalid ledger_index")),
-        Value::String(s) if s == "validated" || s == "closed" || s == "current" => {
-            Ok(Some(current_seq))
+        Value::String(s) if s == "validated" => {
+            validated_head_from_master(ctx.ledger_master_snapshot.as_ref())
+                .map(|(seq, _)| Some(seq))
+                .ok_or_else(lgr_not_found)
         }
+        Value::String(s) if s == "closed" || s == "current" => Ok(Some(ctx.ledger_seq)),
         Value::String(s) => s
             .parse::<u32>()
             .map(Some)
@@ -612,7 +697,7 @@ fn resolve_ledger_selector(params: &Value, ctx: &NodeContext) -> Result<Option<u
         });
     }
 
-    parse_ledger_index(params, ctx.ledger_seq)
+    parse_ledger_index(params, ctx)
 }
 
 fn historical_ledger_header(
@@ -653,6 +738,19 @@ fn collect_historical_state_entries(
         next_key = map.upper_bound_lazy(&key);
     }
     Ok(entries)
+}
+
+fn historical_ledger_state(
+    requested_seq: u32,
+    ctx: &NodeContext,
+    unavailable_message: &'static str,
+) -> Result<(crate::ledger::LedgerHeader, crate::ledger::LedgerState), RpcError> {
+    let (header, mut map) = historical_state_map(requested_seq, ctx, unavailable_message)?;
+    let mut state = crate::ledger::LedgerState::new();
+    for (key, raw) in collect_historical_state_entries(&mut map)? {
+        state.insert_raw(key, raw);
+    }
+    Ok((header, state))
 }
 
 fn serialize_ledger_header_blob(header: &crate::ledger::LedgerHeader) -> Vec<u8> {
@@ -752,6 +850,28 @@ fn parse_amount_from_value(
             .map(crate::transaction::Amount::Xrp)
             .ok_or_else(|| RpcError::invalid_params(&format!("invalid {field}"))),
         Value::Object(obj) => {
+            if let Some(mptid_value) = obj
+                .get("mpt_issuance_id")
+                .or_else(|| obj.get("MPTIssuanceID"))
+            {
+                let value = obj
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params(&format!("{field} missing 'value'")))?
+                    .parse::<u64>()
+                    .map_err(|_| RpcError::invalid_params(&format!("invalid {field} value")))?;
+                let mptid_text = mptid_value
+                    .as_str()
+                    .ok_or_else(|| invalid_field("mpt_issuance_id"))?;
+                let mptid_bytes =
+                    hex::decode(mptid_text).map_err(|_| invalid_field("mpt_issuance_id"))?;
+                if mptid_bytes.len() != 24 {
+                    return Err(invalid_field("mpt_issuance_id"));
+                }
+                let mut mptid = [0u8; 24];
+                mptid.copy_from_slice(&mptid_bytes);
+                return Ok(crate::transaction::Amount::from_mpt_value(value, mptid));
+            }
             let value_str = obj
                 .get("value")
                 .and_then(Value::as_str)
@@ -764,15 +884,14 @@ fn parse_amount_from_value(
                 .get("issuer")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::invalid_params(&format!("{field} missing 'issuer'")))?;
-            let value_f64 = value_str
-                .parse::<f64>()
+            let value = crate::transaction::amount::IouValue::parse_decimal(value_str)
                 .map_err(|_| RpcError::invalid_params(&format!("invalid {field} value")))?;
             let currency = crate::transaction::amount::Currency::from_code(currency_str)
                 .map_err(|_| RpcError::invalid_params(&format!("invalid {field} currency")))?;
             let issuer = decode_account(issuer_str)
                 .map_err(|_| RpcError::invalid_params(&format!("invalid {field} issuer")))?;
             Ok(crate::transaction::Amount::Iou {
-                value: crate::transaction::amount::IouValue::from_f64(value_f64),
+                value,
                 currency,
                 issuer,
             })
@@ -838,10 +957,24 @@ fn ensure_simulate_unsigned(tx_json: &mut Value) -> Result<(), RpcError> {
         ));
     }
 
-    if tx_json.get("Signers").is_some() {
-        return Err(RpcError::invalid_params(
-            "simulate does not support Signers yet",
-        ));
+    if let Some(signers) = tx_json.get("Signers") {
+        let signers = signers
+            .as_array()
+            .ok_or_else(|| RpcError::invalid_params("invalid Signers"))?;
+        for signer in signers {
+            let signer = signer
+                .get("Signer")
+                .and_then(Value::as_object)
+                .ok_or_else(|| RpcError::invalid_params("invalid Signers"))?;
+            match signer.get("TxnSignature") {
+                Some(Value::String(sig)) if sig.is_empty() => {}
+                None => {}
+                Some(Value::String(_)) => {
+                    return Err(RpcError::invalid_params("transaction must be unsigned"))
+                }
+                Some(_) => return Err(invalid_field_not_string("TxnSignature")),
+            }
+        }
     }
 
     match tx_json.get("TxnSignature") {
@@ -1077,7 +1210,13 @@ fn parse_simulate_input(
     let blob = build_unsigned_blob_from_tx_json(&tx_json, ctx)?;
     let parsed = crate::transaction::parse_blob(&blob)
         .map_err(|e| RpcError::invalid_params(&format!("tx parse error: {e}")))?;
-    Ok((blob, parsed_tx_json(&parsed), binary))
+    let mut parsed_json = parsed_tx_json(&parsed);
+    if let Some(signers) = tx_json.get("Signers").cloned() {
+        parsed_json["Signers"] = signers;
+        parsed_json["SigningPubKey"] = json!("");
+        parsed_json["TxnSignature"] = json!("");
+    }
+    Ok((blob, parsed_json, binary))
 }
 
 fn recommended_trust_set_limit(
@@ -1279,6 +1418,935 @@ fn append_load_fields(
     }
 }
 
+fn sync_metrics_counters_json(metrics: &crate::sync_runtime::SyncMetricsSnapshot) -> Value {
+    let mut counters = Map::new();
+    macro_rules! put_counter {
+        ($name:literal, $value:expr) => {
+            counters.insert($name.to_string(), json!($value));
+        };
+    }
+
+    put_counter!("queued_responses_total", metrics.queued_responses_total);
+    put_counter!(
+        "queued_response_bytes_total",
+        metrics.queued_response_bytes_total
+    );
+    put_counter!("max_queue_len", metrics.max_queue_len);
+    put_counter!("max_queue_bytes", metrics.max_queue_bytes);
+    put_counter!("dequeued_responses_total", metrics.dequeued_responses_total);
+    put_counter!("dropped_responses_total", metrics.dropped_responses_total);
+    put_counter!(
+        "dropped_response_bytes_total",
+        metrics.dropped_response_bytes_total
+    );
+    put_counter!("cleared_responses_total", metrics.cleared_responses_total);
+    put_counter!(
+        "cleared_response_bytes_total",
+        metrics.cleared_response_bytes_total
+    );
+    put_counter!("gate_accept_total", metrics.gate_accept_total);
+    put_counter!("gate_reject_total", metrics.gate_reject_total);
+    put_counter!("gate_invalid_total", metrics.gate_invalid_total);
+    put_counter!("gate_lock_busy_total", metrics.gate_lock_busy_total);
+    put_counter!(
+        "malformed_responses_total",
+        metrics.malformed_responses_total
+    );
+    put_counter!("stale_responses_total", metrics.stale_responses_total);
+    put_counter!(
+        "processed_responses_total",
+        metrics.processed_responses_total
+    );
+    put_counter!("useful_nodes_total", metrics.useful_nodes_total);
+    put_counter!("completed_sync_total", metrics.completed_sync_total);
+    put_counter!("completion_checks_total", metrics.completion_checks_total);
+    put_counter!(
+        "completion_plausible_total",
+        metrics.completion_plausible_total
+    );
+    put_counter!("completion_true_total", metrics.completion_true_total);
+    put_counter!("completion_false_total", metrics.completion_false_total);
+    put_counter!(
+        "completion_disk_complete_total",
+        metrics.completion_disk_complete_total
+    );
+    put_counter!(
+        "completion_anchor_blocked_total",
+        metrics.completion_anchor_blocked_total
+    );
+    put_counter!("pass_complete_total", metrics.pass_complete_total);
+    put_counter!("hit_cap_total", metrics.hit_cap_total);
+    put_counter!("inactive_batch_total", metrics.inactive_batch_total);
+    put_counter!("batches_total", metrics.batches_total);
+    put_counter!("last_batch_responses", metrics.last_batch_responses);
+    put_counter!("last_batch_useful_nodes", metrics.last_batch_useful_nodes);
+    put_counter!("last_batch_ms", metrics.last_batch_ms);
+    put_counter!("last_batch_outcome", metrics.last_batch_outcome.clone());
+    put_counter!("total_lock_wait_ms", metrics.total_lock_wait_ms);
+    put_counter!("total_hold_ms", metrics.total_hold_ms);
+    put_counter!("total_batch_ms", metrics.total_batch_ms);
+    put_counter!("max_lock_wait_ms", metrics.max_lock_wait_ms);
+    put_counter!("max_hold_ms", metrics.max_hold_ms);
+    put_counter!("max_batch_ms", metrics.max_batch_ms);
+    put_counter!("route_messages_total", metrics.route_messages_total);
+    put_counter!(
+        "slow_route_messages_total",
+        metrics.slow_route_messages_total
+    );
+    put_counter!("max_route_ms", metrics.max_route_ms);
+    put_counter!(
+        "route_queue_enqueued_total",
+        metrics.route_queue_enqueued_total
+    );
+    put_counter!("route_queue_full_total", metrics.route_queue_full_total);
+    put_counter!("route_queue_inline_total", metrics.route_queue_inline_total);
+    put_counter!(
+        "route_queue_dropped_total",
+        metrics.route_queue_dropped_total
+    );
+    put_counter!("route_queue_max_len", metrics.route_queue_max_len);
+    put_counter!("route_queue_capacity", metrics.route_queue_capacity);
+    counters.insert(
+        "route_message_types".to_string(),
+        json!(metrics
+            .route_message_types
+            .iter()
+            .map(|route| json!({
+                "message_type": route.message_type.clone(),
+                "total": route.total,
+                "slow_total": route.slow_total,
+                "max_ms": route.max_ms,
+            }))
+            .collect::<Vec<_>>()),
+    );
+    counters.insert(
+        "route_queue_peers".to_string(),
+        json!(metrics
+            .route_queue_peers
+            .iter()
+            .map(|peer| json!({
+                "peer_id": peer.peer_id,
+                "message_type": peer.message_type,
+                "full_total": peer.full_total,
+                "inline_retry_total": peer.inline_retry_total,
+                "dropped_total": peer.dropped_total,
+            }))
+            .collect::<Vec<_>>()),
+    );
+    counters.insert(
+        "worker_lanes".to_string(),
+        json!(metrics
+            .worker_lanes
+            .iter()
+            .map(|lane| json!({
+                "lane": lane.lane,
+                "enqueued_total": lane.enqueued_total,
+                "started_total": lane.started_total,
+                "completed_total": lane.completed_total,
+                "failed_total": lane.failed_total,
+                "in_flight": lane.in_flight,
+                "max_in_flight": lane.max_in_flight,
+                "queue_capacity": lane.queue_capacity,
+                "max_queue_depth": lane.max_queue_depth,
+                "backpressure_total": lane.backpressure_total,
+                "max_backpressure_ms": lane.max_backpressure_ms,
+            }))
+            .collect::<Vec<_>>()),
+    );
+    put_counter!("diff_sync_queued_total", metrics.diff_sync_queued_total);
+    put_counter!(
+        "diff_sync_queue_fail_total",
+        metrics.diff_sync_queue_fail_total
+    );
+    put_counter!(
+        "diff_sync_discarded_total",
+        metrics.diff_sync_discarded_total
+    );
+    put_counter!(
+        "object_fallback_requests_total",
+        metrics.object_fallback_requests_total
+    );
+    put_counter!(
+        "object_fallback_no_request_total",
+        metrics.object_fallback_no_request_total
+    );
+    put_counter!(
+        "object_fallback_responses_total",
+        metrics.object_fallback_responses_total
+    );
+    put_counter!(
+        "object_fallback_accepted_total",
+        metrics.object_fallback_accepted_total
+    );
+    put_counter!(
+        "object_fallback_rejected_total",
+        metrics.object_fallback_rejected_total
+    );
+    put_counter!(
+        "object_fallback_stored_total",
+        metrics.object_fallback_stored_total
+    );
+    put_counter!(
+        "object_fallback_duplicate_total",
+        metrics.object_fallback_duplicate_total
+    );
+    put_counter!(
+        "object_fallback_empty_total",
+        metrics.object_fallback_empty_total
+    );
+
+    Value::Object(counters)
+}
+
+pub fn sync_metrics(ctx: &NodeContext) -> Result<Value, RpcError> {
+    let load = &ctx.load_snapshot;
+    let sync = ctx.fetch_info.as_ref().map(|fetch| {
+        json!({
+            "active": fetch.sync_active,
+            "in_progress": fetch.sync_in_progress,
+            "done": fetch.sync_done,
+            "ready": fetch.ready,
+            "readiness": fetch.readiness,
+            "readiness_blockers": fetch.readiness_blockers,
+            "target_seq": fetch.target_seq,
+            "target_hash": fetch.target_hash,
+            "target_account_hash": fetch.target_account_hash,
+            "computed_root_hash": fetch.computed_root_hash,
+            "root_matches": fetch.root_matches,
+            "have_header": fetch.have_header,
+            "have_state": fetch.have_state,
+            "have_transactions": fetch.have_transactions,
+            "backend_fetch_errors": fetch.backend_fetch_errors,
+            "timeouts": fetch.timeouts,
+            "in_flight": fetch.in_flight,
+            "outstanding_cookies": fetch.outstanding_cookies,
+            "outstanding_object_queries": fetch.outstanding_object_queries,
+            "recent_nodes": fetch.recent_nodes,
+            "useful_idle_secs": fetch.useful_idle_secs,
+            "response_idle_secs": fetch.response_idle_secs,
+            "queue_len": fetch.queue_len,
+            "queue_bytes": fetch.queue_bytes,
+            "inner_nodes": fetch.inner_nodes,
+            "state_nodes": fetch.state_nodes,
+            "pass": fetch.pass,
+            "new_objects": fetch.new_objects,
+            "tail_stuck_hash": fetch.tail_stuck_hash,
+            "tail_stuck_retries": fetch.tail_stuck_retries,
+        })
+    });
+    Ok(json!({
+        "load": {
+            "load_base": load.load_base,
+            "load_factor": load.load_factor(),
+            "load_factor_server": load.load_factor_server(),
+            "load_factor_local": load.load_factor_local(),
+            "load_factor_net": load.load_factor_net(),
+            "load_factor_cluster": load.load_factor_cluster(),
+            "queue_depth": load.queue_depth,
+            "queue_capacity": load.queue_capacity,
+            "queue_overloaded": load.queue_overloaded,
+            "queued_transactions": load.queued_transactions,
+            "tracked_transactions": load.tracked_transactions,
+            "tracked_inbound_transactions": load.tracked_inbound_transactions,
+            "active_path_requests": load.active_path_requests,
+            "active_inbound_ledgers": load.active_inbound_ledgers,
+            "warning_count": load.warning_count,
+            "slow_operation_count": load.slow_operation_count,
+            "sync_stall_count": load.sync_stall_count,
+            "service_cycles": load.service_cycles,
+            "overload_cycles": load.overload_cycles,
+            "idle_cycles": load.idle_cycles,
+            "last_warning_reason": load.last_warning_reason,
+            "last_cycle_reason": load.last_cycle_reason,
+        },
+        "job_queue": {
+            "threads": load.job_queue_threads,
+            "job_types": load.queue_job_types.iter().map(|job| json!({
+                "job_type": job.job_type,
+                "waiting": job.waiting,
+                "in_progress": job.in_progress,
+                "over_target": job.over_target,
+            })).collect::<Vec<_>>(),
+        },
+        "sync": sync.unwrap_or_else(|| json!({ "active": false })),
+        "sync_peers": ctx.sync_peer_usefulness.iter().map(|peer| json!({
+            "peer_id": peer.peer_id,
+            "address": peer.address,
+            "useful_score": peer.useful_score,
+            "useful_nodes_total": peer.useful_nodes_total,
+            "duplicate_score": peer.duplicate_score,
+            "duplicate_responses_total": peer.duplicate_responses_total,
+            "last_useful_secs": peer.last_useful_secs,
+            "latency": peer.latency,
+            "ledger_range": peer.ledger_range.map(|(min, max)| json!({
+                "min": min,
+                "max": max,
+            })),
+        })).collect::<Vec<_>>(),
+        "counters": ctx
+            .sync_metrics
+            .as_ref()
+            .map(sync_metrics_counters_json)
+            .unwrap_or_else(|| json!({})),
+        "tx_relay": ctx.tx_relay_metrics.as_ref().map(|tx| json!({
+            "queued_transactions": tx.queued_transactions,
+            "peer_count": tx.peer_count,
+            "max_queue_size": tx.max_queue_size,
+            "tracked_transactions": tx.tracked_transactions,
+            "submitted_transactions": tx.submitted_transactions,
+            "accepted_transactions": tx.accepted_transactions,
+            "duplicate_transactions": tx.duplicate_transactions,
+            "relayed_transactions": tx.relayed_transactions,
+            "persisted_transactions": tx.persisted_transactions,
+        })),
+        "inbound_ledgers": ctx.inbound_ledgers_snapshot.as_ref().map(|s| json!({
+            "active": s.active,
+            "complete": s.complete,
+            "header_complete": s.header_complete,
+            "state_complete": s.state_complete,
+            "tx_complete": s.tx_complete,
+            "full_complete": s.full_complete,
+            "tx_missing_nodes_total": s.tx_missing_nodes_total,
+            "failed": s.failed,
+            "retry_ready": s.retry_ready,
+            "stale": s.stale,
+            "fetched_total": s.fetched_total,
+            "cache_size": s.cache_size,
+            "recent_failures": s.recent_failures,
+            "history": s.history,
+            "generic": s.generic,
+            "consensus": s.consensus,
+            "header_responses_total": s.header_responses_total,
+            "tx_node_responses_total": s.tx_node_responses_total,
+            "state_tree_complete_total": s.state_tree_complete_total,
+        })),
+        "inbound_transactions": ctx.inbound_transactions_snapshot.as_ref().map(|s| json!({
+            "tracked": s.tracked,
+            "accepted_total": s.accepted_total,
+            "duplicate_total": s.duplicate_total,
+            "relayed_total": s.relayed_total,
+            "persisted_total": s.persisted_total,
+        })),
+        "tx_master": ctx.tx_master_snapshot.as_ref().map(|s| json!({
+            "tracked": s.tracked,
+            "proposed_total": s.proposed_total,
+            "submitted_total": s.submitted_total,
+            "buffered_total": s.buffered_total,
+            "accepted_total": s.accepted_total,
+            "validated_total": s.validated_total,
+            "relayed_total": s.relayed_total,
+        })),
+        "ledger_master": ctx.ledger_master_snapshot.as_ref().map(|s| json!({
+            "validated_seq": s.validated_seq,
+            "validated_hash": s.validated_hash,
+            "open_ledger_seq": s.open_ledger_seq,
+            "complete_ledgers": s.complete_ledgers,
+            "last_close_time": s.last_close_time,
+            "queued_transactions": s.queued_transactions,
+            "candidate_set_hash": s.candidate_set_hash,
+        })),
+        "open_ledger": ctx.open_ledger_snapshot.as_ref().map(|s| json!({
+            "ledger_current_index": s.ledger_current_index,
+            "parent_ledger_index": s.parent_ledger_index,
+            "queued_transactions": s.queued_transactions,
+            "max_queue_size": s.max_queue_size,
+            "open_fee_level": s.open_fee_level,
+            "revision": s.revision,
+            "modify_count": s.modify_count,
+            "accept_count": s.accept_count,
+            "has_open_view": s.has_open_view,
+        })),
+        "node_store": ctx.node_store_snapshot.as_ref().map(|s| json!({
+            "fetch_hits": s.fetch_hits,
+            "fetch_missing": s.fetch_missing,
+            "fetch_errors": s.fetch_errors,
+            "store_ops": s.store_ops,
+            "store_unchecked_ops": s.store_unchecked_ops,
+            "batch_store_ops": s.batch_store_ops,
+            "batch_store_nodes": s.batch_store_nodes,
+            "fetch_total_ms": s.fetch_total_ms,
+            "fetch_max_ms": s.fetch_max_ms,
+            "store_total_ms": s.store_total_ms,
+            "store_max_ms": s.store_max_ms,
+            "batch_store_total_ms": s.batch_store_total_ms,
+            "batch_store_max_ms": s.batch_store_max_ms,
+            "flush_total_ms": s.flush_total_ms,
+            "flush_max_ms": s.flush_max_ms,
+            "flush_ops": s.flush_ops,
+            "last_flush_unix": s.last_flush_unix,
+            "last_flush_duration_ms": s.last_flush_duration_ms,
+            "last_error": s.last_error,
+        })),
+        "fetch_pack": ctx.fetch_pack_snapshot.as_ref().map(|s| json!({
+            "tracked": s.tracked,
+            "bytes": s.bytes,
+            "stashed_total": s.stashed_total,
+            "backend_fill_total": s.backend_fill_total,
+            "imported_total": s.imported_total,
+            "reply_objects_total": s.reply_objects_total,
+            "verified_objects_total": s.verified_objects_total,
+            "persisted_total": s.persisted_total,
+            "persist_errors_total": s.persist_errors_total,
+            "reused_total": s.reused_total,
+            "evicted_total": s.evicted_total,
+            "flush_ops": s.flush_ops,
+            "last_import_error": s.last_import_error,
+            "last_flush_error": s.last_flush_error,
+        })),
+    }))
+}
+
+fn prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
+fn push_metric(out: &mut String, name: &str, value: impl std::fmt::Display) {
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+pub fn metrics_text(ctx: &NodeContext) -> String {
+    let mut out = String::new();
+    out.push_str("# TYPE xledgrs_ledger_seq gauge\n");
+    push_metric(&mut out, "xledgrs_ledger_seq", ctx.ledger_seq);
+    push_metric(&mut out, "xledgrs_peer_count", ctx.peer_count);
+    push_metric(&mut out, "xledgrs_object_count", ctx.object_count);
+    push_metric(
+        &mut out,
+        "xledgrs_uptime_seconds",
+        ctx.start_time.elapsed().as_secs(),
+    );
+
+    let load = &ctx.load_snapshot;
+    push_metric(&mut out, "xledgrs_load_factor", load.load_factor());
+    push_metric(
+        &mut out,
+        "xledgrs_load_factor_server",
+        load.load_factor_server(),
+    );
+    push_metric(&mut out, "xledgrs_load_queue_depth", load.queue_depth);
+    push_metric(&mut out, "xledgrs_load_queue_capacity", load.queue_capacity);
+    push_metric(
+        &mut out,
+        "xledgrs_load_queue_overloaded",
+        u8::from(load.queue_overloaded),
+    );
+    push_metric(
+        &mut out,
+        "xledgrs_load_slow_operations_total",
+        load.slow_operation_count,
+    );
+    push_metric(
+        &mut out,
+        "xledgrs_load_sync_stalls_total",
+        load.sync_stall_count,
+    );
+    for job in &load.queue_job_types {
+        let label = prometheus_label_value(&job.job_type);
+        push_metric(
+            &mut out,
+            &format!("xledgrs_job_waiting{{job_type=\"{label}\"}}"),
+            job.waiting,
+        );
+        push_metric(
+            &mut out,
+            &format!("xledgrs_job_in_progress{{job_type=\"{label}\"}}"),
+            job.in_progress,
+        );
+        push_metric(
+            &mut out,
+            &format!("xledgrs_job_over_target{{job_type=\"{label}\"}}"),
+            u8::from(job.over_target),
+        );
+    }
+
+    if let Some(fetch) = &ctx.fetch_info {
+        push_metric(&mut out, "xledgrs_sync_active", u8::from(fetch.sync_active));
+        push_metric(&mut out, "xledgrs_sync_ready", u8::from(fetch.ready));
+        push_metric(&mut out, "xledgrs_sync_in_flight", fetch.in_flight);
+        push_metric(&mut out, "xledgrs_sync_queue_len", fetch.queue_len);
+        push_metric(&mut out, "xledgrs_sync_queue_bytes", fetch.queue_bytes);
+        push_metric(&mut out, "xledgrs_sync_inner_nodes", fetch.inner_nodes);
+        push_metric(&mut out, "xledgrs_sync_state_nodes", fetch.state_nodes);
+        push_metric(
+            &mut out,
+            "xledgrs_sync_backend_fetch_errors_total",
+            fetch.backend_fetch_errors,
+        );
+    } else {
+        push_metric(&mut out, "xledgrs_sync_active", 0);
+    }
+
+    if let Some(metrics) = &ctx.sync_metrics {
+        push_metric(
+            &mut out,
+            "xledgrs_sync_queued_responses_total",
+            metrics.queued_responses_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_max_queue_len",
+            metrics.max_queue_len,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_max_queue_bytes",
+            metrics.max_queue_bytes,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_dropped_responses_total",
+            metrics.dropped_responses_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_gate_lock_busy_total",
+            metrics.gate_lock_busy_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_gate_invalid_total",
+            metrics.gate_invalid_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_processed_responses_total",
+            metrics.processed_responses_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_useful_nodes_total",
+            metrics.useful_nodes_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_last_batch_responses",
+            metrics.last_batch_responses,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_last_batch_useful_nodes",
+            metrics.last_batch_useful_nodes,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_last_batch_ms",
+            metrics.last_batch_ms,
+        );
+        let outcome = prometheus_label_value(&metrics.last_batch_outcome);
+        push_metric(
+            &mut out,
+            &format!("xledgrs_sync_last_batch_outcome{{outcome=\"{outcome}\"}}"),
+            1,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_total_lock_wait_ms",
+            metrics.total_lock_wait_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_total_hold_ms",
+            metrics.total_hold_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_total_batch_ms",
+            metrics.total_batch_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_max_lock_wait_ms",
+            metrics.max_lock_wait_ms,
+        );
+        push_metric(&mut out, "xledgrs_sync_max_hold_ms", metrics.max_hold_ms);
+        push_metric(&mut out, "xledgrs_sync_max_batch_ms", metrics.max_batch_ms);
+        push_metric(
+            &mut out,
+            "xledgrs_sync_completion_checks_total",
+            metrics.completion_checks_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_completion_plausible_total",
+            metrics.completion_plausible_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_completion_true_total",
+            metrics.completion_true_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_completion_false_total",
+            metrics.completion_false_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_completion_disk_complete_total",
+            metrics.completion_disk_complete_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_sync_completion_anchor_blocked_total",
+            metrics.completion_anchor_blocked_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_route_messages_total",
+            metrics.route_messages_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_route_slow_messages_total",
+            metrics.slow_route_messages_total,
+        );
+        push_metric(&mut out, "xledgrs_route_max_ms", metrics.max_route_ms);
+        push_metric(
+            &mut out,
+            "xledgrs_route_queue_enqueued_total",
+            metrics.route_queue_enqueued_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_route_queue_full_total",
+            metrics.route_queue_full_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_route_queue_inline_total",
+            metrics.route_queue_inline_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_route_queue_dropped_total",
+            metrics.route_queue_dropped_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_route_queue_max_len",
+            metrics.route_queue_max_len,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_route_queue_capacity",
+            metrics.route_queue_capacity,
+        );
+        for route in &metrics.route_message_types {
+            let label = prometheus_label_value(&route.message_type);
+            push_metric(
+                &mut out,
+                &format!("xledgrs_route_messages_by_type_total{{message_type=\"{label}\"}}"),
+                route.total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_route_slow_messages_by_type_total{{message_type=\"{label}\"}}"),
+                route.slow_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_route_max_ms_by_type{{message_type=\"{label}\"}}"),
+                route.max_ms,
+            );
+        }
+        for peer in &metrics.route_queue_peers {
+            let peer_id = prometheus_label_value(&peer.peer_id);
+            let message_type = prometheus_label_value(&peer.message_type);
+            let labels = format!("peer_id=\"{peer_id}\",message_type=\"{message_type}\"");
+            push_metric(
+                &mut out,
+                &format!("xledgrs_route_queue_full_by_peer_total{{{labels}}}"),
+                peer.full_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_route_queue_inline_retry_by_peer_total{{{labels}}}"),
+                peer.inline_retry_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_route_queue_dropped_by_peer_total{{{labels}}}"),
+                peer.dropped_total,
+            );
+        }
+        for lane in &metrics.worker_lanes {
+            let lane_label = prometheus_label_value(&lane.lane);
+            let labels = format!("lane=\"{lane_label}\"");
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_enqueued_total{{{labels}}}"),
+                lane.enqueued_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_started_total{{{labels}}}"),
+                lane.started_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_completed_total{{{labels}}}"),
+                lane.completed_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_failed_total{{{labels}}}"),
+                lane.failed_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_in_flight{{{labels}}}"),
+                lane.in_flight,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_max_in_flight{{{labels}}}"),
+                lane.max_in_flight,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_queue_capacity{{{labels}}}"),
+                lane.queue_capacity,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_max_queue_depth{{{labels}}}"),
+                lane.max_queue_depth,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_backpressure_total{{{labels}}}"),
+                lane.backpressure_total,
+            );
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_worker_lane_max_backpressure_ms{{{labels}}}"),
+                lane.max_backpressure_ms,
+            );
+        }
+        push_metric(
+            &mut out,
+            "xledgrs_diff_sync_queued_total",
+            metrics.diff_sync_queued_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_diff_sync_queue_fail_total",
+            metrics.diff_sync_queue_fail_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_diff_sync_discarded_total",
+            metrics.diff_sync_discarded_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_requests_total",
+            metrics.object_fallback_requests_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_no_request_total",
+            metrics.object_fallback_no_request_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_responses_total",
+            metrics.object_fallback_responses_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_accepted_total",
+            metrics.object_fallback_accepted_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_rejected_total",
+            metrics.object_fallback_rejected_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_stored_total",
+            metrics.object_fallback_stored_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_duplicate_total",
+            metrics.object_fallback_duplicate_total,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_object_fallback_empty_total",
+            metrics.object_fallback_empty_total,
+        );
+    }
+
+    for peer in &ctx.sync_peer_usefulness {
+        let peer_id = prometheus_label_value(&peer.peer_id);
+        let address = prometheus_label_value(&peer.address);
+        let labels = format!("peer_id=\"{peer_id}\",address=\"{address}\"");
+        push_metric(
+            &mut out,
+            &format!("xledgrs_sync_peer_useful_score{{{labels}}}"),
+            peer.useful_score,
+        );
+        push_metric(
+            &mut out,
+            &format!("xledgrs_sync_peer_useful_nodes_total{{{labels}}}"),
+            peer.useful_nodes_total,
+        );
+        push_metric(
+            &mut out,
+            &format!("xledgrs_sync_peer_duplicate_score{{{labels}}}"),
+            peer.duplicate_score,
+        );
+        push_metric(
+            &mut out,
+            &format!("xledgrs_sync_peer_duplicate_responses_total{{{labels}}}"),
+            peer.duplicate_responses_total,
+        );
+        if let Some(last_useful_secs) = peer.last_useful_secs {
+            push_metric(
+                &mut out,
+                &format!("xledgrs_sync_peer_last_useful_seconds{{{labels}}}"),
+                last_useful_secs,
+            );
+        }
+    }
+
+    if let Some(store) = &ctx.node_store_snapshot {
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_fetch_hits_total",
+            store.fetch_hits,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_fetch_missing_total",
+            store.fetch_missing,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_fetch_errors_total",
+            store.fetch_errors,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_store_ops_total",
+            store.store_ops,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_store_unchecked_ops_total",
+            store.store_unchecked_ops,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_batch_store_ops_total",
+            store.batch_store_ops,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_batch_store_nodes_total",
+            store.batch_store_nodes,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_fetch_total_ms",
+            store.fetch_total_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_fetch_max_ms",
+            store.fetch_max_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_store_total_ms",
+            store.store_total_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_store_max_ms",
+            store.store_max_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_batch_store_total_ms",
+            store.batch_store_total_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_batch_store_max_ms",
+            store.batch_store_max_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_flush_ops_total",
+            store.flush_ops,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_flush_total_ms",
+            store.flush_total_ms,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_node_store_flush_max_ms",
+            store.flush_max_ms,
+        );
+        if let Some(last_flush_unix) = store.last_flush_unix {
+            push_metric(
+                &mut out,
+                "xledgrs_node_store_last_flush_unix",
+                last_flush_unix,
+            );
+        }
+        if let Some(last_flush_duration_ms) = store.last_flush_duration_ms {
+            push_metric(
+                &mut out,
+                "xledgrs_node_store_last_flush_duration_ms",
+                last_flush_duration_ms,
+            );
+        }
+    }
+
+    if let Some(tx) = &ctx.tx_relay_metrics {
+        push_metric(&mut out, "xledgrs_tx_queue_size", tx.queued_transactions);
+        push_metric(
+            &mut out,
+            "xledgrs_tx_submitted_total",
+            tx.submitted_transactions,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_tx_accepted_total",
+            tx.accepted_transactions,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_tx_duplicate_total",
+            tx.duplicate_transactions,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_tx_relayed_total",
+            tx.relayed_transactions,
+        );
+        push_metric(
+            &mut out,
+            "xledgrs_tx_persisted_total",
+            tx.persisted_transactions,
+        );
+    }
+    out
+}
+
 fn append_open_ledger_fields(
     dest: &mut Value,
     open: &crate::ledger::open_ledger::OpenLedgerSnapshot,
@@ -1338,6 +2406,21 @@ fn snapshot_needs_network_ledger(sync_done: bool, ledger_seq: u32) -> bool {
     !sync_done && ledger_seq == 0
 }
 
+fn validated_ready_from_snapshot(
+    sync_done: bool,
+    follower_healthy: bool,
+    validated: &ValidatedLedgerStatus,
+) -> bool {
+    sync_done && follower_healthy && validated.seq > 0 && validated.hash != ZERO_LEDGER_HASH
+}
+
+fn validated_ready_from_server_state(
+    server_state: &str,
+    validated: &ValidatedLedgerStatus,
+) -> bool {
+    matches!(server_state, "full" | "proposing") && validated.seq > 0
+}
+
 fn context_needs_network_ledger(ctx: &NodeContext) -> bool {
     if ctx.ledger_seq == 0 {
         return true;
@@ -1346,6 +2429,139 @@ fn context_needs_network_ledger(ctx: &NodeContext) -> bool {
         .as_ref()
         .map(|fetch| !fetch.have_header)
         .unwrap_or(false)
+}
+
+const ZERO_LEDGER_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Debug, Clone)]
+struct ValidatedLedgerStatus {
+    seq: u32,
+    hash: String,
+    close_time: u64,
+    age: u64,
+}
+
+fn has_quorum_validated_hash(hash: &str) -> bool {
+    !hash.is_empty() && hash.chars().any(|c| c != '0')
+}
+
+fn validated_head_from_master(
+    snapshot: Option<&crate::ledger::master::LedgerMasterSnapshot>,
+) -> Option<(u32, String)> {
+    let snapshot = snapshot?;
+    if snapshot.validated_seq == 0 || !has_quorum_validated_hash(&snapshot.validated_hash) {
+        return None;
+    }
+    Some((snapshot.validated_seq, snapshot.validated_hash.clone()))
+}
+
+fn ledger_hash_for_status(ctx: &NodeContext, seq: u32, validated_hash: &str) -> Option<u64> {
+    if seq == ctx.ledger_header.sequence {
+        let header_hash = hex::encode_upper(ctx.ledger_header.hash);
+        if header_hash.eq_ignore_ascii_case(validated_hash)
+            || ctx.ledger_hash.eq_ignore_ascii_case(validated_hash)
+        {
+            return Some(ctx.ledger_header.close_time);
+        }
+    }
+
+    let history = ctx.history.read().unwrap_or_else(|e| e.into_inner());
+    history.get_ledger(seq).and_then(|record| {
+        let header_hash = hex::encode_upper(record.header.hash);
+        header_hash
+            .eq_ignore_ascii_case(validated_hash)
+            .then_some(record.header.close_time)
+    })
+}
+
+fn validated_ledger_status_from_ctx(ctx: &NodeContext, now_unix: u64) -> ValidatedLedgerStatus {
+    const XRPL_EPOCH_OFFSET: u64 = 946_684_800;
+    let Some((seq, hash)) = validated_head_from_master(ctx.ledger_master_snapshot.as_ref()) else {
+        return ValidatedLedgerStatus {
+            seq: 0,
+            hash: ZERO_LEDGER_HASH.to_string(),
+            close_time: 0,
+            age: 0,
+        };
+    };
+
+    let close_time = ledger_hash_for_status(ctx, seq, &hash).unwrap_or(0);
+    let age = if close_time == 0 {
+        0
+    } else {
+        now_unix.saturating_sub(close_time + XRPL_EPOCH_OFFSET)
+    };
+
+    ValidatedLedgerStatus {
+        seq,
+        hash,
+        close_time,
+        age,
+    }
+}
+
+fn validated_ledger_status_from_snapshot(
+    snap: &crate::rpc::RpcSnapshot,
+    now_unix: u64,
+) -> ValidatedLedgerStatus {
+    const XRPL_EPOCH_OFFSET: u64 = 946_684_800;
+    if snap.ledger_seq == 0 || !has_quorum_validated_hash(&snap.ledger_hash) {
+        return ValidatedLedgerStatus {
+            seq: 0,
+            hash: ZERO_LEDGER_HASH.to_string(),
+            close_time: 0,
+            age: 0,
+        };
+    }
+
+    let close_time = snap.ledger_header.close_time;
+    let age = if close_time == 0 {
+        0
+    } else {
+        now_unix.saturating_sub(close_time + XRPL_EPOCH_OFFSET)
+    };
+
+    ValidatedLedgerStatus {
+        seq: snap.ledger_seq,
+        hash: snap.ledger_hash.clone(),
+        close_time,
+        age,
+    }
+}
+
+fn ledger_seq_is_validated(ctx: &NodeContext, seq: u32, ledger_hash: Option<&str>) -> bool {
+    let Some(snapshot) = ctx.ledger_master_snapshot.as_ref() else {
+        return false;
+    };
+    let Some((validated_seq, validated_hash)) = validated_head_from_master(Some(snapshot)) else {
+        return false;
+    };
+
+    if seq > validated_seq {
+        return false;
+    }
+
+    if seq == validated_seq {
+        return ledger_hash
+            .map(|hash| hash.eq_ignore_ascii_case(&validated_hash))
+            .unwrap_or(true);
+    }
+
+    if let Some(expected) = snapshot
+        .recent_validated
+        .iter()
+        .find(|entry| entry.seq == seq)
+        .map(|entry| entry.hash.as_str())
+    {
+        return ledger_hash
+            .map(|hash| hash.eq_ignore_ascii_case(expected))
+            .unwrap_or(true);
+    }
+
+    // Do not infer validation by sequence alone. Without a matching recent
+    // validated hash, this may be a merely acquired historical ledger or the
+    // wrong fork.
+    false
 }
 
 /// Lock-free server_info using ArcSwap snapshot — never blocks during sync.
@@ -1359,12 +2575,11 @@ pub fn server_info_snapshot(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let ledger_unix = snap.ledger_header.close_time as u64 + XRPL_EPOCH_OFFSET;
-    let age = now_unix.saturating_sub(ledger_unix);
+    let validated_ledger = validated_ledger_status_from_snapshot(snap, now_unix);
 
     // Format close_time as human-readable
     let close_time_human = {
-        let unix_ts = snap.ledger_header.close_time as i64 + XRPL_EPOCH_OFFSET as i64;
+        let unix_ts = validated_ledger.close_time as i64 + XRPL_EPOCH_OFFSET as i64;
         let secs = unix_ts % 60;
         let mins = (unix_ts / 60) % 60;
         let hours = (unix_ts / 3600) % 24;
@@ -1373,9 +2588,11 @@ pub fn server_info_snapshot(
     let server_state = crate::network::ops::snapshot_server_state_label(
         snap.sync_done,
         snap.follower_healthy,
-        age,
+        validated_ledger.age,
         snap.peer_count,
     );
+    let validated_ready =
+        validated_ready_from_snapshot(snap.sync_done, snap.follower_healthy, &validated_ledger);
     let state_accounting = snap.state_accounting_snapshot.clone().unwrap_or_else(|| {
         crate::network::ops::synthetic_state_accounting_snapshot(
             snap.start_time,
@@ -1392,20 +2609,22 @@ pub fn server_info_snapshot(
             "server_state":      server_state,
             "validation_quorum": snap.validation_quorum,
             "validated_ledger": {
-                "seq":           snap.ledger_seq,
-                "hash":          snap.ledger_hash,
+                "seq":           validated_ledger.seq,
+                "hash":          validated_ledger.hash,
                 "base_fee_xrp":  snap.fees.base as f64 / 1_000_000.0,
                 "reserve_base_xrp": snap.fees.reserve as f64 / 1_000_000.0,
                 "reserve_inc_xrp":  snap.fees.increment as f64 / 1_000_000.0,
-                "age":           age,
-                "close_time":    snap.ledger_header.close_time,
+                "age":           validated_ledger.age,
+                "close_time":    validated_ledger.close_time,
                 "close_time_human": close_time_human,
             },
-            "validated_ledger_age": age,
+            "validated_ledger_age": validated_ledger.age,
             "peers":             snap.peer_count,
             "pubkey_node":       snap.pubkey_node,
             "uptime":            snap.start_time.elapsed().as_secs(),
             "complete_ledgers":  snap.complete_ledgers,
+            "stored_ledger_range": snap.complete_ledgers,
+            "validated_ready":    validated_ready,
             "memory_mb":         snap.memory_mb,
             "objects_stored":    snap.object_count,
             "leaf_count":        snap.leaf_count,
@@ -1452,19 +2671,19 @@ pub fn server_info_snapshot(
 }
 
 pub fn server_state_snapshot(snap: &crate::rpc::RpcSnapshot) -> Result<Value, RpcError> {
-    const XRPL_EPOCH_OFFSET: u64 = 946_684_800;
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let ledger_unix = snap.ledger_header.close_time as u64 + XRPL_EPOCH_OFFSET;
-    let age = now_unix.saturating_sub(ledger_unix);
+    let validated_ledger = validated_ledger_status_from_snapshot(snap, now_unix);
     let server_state = crate::network::ops::snapshot_server_state_label(
         snap.sync_done,
         snap.follower_healthy,
-        age,
+        validated_ledger.age,
         snap.peer_count,
     );
+    let validated_ready =
+        validated_ready_from_snapshot(snap.sync_done, snap.follower_healthy, &validated_ledger);
     let state_accounting = snap.state_accounting_snapshot.clone().unwrap_or_else(|| {
         crate::network::ops::synthetic_state_accounting_snapshot(
             snap.start_time,
@@ -1481,18 +2700,20 @@ pub fn server_state_snapshot(snap: &crate::rpc::RpcSnapshot) -> Result<Value, Rp
             "server_state": server_state,
             "validation_quorum": snap.validation_quorum,
             "validated_ledger": {
-                "seq": snap.ledger_seq,
-                "hash": snap.ledger_hash,
+                "seq": validated_ledger.seq,
+                "hash": validated_ledger.hash,
                 "base_fee": snap.fees.base,
                 "reserve_base": snap.fees.reserve,
                 "reserve_inc": snap.fees.increment,
-                "age": age,
-                "close_time": snap.ledger_header.close_time,
+                "age": validated_ledger.age,
+                "close_time": validated_ledger.close_time,
             },
             "peers": snap.peer_count,
             "pubkey_node": snap.pubkey_node,
             "uptime": snap.start_time.elapsed().as_secs(),
             "complete_ledgers": snap.complete_ledgers,
+            "stored_ledger_range": snap.complete_ledgers,
+            "validated_ready": validated_ready,
             "memory_mb": snap.memory_mb,
             "objects_stored": snap.object_count,
         }
@@ -1509,15 +2730,11 @@ pub fn server_state_snapshot(snap: &crate::rpc::RpcSnapshot) -> Result<Value, Rp
 }
 
 pub fn server_info(ctx: &NodeContext) -> Result<Value, RpcError> {
-    // XRPL epoch starts at 2000-01-01 00:00:00 UTC = Unix timestamp 946684800
-    const XRPL_EPOCH_OFFSET: u64 = 946_684_800;
-
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let ledger_unix = ctx.ledger_header.close_time as u64 + XRPL_EPOCH_OFFSET;
-    let age = now_unix.saturating_sub(ledger_unix);
+    let validated_ledger = validated_ledger_status_from_ctx(ctx, now_unix);
     let validation_quorum = current_validation_quorum(ctx);
     let ops = ctx
         .network_ops_snapshot
@@ -1529,6 +2746,12 @@ pub fn server_info(ctx: &NodeContext) -> Result<Value, RpcError> {
         .cloned()
         .unwrap_or_default();
     let server_state = ops.server_state.clone();
+    let complete_ledgers = ctx
+        .history
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .complete_ledgers();
+    let validated_ready = validated_ready_from_server_state(&server_state, &validated_ledger);
     let state_accounting = ctx.state_accounting_snapshot.clone().unwrap_or_else(|| {
         crate::network::ops::synthetic_state_accounting_snapshot(
             ctx.start_time,
@@ -1545,13 +2768,13 @@ pub fn server_info(ctx: &NodeContext) -> Result<Value, RpcError> {
             "server_state":          server_state,
             "validation_quorum":     validation_quorum,
             "validated_ledger": {
-                "seq":               ctx.ledger_seq,
-                "hash":              ctx.ledger_hash,
+                "seq":               validated_ledger.seq,
+                "hash":              validated_ledger.hash,
                 "base_fee_xrp":      ctx.fees.base as f64 / 1_000_000.0,
                 "reserve_base_xrp":  ctx.fees.reserve as f64 / 1_000_000.0,
                 "reserve_inc_xrp":   ctx.fees.increment as f64 / 1_000_000.0,
-                "age":               age,
-                "close_time":        ctx.ledger_header.close_time,
+                "age":               validated_ledger.age,
+                "close_time":        validated_ledger.close_time,
             },
             "peers":                 ops.peer_count,
             "cluster":               {
@@ -1595,7 +2818,9 @@ pub fn server_info(ctx: &NodeContext) -> Result<Value, RpcError> {
             "submitted_transactions": ops.submitted_transactions,
             "pubkey_node":           ctx.pubkey_node.clone(),
             "uptime":                ctx.start_time.elapsed().as_secs(),
-            "complete_ledgers":      ctx.history.read().unwrap_or_else(|e| e.into_inner()).complete_ledgers(),
+            "complete_ledgers":      complete_ledgers.clone(),
+            "stored_ledger_range":   complete_ledgers,
+            "validated_ready":       validated_ready,
             "memory_mb":             get_memory_mb(),
             "objects_stored":        ops.object_count,
         }
@@ -1654,14 +2879,11 @@ pub fn server_info(ctx: &NodeContext) -> Result<Value, RpcError> {
 }
 
 pub fn server_state(ctx: &NodeContext) -> Result<Value, RpcError> {
-    const XRPL_EPOCH_OFFSET: u64 = 946_684_800;
-
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let ledger_unix = ctx.ledger_header.close_time as u64 + XRPL_EPOCH_OFFSET;
-    let age = now_unix.saturating_sub(ledger_unix);
+    let validated_ledger = validated_ledger_status_from_ctx(ctx, now_unix);
     let validation_quorum = current_validation_quorum(ctx);
     let ops = ctx
         .network_ops_snapshot
@@ -1679,6 +2901,12 @@ pub fn server_state(ctx: &NodeContext) -> Result<Value, RpcError> {
             std::time::Instant::now(),
         )
     });
+    let complete_ledgers = ctx
+        .history
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .complete_ledgers();
+    let validated_ready = validated_ready_from_server_state(&ops.server_state, &validated_ledger);
 
     let mut state = json!({
         "state": {
@@ -1688,13 +2916,13 @@ pub fn server_state(ctx: &NodeContext) -> Result<Value, RpcError> {
             "server_state": ops.server_state,
             "validation_quorum": validation_quorum,
             "validated_ledger": {
-                "seq": ctx.ledger_seq,
-                "hash": ctx.ledger_hash,
+                "seq": validated_ledger.seq,
+                "hash": validated_ledger.hash,
                 "base_fee": ctx.fees.base,
                 "reserve_base": ctx.fees.reserve,
                 "reserve_inc": ctx.fees.increment,
-                "age": age,
-                "close_time": ctx.ledger_header.close_time,
+                "age": validated_ledger.age,
+                "close_time": validated_ledger.close_time,
             },
             "peers": ops.peer_count,
             "cluster": {
@@ -1738,7 +2966,9 @@ pub fn server_state(ctx: &NodeContext) -> Result<Value, RpcError> {
             "submitted_transactions": ops.submitted_transactions,
             "pubkey_node": ctx.pubkey_node.clone(),
             "uptime": ctx.start_time.elapsed().as_secs(),
-            "complete_ledgers": ctx.history.read().unwrap_or_else(|e| e.into_inner()).complete_ledgers(),
+            "complete_ledgers": complete_ledgers.clone(),
+            "stored_ledger_range": complete_ledgers,
+            "validated_ready": validated_ready,
             "memory_mb": get_memory_mb(),
             "objects_stored": ops.object_count,
         }
@@ -1768,15 +2998,36 @@ fn current_validation_quorum(ctx: &NodeContext) -> u32 {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if let Some(manager) = ctx.validator_list_manager.as_ref() {
-        return manager
+        let snapshot = manager
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .snapshot(now)
-            .validation_quorum;
+            .snapshot(now);
+        let disabled = current_negative_unl_disabled(ctx);
+        let effective =
+            crate::validator_list::apply_negative_unl(&snapshot.effective_unl, &disabled);
+        return crate::consensus::validation_quorum_count(
+            effective.len(),
+            Some(snapshot.effective_unl.len()),
+        ) as u32;
     }
 
-    let unl_size = ctx.amendments.len().max(35) as u32;
-    unl_size * 80 / 100 + 1
+    0
+}
+
+fn current_negative_unl_disabled(ctx: &NodeContext) -> Vec<Vec<u8>> {
+    let negative_unl_key = crate::ledger::keylet::negative_unl().key;
+    let raw = ctx
+        .closed_ledger
+        .as_ref()
+        .and_then(|closed| closed.get_raw(&negative_unl_key))
+        .or_else(|| {
+            ctx.ledger_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_raw(&negative_unl_key)
+                .map(|raw| raw.to_vec())
+        });
+    crate::validator_list::disabled_validators_from_negative_unl_raw(raw.as_deref())
 }
 
 pub fn version() -> Result<Value, RpcError> {
@@ -1789,183 +3040,15 @@ pub fn version() -> Result<Value, RpcError> {
     }))
 }
 
-fn server_definition_type_name(type_code: u16) -> &'static str {
-    match type_code {
-        1 => "UInt16",
-        2 => "UInt32",
-        3 => "UInt64",
-        4 => "Hash128",
-        5 => "Hash256",
-        6 => "Amount",
-        7 => "Blob",
-        8 => "AccountID",
-        14 => "STObject",
-        15 => "STArray",
-        16 => "UInt8",
-        17 => "Hash160",
-        19 => "Vector256",
-        _ => "Unknown",
-    }
-}
-
-fn server_definition_fields() -> Vec<Value> {
-    use crate::transaction::field as f;
-    let defs: [(&str, crate::transaction::field::FieldDef); 43] = [
-        ("TransactionType", f::TRANSACTION_TYPE),
-        ("SignerWeight", f::SIGNER_WEIGHT),
-        ("TransferFee", f::TRANSFER_FEE),
-        ("Flags", f::FLAGS),
-        ("SourceTag", f::SOURCE_TAG),
-        ("Sequence", f::SEQUENCE),
-        ("Expiration", f::EXPIRATION),
-        ("TransferRate", f::TRANSFER_RATE),
-        ("DestinationTag", f::DESTINATION_TAG),
-        ("QualityIn", f::QUALITY_IN),
-        ("QualityOut", f::QUALITY_OUT),
-        ("OfferSequence", f::OFFER_SEQUENCE),
-        ("LastLedgerSequence", f::LAST_LEDGER_SEQUENCE),
-        ("CancelAfter", f::CANCEL_AFTER),
-        ("FinishAfter", f::FINISH_AFTER),
-        ("SettleDelay", f::SETTLE_DELAY),
-        ("TicketSequence", f::TICKET_SEQUENCE),
-        ("NFTokenTaxon", f::NFTOKEN_TAXON),
-        ("AccountTxnID", f::ACCOUNT_TXID),
-        ("NFTokenID", f::NFTOKEN_ID),
-        ("InvoiceID", f::INVOICE_ID),
-        ("Channel", f::CHANNEL),
-        ("NFTokenBuyOffer", f::NFTOKEN_BUY_OFFER),
-        ("NFTokenSellOffer", f::NFTOKEN_SELL_OFFER),
-        ("Amount", f::AMOUNT),
-        ("LimitAmount", f::LIMIT_AMOUNT),
-        ("TakerPays", f::TAKER_PAYS),
-        ("TakerGets", f::TAKER_GETS),
-        ("Fee", f::FEE),
-        ("SendMax", f::SEND_MAX),
-        ("DeliverMin", f::DELIVER_MIN),
-        ("PublicKey", f::PUBLIC_KEY),
-        ("SigningPubKey", f::SIGNING_PUB_KEY),
-        ("TxnSignature", f::TXN_SIGNATURE),
-        ("URI", f::URI),
-        ("Signature", f::SIGNATURE),
-        ("MemoType", f::MEMO_TYPE),
-        ("MemoData", f::MEMO_DATA),
-        ("Account", f::ACCOUNT),
-        ("Destination", f::DESTINATION),
-        ("Issuer", f::ISSUER),
-        ("Authorize", f::AUTHORIZE),
-        ("Unauthorize", f::UNAUTHORIZE),
-    ];
-    defs.into_iter()
-        .map(|(name, def)| {
-            json!([
-                name,
-                {
-                    "isSerialized": true,
-                    "isSigningField": def.is_signing,
-                    "isVLEncoded": def.type_code == crate::transaction::field::TypeCode::Blob as u16,
-                    "nth": def.field_code,
-                    "type": server_definition_type_name(def.type_code),
-                }
-            ])
-        })
-        .collect()
-}
-
-fn server_definition_transaction_types() -> Vec<Value> {
-    vec![
-        json!(["Payment", 0]),
-        json!(["EscrowCreate", 1]),
-        json!(["EscrowFinish", 2]),
-        json!(["AccountSet", 3]),
-        json!(["EscrowCancel", 4]),
-        json!(["SetRegularKey", 5]),
-        json!(["OfferCreate", 7]),
-        json!(["OfferCancel", 8]),
-        json!(["TicketCreate", 10]),
-        json!(["PaymentChannelCreate", 13]),
-        json!(["PaymentChannelFund", 14]),
-        json!(["PaymentChannelClaim", 15]),
-        json!(["CheckCreate", 16]),
-        json!(["CheckCash", 17]),
-        json!(["CheckCancel", 18]),
-        json!(["DepositPreauth", 19]),
-        json!(["TrustSet", 20]),
-        json!(["AccountDelete", 21]),
-        json!(["NFTokenMint", 25]),
-        json!(["NFTokenBurn", 26]),
-        json!(["NFTokenCreateOffer", 27]),
-        json!(["NFTokenCancelOffer", 28]),
-        json!(["NFTokenAcceptOffer", 29]),
-        json!(["AMMCreate", 35]),
-        json!(["AMMDeposit", 36]),
-        json!(["AMMWithdraw", 37]),
-        json!(["AMMVote", 38]),
-        json!(["AMMBid", 39]),
-        json!(["AMMDelete", 40]),
-        json!(["DelegateSet", 64]),
-        json!(["Batch", 71]),
-    ]
-}
-
-fn server_definition_ledger_entry_types() -> Vec<Value> {
-    vec![
-        json!(["AccountRoot", 0x0061]),
-        json!(["DirectoryNode", 0x0064]),
-        json!(["RippleState", 0x0072]),
-        json!(["Offer", 0x006F]),
-        json!(["LedgerHashes", 0x0068]),
-        json!(["Amendments", 0x0066]),
-        json!(["FeeSettings", 0x0073]),
-        json!(["NegativeUNL", 0x004E]),
-        json!(["Escrow", 0x0075]),
-        json!(["PayChannel", 0x0078]),
-        json!(["Check", 0x0043]),
-        json!(["DepositPreauth", 0x0070]),
-        json!(["Ticket", 0x0054]),
-        json!(["SignerList", 0x0053]),
-        json!(["NFTokenPage", 0x0050]),
-        json!(["NFTokenOffer", 0x0037]),
-        json!(["AMM", 0x0079]),
-        json!(["DID", 0x0049]),
-        json!(["Oracle", 0x0080]),
-        json!(["MPToken", 0x007F]),
-        json!(["MPTokenIssuance", 0x007E]),
-        json!(["Bridge", 0x0069]),
-        json!(["XChainOwnedClaimID", 0x0071]),
-        json!(["XChainOwnedCreateAccountClaimID", 0x0074]),
-        json!(["Credential", 0x0081]),
-        json!(["PermissionedDomain", 0x0082]),
-        json!(["Delegate", 0x0083]),
-        json!(["Vault", 0x0084]),
-        json!(["LoanBroker", 0x0088]),
-        json!(["Loan", 0x0089]),
-    ]
-}
-
 pub fn server_definitions(params: &Value) -> Result<Value, RpcError> {
-    let base = json!({
-        "FIELDS": server_definition_fields(),
-        "LEDGER_ENTRY_TYPES": server_definition_ledger_entry_types(),
-        "TRANSACTION_TYPES": server_definition_transaction_types(),
-        "TYPES": [
-            ["UInt16", 1],
-            ["UInt32", 2],
-            ["UInt64", 3],
-            ["Hash128", 4],
-            ["Hash256", 5],
-            ["Amount", 6],
-            ["Blob", 7],
-            ["AccountID", 8],
-            ["STObject", 14],
-            ["STArray", 15],
-            ["UInt8", 16],
-            ["Hash160", 17],
-            ["Vector256", 19]
-        ]
-    });
-
-    let encoded = serde_json::to_vec(&base).map_err(|_| RpcError::internal("definitions"))?;
-    let hash = hex::encode_upper(crate::crypto::sha256(&encoded));
+    let base: Value =
+        serde_json::from_str(include_str!("data/server_definitions_mainnet_3_1_2.json"))
+            .map_err(|_| RpcError::internal("definitions"))?;
+    let hash = base
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::internal("definitions"))?
+        .to_string();
     if params
         .get("hash")
         .and_then(Value::as_str)
@@ -2017,6 +3100,33 @@ pub fn fetch_info(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
     if let Some(fetch) = &ctx.fetch_info {
         let mut entry = serde_json::Map::new();
         entry.insert("hash".to_string(), json!(fetch.hash));
+        entry.insert("sync_active".to_string(), json!(fetch.sync_active));
+        entry.insert(
+            "sync_in_progress".to_string(),
+            json!(fetch.sync_in_progress),
+        );
+        entry.insert("sync_done".to_string(), json!(fetch.sync_done));
+        entry.insert(
+            "pending_sync_anchor".to_string(),
+            json!(fetch.pending_sync_anchor),
+        );
+        entry.insert("target_seq".to_string(), json!(fetch.target_seq));
+        entry.insert("target_hash".to_string(), json!(fetch.target_hash));
+        entry.insert(
+            "target_account_hash".to_string(),
+            json!(fetch.target_account_hash),
+        );
+        entry.insert(
+            "computed_root_hash".to_string(),
+            json!(fetch.computed_root_hash),
+        );
+        entry.insert("root_matches".to_string(), json!(fetch.root_matches));
+        entry.insert("ready".to_string(), json!(fetch.ready));
+        entry.insert("readiness".to_string(), json!(fetch.readiness));
+        entry.insert(
+            "readiness_blockers".to_string(),
+            json!(fetch.readiness_blockers),
+        );
         entry.insert("have_header".to_string(), json!(fetch.have_header));
         entry.insert("have_state".to_string(), json!(fetch.have_state));
         entry.insert(
@@ -2034,6 +3144,25 @@ pub fn fetch_info(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
         entry.insert("peers".to_string(), json!(fetch.peers));
         entry.insert("timeouts".to_string(), json!(fetch.timeouts));
         entry.insert("in_flight".to_string(), json!(fetch.in_flight));
+        entry.insert(
+            "outstanding_cookies".to_string(),
+            json!(fetch.outstanding_cookies),
+        );
+        entry.insert(
+            "outstanding_object_queries".to_string(),
+            json!(fetch.outstanding_object_queries),
+        );
+        entry.insert("recent_nodes".to_string(), json!(fetch.recent_nodes));
+        entry.insert(
+            "useful_idle_secs".to_string(),
+            json!(fetch.useful_idle_secs),
+        );
+        entry.insert(
+            "response_idle_secs".to_string(),
+            json!(fetch.response_idle_secs),
+        );
+        entry.insert("queue_len".to_string(), json!(fetch.queue_len));
+        entry.insert("queue_bytes".to_string(), json!(fetch.queue_bytes));
         entry.insert("inner_nodes".to_string(), json!(fetch.inner_nodes));
         entry.insert("state_nodes".to_string(), json!(fetch.state_nodes));
         entry.insert("pass".to_string(), json!(fetch.pass));
@@ -2665,6 +3794,14 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                     "store_unchecked_ops": snapshot.store_unchecked_ops,
                     "batch_store_ops": snapshot.batch_store_ops,
                     "batch_store_nodes": snapshot.batch_store_nodes,
+                    "fetch_total_ms": snapshot.fetch_total_ms,
+                    "fetch_max_ms": snapshot.fetch_max_ms,
+                    "store_total_ms": snapshot.store_total_ms,
+                    "store_max_ms": snapshot.store_max_ms,
+                    "batch_store_total_ms": snapshot.batch_store_total_ms,
+                    "batch_store_max_ms": snapshot.batch_store_max_ms,
+                    "flush_total_ms": snapshot.flush_total_ms,
+                    "flush_max_ms": snapshot.flush_max_ms,
                     "flush_ops": snapshot.flush_ops,
                     "last_flush_unix": snapshot.last_flush_unix,
                     "last_flush_duration_ms": snapshot.last_flush_duration_ms,
@@ -2679,8 +3816,9 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 .cloned()
                 .unwrap_or_default();
             Ok(json!({
-                "fetch_pack": {
+                    "fetch_pack": {
                     "tracked": snapshot.tracked,
+                    "bytes": snapshot.bytes,
                     "stashed_total": snapshot.stashed_total,
                     "backend_fill_total": snapshot.backend_fill_total,
                     "imported_total": snapshot.imported_total,
@@ -2760,42 +3898,61 @@ pub fn print(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
                 .as_ref()
                 .cloned()
                 .unwrap_or_default();
-            Ok(json!({
-                "inbound_ledgers": {
-                    "active": snapshot.active,
-                    "complete": snapshot.complete,
-                    "failed": snapshot.failed,
-                    "retry_ready": snapshot.retry_ready,
-                    "stale": snapshot.stale,
-                    "fetch_rate": snapshot.fetch_rate,
-                    "fetched_total": snapshot.fetched_total,
-                    "fetch_pack_hits": snapshot.fetch_pack_hits,
-                    "cache_size": snapshot.cache_size,
-                    "sweep_total": snapshot.sweep_total,
-                    "last_sweep_removed": snapshot.last_sweep_removed,
-                    "last_sweep_unix": snapshot.last_sweep_unix,
-                    "stop_total": snapshot.stop_total,
-                    "last_stop_unix": snapshot.last_stop_unix,
-                    "cached_seq_hashes": snapshot.cached_seq_hashes,
-                    "cached_seq_headers": snapshot.cached_seq_headers,
-                    "recent_failures": snapshot.recent_failures,
-                    "history": snapshot.history,
-                    "generic": snapshot.generic,
-                    "consensus": snapshot.consensus,
-                    "entries": snapshot.entries.into_iter().map(|entry| json!({
+            let entries = snapshot
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    json!({
                         "ledger_hash": entry.ledger_hash,
                         "ledger_seq": entry.ledger_seq,
                         "reason": entry.reason,
                         "has_header": entry.has_header,
+                        "has_state": entry.has_state,
                         "has_transactions": entry.has_transactions,
+                        "tx_complete": entry.tx_complete,
+                        "tx_missing_nodes": entry.tx_missing_nodes,
+                        "state_root_known": entry.state_root_known,
+                        "full_complete": entry.full_complete,
                         "complete": entry.complete,
                         "failed": entry.failed,
                         "timeout_count": entry.timeout_count,
                         "age_ms": entry.age_ms,
                         "idle_ms": entry.idle_ms,
-                    })).collect::<Vec<_>>(),
-                }
-            }))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let inbound_ledgers = json!({
+                "active": snapshot.active,
+                "complete": snapshot.complete,
+                "header_complete": snapshot.header_complete,
+                "state_complete": snapshot.state_complete,
+                "tx_complete": snapshot.tx_complete,
+                "full_complete": snapshot.full_complete,
+                "tx_missing_nodes_total": snapshot.tx_missing_nodes_total,
+                "failed": snapshot.failed,
+                "retry_ready": snapshot.retry_ready,
+                "stale": snapshot.stale,
+                "fetch_rate": snapshot.fetch_rate,
+                "fetched_total": snapshot.fetched_total,
+                "fetch_pack_hits": snapshot.fetch_pack_hits,
+                "cache_size": snapshot.cache_size,
+                "sweep_total": snapshot.sweep_total,
+                "last_sweep_removed": snapshot.last_sweep_removed,
+                "last_sweep_unix": snapshot.last_sweep_unix,
+                "stop_total": snapshot.stop_total,
+                "last_stop_unix": snapshot.last_stop_unix,
+                "cached_seq_hashes": snapshot.cached_seq_hashes,
+                "cached_seq_headers": snapshot.cached_seq_headers,
+                "recent_failures": snapshot.recent_failures,
+                "history": snapshot.history,
+                "generic": snapshot.generic,
+                "consensus": snapshot.consensus,
+                "header_responses_total": snapshot.header_responses_total,
+                "tx_node_responses_total": snapshot.tx_node_responses_total,
+                "state_tree_complete_total": snapshot.state_tree_complete_total,
+                "entries": entries,
+            });
+            Ok(json!({ "inbound_ledgers": inbound_ledgers }))
         }
         Some("network_ops") => {
             let snapshot = ctx
@@ -3512,12 +4669,17 @@ pub fn validators(ctx: &NodeContext) -> Result<Value, RpcError> {
             Value::Object(entry)
         })
         .collect();
-    let trusted_validator_keys: Vec<String> = snapshot
-        .effective_unl
+    let disabled_validators = current_negative_unl_disabled(ctx);
+    let effective_unl =
+        crate::validator_list::apply_negative_unl(&snapshot.effective_unl, &disabled_validators);
+    let trusted_validator_keys: Vec<String> = effective_unl
         .iter()
         .map(|raw| encode_validator_display(raw))
         .collect();
-    let validation_quorum = snapshot.validation_quorum;
+    let validation_quorum = crate::consensus::validation_quorum_count(
+        effective_unl.len(),
+        Some(snapshot.effective_unl.len()),
+    ) as u32;
     let mut signing_keys = std::collections::BTreeMap::<String, Value>::new();
     for publisher in &snapshot.publisher_lists {
         for manifest in publisher
@@ -3586,8 +4748,10 @@ pub fn unl_list(ctx: &NodeContext) -> Result<Value, RpcError> {
         .unwrap_or_else(|e| e.into_inner())
         .snapshot(now);
 
-    let trusted: HashSet<String> = snapshot
-        .effective_unl
+    let disabled_validators = current_negative_unl_disabled(ctx);
+    let effective_unl =
+        crate::validator_list::apply_negative_unl(&snapshot.effective_unl, &disabled_validators);
+    let trusted: HashSet<String> = effective_unl
         .iter()
         .map(|pk| crate::crypto::base58::encode(crate::crypto::base58::PREFIX_NODE_PUBLIC, pk))
         .collect();
@@ -4464,8 +5628,18 @@ pub fn fee(ctx: &NodeContext) -> Result<Value, RpcError> {
 // ── account_info ─────────────────────────────────────────────────────────────
 
 pub fn account_info(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
-    let address = params.get("account").and_then(Value::as_str).unwrap_or("");
-    let account_id = parse_account_field(params, "account")?;
+    let account_field = if params.get("account").is_some() {
+        "account"
+    } else if params.get("ident").is_some() {
+        "ident"
+    } else {
+        return Err(RpcError::invalid_params("missing 'account' field"));
+    };
+    let address = params
+        .get(account_field)
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let account_id = parse_account_field(params, account_field)?;
     let account_key = crate::ledger::keylet::account(&account_id).key;
 
     // Resolve ledger_index — rippled: lookupLedger validates the ledger exists
@@ -4541,25 +5715,902 @@ pub fn account_info(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError
     if root.minted_nftokens != 0 {
         account_data["MintedNFTokens"] = json!(root.minted_nftokens);
     }
+    if root.first_nftoken_sequence != 0 {
+        account_data["FirstNFTokenSequence"] = json!(root.first_nftoken_sequence);
+    }
     if root.burned_nftokens != 0 {
         account_data["BurnedNFTokens"] = json!(root.burned_nftokens);
     }
 
-    Ok(json!({
+    let flags = root.flags;
+    let account_flags = json!({
+        "defaultRipple": flags & crate::ledger::account::LSF_DEFAULT_RIPPLE != 0,
+        "depositAuth": flags & crate::ledger::account::LSF_DEPOSIT_AUTH != 0,
+        "disableMasterKey": flags & crate::ledger::account::LSF_DISABLE_MASTER != 0,
+        "disallowIncomingCheck": flags & 0x0800_0000 != 0,
+        "disallowIncomingNFTokenOffer": flags & 0x0400_0000 != 0,
+        "disallowIncomingPayChan": flags & 0x1000_0000 != 0,
+        "disallowIncomingTrustline": flags & crate::ledger::account::LSF_DISALLOW_INCOMING_TRUSTLINE != 0,
+        "disallowIncomingXRP": flags & crate::ledger::account::LSF_DISALLOW_XRP != 0,
+        "globalFreeze": flags & crate::ledger::account::LSF_GLOBAL_FREEZE != 0,
+        "noFreeze": flags & crate::ledger::account::LSF_NO_FREEZE != 0,
+        "passwordSpent": flags & crate::ledger::account::LSF_PASSWORD_SPENT != 0,
+        "requireAuthorization": flags & crate::ledger::account::LSF_REQUIRE_AUTH != 0,
+        "requireDestinationTag": flags & crate::ledger::account::LSF_REQUIRE_DEST_TAG != 0,
+    });
+
+    let mut result = json!({
         "account_data":         account_data,
+        "account_flags":        account_flags,
         "ledger_current_index": ctx.ledger_seq,
-        "validated":            ctx.ledger_seq > 0,
-    }))
+        "ledger_hash":          requested_seq
+            .and_then(|seq| {
+                if seq == ctx.ledger_seq {
+                    Some(ctx.ledger_hash.clone())
+                } else {
+                    ctx.history
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_ledger(seq)
+                        .map(|rec| hex::encode_upper(rec.header.hash))
+                }
+            })
+            .unwrap_or_else(|| ctx.ledger_hash.clone()),
+        "ledger_index":         requested_seq.unwrap_or(ctx.ledger_seq),
+        "validated":            requested_seq
+            .map(|seq| ledger_seq_is_validated(ctx, seq, None))
+            .unwrap_or_else(|| ledger_seq_is_validated(ctx, ctx.ledger_seq, None)),
+    });
+
+    let queue_requested = parse_bool_field(params, "queue")?.unwrap_or(false);
+    if queue_requested
+        && (params.get("ledger_hash").is_some()
+            || params
+                .get("ledger_index")
+                .is_some_and(|value| value.as_str() != Some("current")))
+    {
+        return Err(RpcError::invalid_params(
+            "queue can only be requested for the open ledger",
+        ));
+    }
+
+    if queue_requested {
+        let tx_count = ctx
+            .tx_pool
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .count_by_account(&account_id);
+        result["queue_data"] = json!({
+            "txn_count": tx_count,
+        });
+    }
+
+    if parse_bool_field(params, "signer_lists")?.unwrap_or(false) {
+        let signer_key = crate::ledger::keylet::signer_list(&account_id).key;
+        let raw = if is_historical {
+            let target_seq = requested_seq.unwrap();
+            let (_, mut map) =
+                historical_state_map(target_seq, ctx, "historical signer list lookup unavailable")?;
+            map.get(&signer_key)
+        } else {
+            let ls = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+            ls.get_raw(&signer_key)
+                .map(|raw| raw.to_vec())
+                .or_else(|| ls.get_raw_owned(&signer_key))
+                .or_else(|| ls.get_committed_raw_owned(&signer_key))
+        };
+        if let Some(raw) = raw {
+            if let Some(summary) = raw_object_summary(&signer_key.0, &raw) {
+                result["signer_lists"] = json!([summary]);
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 // ── submit ────────────────────────────────────────────────────────────────────
 
 // ── ripple_path_find ─────────────────────────────────────────────────────────
 
-pub fn ripple_path_find(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
-    use crate::ledger::offer::{amount_to_f64, BookKey};
-    use crate::transaction::amount::{Amount, Currency, IouValue};
+const PATH_FIND_MAX_ALTERNATIVES: usize = 6;
+const PATH_FIND_TF_NO_RIPPLE_DIRECT: u32 = 0x0001_0000;
 
+#[derive(Clone)]
+struct PathFindSourceFilter {
+    currency: [u8; 20],
+    issuer: Option<[u8; 20]>,
+}
+
+#[derive(Clone)]
+struct PathFindAmmPool {
+    pseudo_account: [u8; 20],
+}
+
+#[derive(Clone)]
+struct PathFindCandidate {
+    source_issue: crate::transaction::amount::Issue,
+    paths: Vec<Vec<crate::transaction::parse::PathStep>>,
+    paths_computed: Value,
+}
+
+struct PathFindRankedAlternative {
+    paths_computed: Value,
+    source_amount: crate::transaction::amount::Amount,
+    quality: f64,
+    liquidity: f64,
+    path_len: usize,
+    index: usize,
+}
+
+fn path_issue_parts(issue: &crate::transaction::amount::Issue) -> ([u8; 20], [u8; 20]) {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => ([0u8; 20], [0u8; 20]),
+        crate::transaction::amount::Issue::Iou { currency, issuer } => (currency.code, *issuer),
+        crate::transaction::amount::Issue::Mpt(_) => ([0u8; 20], [0u8; 20]),
+    }
+}
+
+fn path_issue_from_parts(
+    currency: [u8; 20],
+    issuer: [u8; 20],
+) -> crate::transaction::amount::Issue {
+    if currency == [0u8; 20] {
+        crate::transaction::amount::Issue::Xrp
+    } else {
+        crate::transaction::amount::Issue::Iou {
+            currency: crate::transaction::amount::Currency { code: currency },
+            issuer,
+        }
+    }
+}
+
+fn amount_issue(
+    amount: &crate::transaction::amount::Amount,
+) -> Option<crate::transaction::amount::Issue> {
+    match amount {
+        crate::transaction::amount::Amount::Xrp(_) => Some(crate::transaction::amount::Issue::Xrp),
+        crate::transaction::amount::Amount::Iou {
+            currency, issuer, ..
+        } => Some(crate::transaction::amount::Issue::Iou {
+            currency: currency.clone(),
+            issuer: *issuer,
+        }),
+        crate::transaction::amount::Amount::Mpt(_) => None,
+    }
+}
+
+fn parse_permissioned_domain_id(params: &Value) -> Result<Option<[u8; 32]>, RpcError> {
+    let Some(raw) = params.get("domain") else {
+        return Ok(None);
+    };
+    let s = raw.as_str().ok_or_else(|| invalid_field("domain"))?;
+    let bytes = hex::decode(s).map_err(|_| invalid_field("domain"))?;
+    if bytes.len() != 32 {
+        return Err(invalid_field("domain"));
+    }
+    let mut domain_id = [0u8; 32];
+    domain_id.copy_from_slice(&bytes);
+    if domain_id == [0u8; 32] {
+        return Err(invalid_field("domain"));
+    }
+    Ok(Some(domain_id))
+}
+
+fn permissioned_domain_exists(ls: &crate::ledger::LedgerState, domain_id: &[u8; 32]) -> bool {
+    let key = crate::ledger::Key(*domain_id);
+    let Some(raw) = ls
+        .get_raw_owned(&key)
+        .or_else(|| ls.get_committed_raw_owned(&key))
+    else {
+        return false;
+    };
+    crate::ledger::meta::parse_sle(&raw).is_some_and(|sle| sle.entry_type == 0x0082)
+}
+
+fn validate_permissioned_domain_member(
+    ls: &crate::ledger::LedgerState,
+    account: &[u8; 20],
+    domain_id: &[u8; 32],
+    close_time: u64,
+    field: &'static str,
+) -> Result<(), RpcError> {
+    if !permissioned_domain_exists(ls, domain_id) {
+        return Err(lgr_not_found());
+    }
+    if !crate::ledger::tx::permissioned_domain::account_in_domain(
+        ls, account, domain_id, close_time,
+    ) {
+        return Err(RpcError::invalid_params(&format!(
+            "{field} is not a member of the requested permissioned domain"
+        )));
+    }
+    Ok(())
+}
+
+fn path_find_amount_for_issue(
+    issue: &crate::transaction::amount::Issue,
+    value: f64,
+) -> crate::transaction::amount::Amount {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => {
+            crate::transaction::amount::Amount::Xrp(value.ceil().max(0.0) as u64)
+        }
+        crate::transaction::amount::Issue::Iou { currency, issuer } => {
+            crate::transaction::amount::Amount::Iou {
+                value: crate::transaction::amount::IouValue::from_f64(value.max(0.0)),
+                currency: currency.clone(),
+                issuer: *issuer,
+            }
+        }
+        crate::transaction::amount::Issue::Mpt(_) => {
+            crate::transaction::amount::Amount::Mpt(Vec::new())
+        }
+    }
+}
+
+fn path_find_issue_step(issue: &crate::transaction::amount::Issue) -> Value {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => json!({"currency": "XRP"}),
+        crate::transaction::amount::Issue::Iou { currency, issuer } => json!({
+            "currency": currency.to_ascii(),
+            "issuer": crate::crypto::base58::encode_account(issuer),
+        }),
+        crate::transaction::amount::Issue::Mpt(raw) => json!({
+            "currency": "MPT",
+            "issuer": hex::encode_upper(raw),
+        }),
+    }
+}
+
+fn path_find_issue_path_step(
+    issue: &crate::transaction::amount::Issue,
+) -> crate::transaction::parse::PathStep {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => crate::transaction::parse::PathStep {
+            account: None,
+            currency: Some([0u8; 20]),
+            issuer: None,
+        },
+        crate::transaction::amount::Issue::Iou { currency, issuer } => {
+            crate::transaction::parse::PathStep {
+                account: None,
+                currency: Some(currency.code),
+                issuer: Some(*issuer),
+            }
+        }
+        crate::transaction::amount::Issue::Mpt(_) => crate::transaction::parse::PathStep {
+            account: None,
+            currency: None,
+            issuer: None,
+        },
+    }
+}
+
+fn path_find_account_step(account: &[u8; 20]) -> Value {
+    json!({"account": crate::crypto::base58::encode_account(account)})
+}
+
+fn path_find_account_path_step(account: [u8; 20]) -> crate::transaction::parse::PathStep {
+    crate::transaction::parse::PathStep {
+        account: Some(account),
+        currency: None,
+        issuer: None,
+    }
+}
+
+fn path_find_amm_step(
+    pool: &PathFindAmmPool,
+    out_issue: &crate::transaction::amount::Issue,
+) -> Value {
+    let mut step = match out_issue {
+        crate::transaction::amount::Issue::Xrp => json!({"currency": "XRP"}),
+        _ => path_find_issue_step(out_issue),
+    };
+    if let Some(obj) = step.as_object_mut() {
+        obj.insert(
+            "account".to_string(),
+            json!(crate::crypto::base58::encode_account(&pool.pseudo_account)),
+        );
+    }
+    step
+}
+
+fn parse_source_currency_filters(
+    params: &Value,
+) -> Result<Option<Vec<PathFindSourceFilter>>, RpcError> {
+    let Some(value) = params.get("source_currencies") else {
+        return Ok(None);
+    };
+    let currencies = value
+        .as_array()
+        .ok_or_else(|| RpcError::invalid_params("invalid source_currencies"))?;
+    if currencies.len() > 18 {
+        return Err(RpcError::invalid_params("invalid source_currencies"));
+    }
+    let mut out = Vec::new();
+    for entry in currencies {
+        let currency_text = entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("invalid source_currencies"))?;
+        if currency_text == "XRP" {
+            out.push(PathFindSourceFilter {
+                currency: [0u8; 20],
+                issuer: None,
+            });
+            continue;
+        }
+        let currency = crate::transaction::amount::Currency::from_code(currency_text)
+            .map_err(|_| RpcError::invalid_params("invalid source_currencies"))?;
+        let issuer = match entry.get("issuer").and_then(Value::as_str) {
+            Some(issuer) => Some(
+                decode_account(issuer)
+                    .map_err(|_| RpcError::invalid_params("invalid source_currencies"))?,
+            ),
+            None => None,
+        };
+        out.push(PathFindSourceFilter {
+            currency: currency.code,
+            issuer,
+        });
+    }
+    Ok(Some(out))
+}
+
+fn path_find_source_filter_allows(
+    filters: Option<&[PathFindSourceFilter]>,
+    issue: &crate::transaction::amount::Issue,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    let (currency, issuer) = path_issue_parts(issue);
+    filters.iter().any(|filter| {
+        filter.currency == currency && filter.issuer.map(|want| want == issuer).unwrap_or(true)
+    })
+}
+
+fn trustline_limit_for(
+    tl: &crate::ledger::trustline::RippleState,
+    account: &[u8; 20],
+) -> crate::transaction::amount::IouValue {
+    if account == &tl.low_account {
+        tl.low_limit
+    } else {
+        tl.high_limit
+    }
+}
+
+fn trustline_is_frozen(tl: &crate::ledger::trustline::RippleState) -> bool {
+    use crate::ledger::trustline::{
+        LSF_HIGH_DEEP_FREEZE, LSF_HIGH_FREEZE, LSF_LOW_DEEP_FREEZE, LSF_LOW_FREEZE,
+    };
+    (tl.flags & (LSF_LOW_FREEZE | LSF_HIGH_FREEZE | LSF_LOW_DEEP_FREEZE | LSF_HIGH_DEEP_FREEZE))
+        != 0
+}
+
+fn path_find_iou_spendable(
+    ls: &crate::ledger::LedgerState,
+    account: &[u8; 20],
+    currency: &crate::transaction::amount::Currency,
+    issuer: &[u8; 20],
+) -> f64 {
+    if account == issuer {
+        return f64::INFINITY;
+    }
+    let Some(tl) = ls.get_trustline_for(account, issuer, currency) else {
+        return 0.0;
+    };
+    if trustline_is_frozen(tl) {
+        return 0.0;
+    }
+    tl.balance_for(account).to_f64().max(0.0)
+}
+
+fn path_find_issue_spendable(
+    ls: &crate::ledger::LedgerState,
+    account: &[u8; 20],
+    issue: &crate::transaction::amount::Issue,
+) -> f64 {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => ls
+            .get_account(account)
+            .map(|acct| acct.balance as f64)
+            .unwrap_or(0.0),
+        crate::transaction::amount::Issue::Iou { currency, issuer } => {
+            path_find_iou_spendable(ls, account, currency, issuer)
+        }
+        crate::transaction::amount::Issue::Mpt(_) => 0.0,
+    }
+}
+
+fn path_find_iou_receive_capacity(
+    ls: &crate::ledger::LedgerState,
+    account: &[u8; 20],
+    currency: &crate::transaction::amount::Currency,
+    issuer: &[u8; 20],
+) -> f64 {
+    if account == issuer {
+        return f64::INFINITY;
+    }
+    let Some(tl) = ls.get_trustline_for(account, issuer, currency) else {
+        return 0.0;
+    };
+    if trustline_is_frozen(tl) {
+        return 0.0;
+    }
+    let limit = trustline_limit_for(tl, account).to_f64();
+    let balance = tl.balance_for(account).to_f64();
+    (limit - balance).max(0.0)
+}
+
+fn path_find_destination_can_receive(
+    ls: &crate::ledger::LedgerState,
+    account: &[u8; 20],
+    issue: &crate::transaction::amount::Issue,
+    amount: f64,
+) -> bool {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => true,
+        crate::transaction::amount::Issue::Iou { currency, issuer } => {
+            path_find_iou_receive_capacity(ls, account, currency, issuer) + 1e-12 >= amount
+        }
+        crate::transaction::amount::Issue::Mpt(_) => false,
+    }
+}
+
+fn path_find_parsed_field<'a>(
+    fields: &'a [crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<&'a [u8]> {
+    fields
+        .iter()
+        .find(|field| field.type_code == type_code && field.field_code == field_code)
+        .map(|field| field.data.as_slice())
+}
+
+fn path_find_parsed_issue(
+    fields: &[crate::ledger::meta::ParsedField],
+    type_code: u16,
+    field_code: u16,
+) -> Option<crate::transaction::amount::Issue> {
+    crate::transaction::amount::Issue::from_bytes(path_find_parsed_field(
+        fields, type_code, field_code,
+    )?)
+    .map(|(issue, _)| issue)
+}
+
+fn path_find_reserve_for_issue(
+    ls: &crate::ledger::LedgerState,
+    pseudo_account: &[u8; 20],
+    issue: &crate::transaction::amount::Issue,
+) -> Option<f64> {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => {
+            Some(ls.get_account(pseudo_account)?.balance as f64)
+        }
+        crate::transaction::amount::Issue::Iou { currency, issuer } => {
+            let tl = ls.get_trustline_for(pseudo_account, issuer, currency)?;
+            if trustline_is_frozen(tl) {
+                return None;
+            }
+            Some(tl.balance_for(pseudo_account).to_f64().max(0.0))
+        }
+        crate::transaction::amount::Issue::Mpt(_) => None,
+    }
+}
+
+fn path_find_load_amm_pool(
+    ls: &crate::ledger::LedgerState,
+    in_issue: &crate::transaction::amount::Issue,
+    out_issue: &crate::transaction::amount::Issue,
+) -> Option<PathFindAmmPool> {
+    if in_issue == out_issue {
+        return None;
+    }
+    let key = crate::ledger::tx::amm_key(in_issue, out_issue);
+    let raw = ls
+        .get_raw_owned(&key)
+        .or_else(|| ls.get_committed_raw_owned(&key))?;
+    let parsed = crate::ledger::meta::parse_sle(&raw)?;
+    if parsed.entry_type != 0x0079 {
+        return None;
+    }
+    let asset = path_find_parsed_issue(&parsed.fields, 24, 3);
+    let asset2 = path_find_parsed_issue(&parsed.fields, 24, 4);
+    if let (Some(asset), Some(asset2)) = (asset.as_ref(), asset2.as_ref()) {
+        if ![asset, asset2].contains(&in_issue) || ![asset, asset2].contains(&out_issue) {
+            return None;
+        }
+    }
+    let pseudo_account = sle_account_field(&parsed, 1)?;
+    let reserve_in = path_find_reserve_for_issue(ls, &pseudo_account, in_issue)?;
+    let reserve_out = path_find_reserve_for_issue(ls, &pseudo_account, out_issue)?;
+    if reserve_in <= 0.0 || reserve_out <= 0.0 {
+        return None;
+    }
+    let trading_fee = path_find_parsed_field(&parsed.fields, 1, 5)
+        .or_else(|| path_find_parsed_field(&parsed.fields, 1, 2))
+        .and_then(|data| (data.len() == 2).then(|| u16::from_be_bytes([data[0], data[1]])))
+        .unwrap_or(0);
+    if trading_fee > 1000 {
+        return None;
+    }
+    Some(PathFindAmmPool { pseudo_account })
+}
+
+fn path_find_source_issues(
+    ls: &crate::ledger::LedgerState,
+    source: &[u8; 20],
+    filters: Option<&[PathFindSourceFilter]>,
+) -> Vec<crate::transaction::amount::Issue> {
+    let mut issues = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push_issue = |issue: crate::transaction::amount::Issue| {
+        if !path_find_source_filter_allows(filters, &issue) {
+            return;
+        }
+        let key = path_issue_parts(&issue);
+        if seen.insert(key) {
+            issues.push(issue);
+        }
+    };
+
+    if path_find_issue_spendable(ls, source, &crate::transaction::amount::Issue::Xrp) > 0.0 {
+        push_issue(crate::transaction::amount::Issue::Xrp);
+    }
+
+    for tl in ls.trustlines_for_account(source) {
+        if trustline_is_frozen(tl) {
+            continue;
+        }
+        let peer = if source == &tl.low_account {
+            tl.high_account
+        } else {
+            tl.low_account
+        };
+        let issue = crate::transaction::amount::Issue::Iou {
+            currency: tl.currency.clone(),
+            issuer: peer,
+        };
+        if path_find_issue_spendable(ls, source, &issue) > 0.0 {
+            push_issue(issue);
+        }
+    }
+
+    for (book_key, _) in ls.iter_order_books() {
+        if book_key.pays_currency != [0u8; 20] && book_key.pays_issuer == *source {
+            push_issue(path_issue_from_parts(
+                book_key.pays_currency,
+                book_key.pays_issuer,
+            ));
+        }
+    }
+
+    if let Some(filters) = filters {
+        for filter in filters {
+            if filter.currency != [0u8; 20] {
+                let issuer = filter.issuer.unwrap_or(*source);
+                push_issue(path_issue_from_parts(filter.currency, issuer));
+            }
+        }
+    }
+
+    issues
+}
+
+fn path_find_amount_value(amount: &crate::transaction::amount::Amount) -> f64 {
+    match amount {
+        crate::transaction::amount::Amount::Xrp(drops) => *drops as f64,
+        crate::transaction::amount::Amount::Iou { value, .. } => value.to_f64().max(0.0),
+        crate::transaction::amount::Amount::Mpt(_) => 0.0,
+    }
+}
+
+fn path_find_issue_balance_value(
+    ls: &crate::ledger::LedgerState,
+    account: &[u8; 20],
+    issue: &crate::transaction::amount::Issue,
+) -> f64 {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => ls
+            .get_account(account)
+            .map(|acct| acct.balance as f64)
+            .unwrap_or(0.0),
+        crate::transaction::amount::Issue::Iou { currency, issuer } if account == issuer => ls
+            .trustlines_for_account(account)
+            .into_iter()
+            .filter(|tl| tl.currency == *currency)
+            .map(|tl| {
+                let peer = if *account == tl.low_account {
+                    tl.high_account
+                } else {
+                    tl.low_account
+                };
+                tl.balance_for(&peer).to_f64().max(0.0)
+            })
+            .sum(),
+        crate::transaction::amount::Issue::Iou { currency, issuer } => ls
+            .get_trustline_for(account, issuer, currency)
+            .map(|tl| tl.balance_for(account).to_f64().max(0.0))
+            .unwrap_or(0.0),
+        crate::transaction::amount::Issue::Mpt(_) => 0.0,
+    }
+}
+
+fn path_find_source_limit_amount(
+    ls: &crate::ledger::LedgerState,
+    source: &[u8; 20],
+    issue: &crate::transaction::amount::Issue,
+) -> Option<crate::transaction::amount::Amount> {
+    match issue {
+        crate::transaction::amount::Issue::Xrp => {
+            let drops = ls.get_account(source)?.balance;
+            (drops > 0).then_some(crate::transaction::amount::Amount::Xrp(drops))
+        }
+        crate::transaction::amount::Issue::Iou { currency, issuer } => {
+            let value = if source == issuer {
+                crate::transaction::amount::IouValue {
+                    mantissa: 1_000_000_000_000_000,
+                    exponent: 20,
+                }
+            } else {
+                let spendable = path_find_iou_spendable(ls, source, currency, issuer);
+                if spendable <= 0.0 {
+                    return None;
+                }
+                crate::transaction::amount::IouValue::from_f64(spendable)
+            };
+            Some(crate::transaction::amount::Amount::Iou {
+                value,
+                currency: currency.clone(),
+                issuer: *issuer,
+            })
+        }
+        crate::transaction::amount::Issue::Mpt(_) => None,
+    }
+}
+
+fn path_find_amount_from_value_for_issue(
+    issue: &crate::transaction::amount::Issue,
+    value: f64,
+) -> crate::transaction::amount::Amount {
+    path_find_amount_for_issue(issue, value.max(0.0))
+}
+
+fn path_find_candidate_key(candidate: &PathFindCandidate) -> String {
+    let (currency, issuer) = path_issue_parts(&candidate.source_issue);
+    format!(
+        "{}:{}:{}",
+        hex::encode_upper(currency),
+        hex::encode_upper(issuer),
+        candidate.paths_computed
+    )
+}
+
+fn path_find_push_candidate(
+    candidates: &mut Vec<PathFindCandidate>,
+    seen: &mut std::collections::HashSet<String>,
+    source_issue: crate::transaction::amount::Issue,
+    path: Vec<crate::transaction::parse::PathStep>,
+    paths_computed: Value,
+) {
+    let candidate = PathFindCandidate {
+        source_issue,
+        paths: if path.is_empty() { vec![] } else { vec![path] },
+        paths_computed,
+    };
+    if seen.insert(path_find_candidate_key(&candidate)) {
+        candidates.push(candidate);
+    }
+}
+
+fn path_find_book_edges(
+    ls: &crate::ledger::LedgerState,
+    domain_id: Option<[u8; 32]>,
+) -> Vec<(
+    crate::transaction::amount::Issue,
+    crate::transaction::amount::Issue,
+)> {
+    let mut edges = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (book_key, book) in ls.iter_order_books() {
+        if book.is_empty() {
+            continue;
+        }
+        if book_key.domain_id != domain_id {
+            continue;
+        }
+        let in_issue = path_issue_from_parts(book_key.pays_currency, book_key.pays_issuer);
+        let out_issue = path_issue_from_parts(book_key.gets_currency, book_key.gets_issuer);
+        if in_issue == out_issue {
+            continue;
+        }
+        if seen.insert((path_issue_parts(&in_issue), path_issue_parts(&out_issue))) {
+            edges.push((in_issue, out_issue));
+        }
+    }
+    edges
+}
+
+fn path_find_collect_book_candidates(
+    ls: &crate::ledger::LedgerState,
+    source_issue: &crate::transaction::amount::Issue,
+    dst_issue: &crate::transaction::amount::Issue,
+    domain_id: Option<[u8; 32]>,
+    candidates: &mut Vec<PathFindCandidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let edges = path_find_book_edges(ls, domain_id);
+    let mut stack = vec![(
+        source_issue.clone(),
+        Vec::<crate::transaction::amount::Issue>::new(),
+    )];
+    let mut visited = std::collections::HashSet::new();
+
+    while let Some((current, path_outputs)) = stack.pop() {
+        if path_outputs.len() >= 3 {
+            continue;
+        }
+        for (edge_in, edge_out) in &edges {
+            if edge_in != &current {
+                continue;
+            }
+            if path_outputs.contains(edge_out) || edge_out == source_issue {
+                continue;
+            }
+            let mut next_outputs = path_outputs.clone();
+            next_outputs.push(edge_out.clone());
+            let visit_key = (
+                path_issue_parts(edge_out),
+                next_outputs
+                    .iter()
+                    .map(path_issue_parts)
+                    .collect::<Vec<([u8; 20], [u8; 20])>>(),
+            );
+            if !visited.insert(visit_key) {
+                continue;
+            }
+            if edge_out == dst_issue {
+                let path = next_outputs
+                    .iter()
+                    .map(path_find_issue_path_step)
+                    .collect::<Vec<_>>();
+                let paths_json = next_outputs
+                    .iter()
+                    .map(path_find_issue_step)
+                    .collect::<Vec<_>>();
+                path_find_push_candidate(
+                    candidates,
+                    seen,
+                    source_issue.clone(),
+                    path,
+                    json!([paths_json]),
+                );
+            } else {
+                stack.push((edge_out.clone(), next_outputs));
+            }
+        }
+    }
+}
+
+fn path_find_collect_account_candidates(
+    ls: &crate::ledger::LedgerState,
+    source: &[u8; 20],
+    destination: &[u8; 20],
+    source_issue: &crate::transaction::amount::Issue,
+    dst_issue: &crate::transaction::amount::Issue,
+    candidates: &mut Vec<PathFindCandidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let (
+        crate::transaction::amount::Issue::Iou {
+            currency: source_currency,
+            ..
+        },
+        crate::transaction::amount::Issue::Iou {
+            currency: dst_currency,
+            ..
+        },
+    ) = (source_issue, dst_issue)
+    else {
+        return;
+    };
+    if source_currency != dst_currency {
+        return;
+    }
+
+    for tl in ls.trustlines_for_account(source) {
+        if trustline_is_frozen(tl) || tl.currency != *source_currency {
+            continue;
+        }
+        let peer = if source == &tl.low_account {
+            tl.high_account
+        } else {
+            tl.low_account
+        };
+        if peer == *destination || peer == *source {
+            continue;
+        }
+        let path = vec![path_find_account_path_step(peer)];
+        path_find_push_candidate(
+            candidates,
+            seen,
+            source_issue.clone(),
+            path,
+            json!([[path_find_account_step(&peer)]]),
+        );
+    }
+}
+
+fn path_find_evaluate_candidate(
+    ls: &mut crate::ledger::LedgerState,
+    source: &[u8; 20],
+    destination: &[u8; 20],
+    source_issue: &crate::transaction::amount::Issue,
+    dst_amount: &crate::transaction::amount::Amount,
+    candidate: PathFindCandidate,
+    index: usize,
+    domain_id: Option<[u8; 32]>,
+    close_time: u64,
+) -> Option<PathFindRankedAlternative> {
+    let send_max = path_find_source_limit_amount(ls, source, source_issue)?;
+    let before_source = path_find_issue_balance_value(ls, source, source_issue);
+    let dst_issue = amount_issue(dst_amount)?;
+    let before_dest = path_find_issue_balance_value(ls, destination, &dst_issue);
+    let mut sim = ls.simulation_copy();
+    let flags = if candidate.paths.is_empty() {
+        0
+    } else {
+        PATH_FIND_TF_NO_RIPPLE_DIRECT
+    };
+    let result = crate::ledger::tx::ripple_calc::ripple_calculate_with_domain(
+        &mut sim,
+        source,
+        destination,
+        dst_amount,
+        Some(&send_max),
+        None,
+        &candidate.paths,
+        flags,
+        domain_id,
+        close_time,
+    );
+    if !result.success {
+        return None;
+    }
+
+    let after_source = path_find_issue_balance_value(&sim, source, source_issue);
+    let after_dest = path_find_issue_balance_value(&sim, destination, &dst_issue);
+    let mut actual_in = if matches!(source_issue, crate::transaction::amount::Issue::Iou { issuer, .. } if issuer == source)
+    {
+        (after_source - before_source).max(0.0)
+    } else {
+        (before_source - after_source).max(0.0)
+    };
+    let actual_out = (after_dest - before_dest)
+        .max(path_find_amount_value(dst_amount))
+        .max(0.0);
+    if actual_in <= 0.0 {
+        actual_in = path_find_amount_value(dst_amount);
+    }
+    if actual_in <= 0.0 || actual_out <= 0.0 {
+        return None;
+    }
+    Some(PathFindRankedAlternative {
+        paths_computed: candidate.paths_computed,
+        source_amount: path_find_amount_from_value_for_issue(source_issue, actual_in),
+        quality: actual_in / actual_out,
+        liquidity: actual_out,
+        path_len: candidate.paths.iter().map(Vec::len).sum(),
+        index,
+    })
+}
+
+pub fn ripple_path_find(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
+    let requested_seq = resolve_ledger_selector(params, ctx)?.unwrap_or(ctx.ledger_seq);
     let src_addr = params
         .get("source_account")
         .and_then(Value::as_str)
@@ -4577,148 +6628,142 @@ pub fn ripple_path_find(params: &Value, ctx: &NodeContext) -> Result<Value, RpcE
     let dst_id = decode_account(dst_addr)
         .map_err(|_| RpcError::invalid_params("invalid destination_account"))?;
 
-    // Parse destination amount
-    let (dst_currency, dst_issuer) = parse_currency_spec(Some(dst_amount_json))?;
-    let dst_is_xrp = dst_currency == [0u8; 20];
+    let dst_amount = parse_amount_from_value(dst_amount_json, "destination_amount")?;
+    let dst_issue = amount_issue(&dst_amount)
+        .ok_or_else(|| RpcError::invalid_params("invalid destination_amount"))?;
+    let dst_value = path_find_amount_value(&dst_amount);
+    if dst_value <= 0.0 {
+        return Err(RpcError::invalid_params("invalid destination_amount"));
+    }
+    if params.get("send_max").is_some() && params.get("source_currencies").is_some() {
+        return Err(RpcError::invalid_params(
+            "send_max and source_currencies cannot both be specified",
+        ));
+    }
+    let source_filters = parse_source_currency_filters(params)?;
+    let source_filters = source_filters.as_deref();
+    let domain_id = parse_permissioned_domain_id(params)?;
 
-    let dst_value = if dst_is_xrp {
-        dst_amount_json
-            .as_str()
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| dst_amount_json.as_u64().map(|v| v as f64))
-            .unwrap_or(0.0)
+    let (mut historical_state, close_time);
+    let mut current_guard;
+    let ls: &mut crate::ledger::LedgerState = if requested_seq == ctx.ledger_seq {
+        close_time = ctx.ledger_header.close_time;
+        current_guard = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+        &mut current_guard
     } else {
-        dst_amount_json
-            .get("value")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0)
+        let (header, state) =
+            historical_ledger_state(requested_seq, ctx, "historical path find unavailable")?;
+        close_time = header.close_time;
+        historical_state = state;
+        &mut historical_state
     };
-
-    let ls = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
-    let mut alternatives: Vec<Value> = Vec::new();
-
-    // ── Direct XRP path (if destination wants XRP) ──────────────────────────
-    if dst_is_xrp {
-        // Source can send XRP directly if they have enough balance
-        if let Some(src_acct) = ls.get_account(&src_id) {
-            if src_acct.balance as f64 >= dst_value {
-                alternatives.push(json!({
-                    "paths_computed": [],
-                    "source_amount": dst_value.to_string(),
-                }));
-            }
-        }
+    if let Some(domain_id) = domain_id.as_ref() {
+        validate_permissioned_domain_member(
+            &ls,
+            &src_id,
+            domain_id,
+            ctx.ledger_header.close_time,
+            "source_account",
+        )?;
     }
 
-    // ── Direct trust line path (if source and dest share a trust line) ──────
-    if !dst_is_xrp {
-        let currency = Currency { code: dst_currency };
-        if let Some(tl) = ls.get_trustline_for(&src_id, &dst_id, &currency) {
-            let bal = tl.balance_for(&src_id);
-            let bal_f = if bal.mantissa == 0 {
-                0.0
-            } else {
-                bal.mantissa as f64 * 10f64.powi(bal.exponent)
-            };
-            if bal_f >= dst_value {
-                alternatives.push(json!({
-                    "paths_computed": [],
-                    "source_amount": format_amount(&Amount::Iou {
-                        value: IouValue::from_f64(dst_value),
-                        currency: currency.clone(),
-                        issuer: dst_issuer,
-                    }),
-                }));
-            }
-        }
+    if !path_find_destination_can_receive(&ls, &dst_id, &dst_issue, dst_value) {
+        return Ok(json!({
+            "alternatives": [],
+            "destination_account": dst_addr,
+            "destination_amount":  dst_amount_json,
+        }));
     }
 
-    // ── One-hop via XRP (IOU→XRP→IOU) ───────────────────────────────────────
-    if !dst_is_xrp {
-        // Check if there's an order book from XRP to destination currency
-        let book_key = BookKey {
-            pays_currency: dst_currency,
-            pays_issuer: dst_issuer,
-            gets_currency: [0u8; 20], // XRP
-            gets_issuer: [0u8; 20],
-        };
-        if let Some(book) = ls.get_book(&book_key) {
-            if !book.is_empty() {
-                // Estimate cost: walk cheapest offers
-                let mut xrp_needed = 0f64;
-                let mut remaining = dst_value;
-                for key in book.iter_by_quality() {
-                    if remaining <= 0.0 {
-                        break;
-                    }
-                    if let Some(off) = ls.get_offer(key) {
-                        let gets_f = amount_to_f64(&off.taker_gets); // XRP
-                        let pays_f = amount_to_f64(&off.taker_pays); // IOU
-                        if pays_f <= 0.0 {
-                            continue;
-                        }
-                        let fill = remaining.min(pays_f);
-                        let cost = fill / pays_f * gets_f;
-                        xrp_needed += cost;
-                        remaining -= fill;
-                    }
-                }
-                if remaining <= 0.0 {
-                    alternatives.push(json!({
-                        "paths_computed": [
-                            [{"currency": "XRP"}]
-                        ],
-                        "source_amount": (xrp_needed.round().max(0.0) as u64).to_string(),
-                    }));
-                }
-            }
-        }
-    }
-
-    // ── One-hop via intermediary IOU ─────────────────────────────────────────
-    // For each trust line the source holds, check if there's a book to the dest currency
-    let src_lines = ls.trustlines_for_account(&src_id);
-    for tl in &src_lines {
-        let src_currency = &tl.currency;
-        if src_currency.is_xrp() {
+    let mut candidates: Vec<PathFindCandidate> = Vec::new();
+    let mut seen_candidates = std::collections::HashSet::new();
+    let source_issues = path_find_source_issues(&ls, &src_id, source_filters);
+    for source_issue in &source_issues {
+        if source_issue == &dst_issue {
+            path_find_push_candidate(
+                &mut candidates,
+                &mut seen_candidates,
+                source_issue.clone(),
+                vec![],
+                json!([]),
+            );
             continue;
         }
-        if src_currency.code == dst_currency {
-            continue;
-        } // already handled above
-
-        let peer = if src_id == tl.low_account {
-            &tl.high_account
-        } else {
-            &tl.low_account
-        };
-
-        let book_key = BookKey {
-            pays_currency: dst_currency,
-            pays_issuer: dst_issuer,
-            gets_currency: src_currency.code,
-            gets_issuer: *peer,
-        };
-        if let Some(book) = ls.get_book(&book_key) {
-            if !book.is_empty() {
-                alternatives.push(json!({
-                    "paths_computed": [
-                        [{"currency": src_currency.to_ascii(), "issuer": crate::crypto::base58::encode_account(peer)}]
-                    ],
-                    "source_amount": format_amount(&Amount::Iou {
-                        value: IouValue::from_f64(dst_value),
-                        currency: src_currency.clone(),
-                        issuer: *peer,
-                    }),
-                }));
+        path_find_collect_account_candidates(
+            &ls,
+            &src_id,
+            &dst_id,
+            source_issue,
+            &dst_issue,
+            &mut candidates,
+            &mut seen_candidates,
+        );
+        path_find_collect_book_candidates(
+            &ls,
+            source_issue,
+            &dst_issue,
+            domain_id,
+            &mut candidates,
+            &mut seen_candidates,
+        );
+        if domain_id.is_none() {
+            if let Some(pool) = path_find_load_amm_pool(&ls, source_issue, &dst_issue) {
+                path_find_push_candidate(
+                    &mut candidates,
+                    &mut seen_candidates,
+                    source_issue.clone(),
+                    vec![path_find_issue_path_step(&dst_issue)],
+                    json!([[path_find_amm_step(&pool, &dst_issue)]]),
+                );
             }
         }
-
-        if alternatives.len() >= 6 {
-            break;
-        } // cap at 6
     }
+
+    let mut ranked = Vec::new();
+    let mut seen_alternatives = std::collections::HashSet::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if !seen_alternatives.insert(path_find_candidate_key(&candidate)) {
+            continue;
+        }
+        let source_issue = candidate.source_issue.clone();
+        if let Some(alternative) = path_find_evaluate_candidate(
+            ls,
+            &src_id,
+            &dst_id,
+            &source_issue,
+            &dst_amount,
+            candidate,
+            index,
+            domain_id,
+            close_time,
+        ) {
+            ranked.push(alternative);
+        }
+    }
+
+    ranked.sort_by(|a, b| {
+        a.quality
+            .partial_cmp(&b.quality)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.liquidity
+                    .partial_cmp(&a.liquidity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.path_len.cmp(&b.path_len))
+            .then_with(|| b.index.cmp(&a.index))
+    });
+
+    let alternatives = ranked
+        .into_iter()
+        .take(PATH_FIND_MAX_ALTERNATIVES)
+        .map(|alternative| {
+            json!({
+                "paths_computed": alternative.paths_computed,
+                "source_amount": format_amount(&alternative.source_amount),
+            })
+        })
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "alternatives": alternatives,
@@ -4734,6 +6779,13 @@ pub(crate) fn path_find_update_result(
     let mut result = ripple_path_find(params, ctx)?;
     if let Some(obj) = result.as_object_mut() {
         obj.insert("type".to_string(), json!("path_find"));
+        obj.insert("full_reply".to_string(), json!(true));
+        if let Some(source_account) = params.get("source_account").cloned() {
+            obj.insert("source_account".to_string(), source_account);
+        }
+        if let Some(id) = params.get("id").cloned() {
+            obj.insert("id".to_string(), id);
+        }
     }
     Ok(result)
 }
@@ -4778,33 +6830,15 @@ pub fn path_find(params: &Value, request_id: &Value, ctx: &NodeContext) -> Resul
     let client_id = path_find_client_id(params, request_id)?;
 
     match subcommand {
-        "create" => {
-            let result = path_find_update_result(params, ctx)?;
-            manager.lock().unwrap_or_else(|e| e.into_inner()).upsert(
-                client_id,
-                params.clone(),
-                &result,
-            );
-            Ok(result)
-        }
-        "status" => {
-            let stored = manager
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .request_for(client_id)
-                .ok_or_else(|| RpcError::invalid_params("No active path_find request."))?;
-            let result = path_find_update_result(&stored, ctx)?;
-            manager
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .upsert(client_id, stored, &result);
-            Ok(result)
-        }
+        "create" | "status" => Err(RpcError::no_events()),
         "close" => {
             let closed = manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .close(client_id);
+            if !closed {
+                return Err(RpcError::no_path_request());
+            }
             Ok(json!({
                 "closed": closed,
             }))
@@ -4817,20 +6851,65 @@ pub fn path_find(params: &Value, request_id: &Value, ctx: &NodeContext) -> Resul
 
 // ── feature (amendments) ─────────────────────────────────────────────────────
 
+fn ledger_enabled_amendment_hashes(ctx: &NodeContext) -> std::collections::HashSet<[u8; 32]> {
+    if let Some(closed) = ctx.closed_ledger.as_ref() {
+        if let Some(raw) = closed.get_raw(&crate::ledger::amendments_key()) {
+            return crate::ledger::parse_amendments(&raw).into_iter().collect();
+        }
+    }
+
+    let state = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+    crate::ledger::read_amendments(&state).into_iter().collect()
+}
+
+fn amendment_feature_hash(feature: &str) -> Option<[u8; 32]> {
+    let trimmed = feature.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let bytes = hex::decode(trimmed).ok()?;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes);
+        Some(hash)
+    } else {
+        Some(crate::crypto::sha512_first_half(trimmed.as_bytes()))
+    }
+}
+
 pub fn feature(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
+    let enabled_hashes = ledger_enabled_amendment_hashes(ctx);
+    let configured_by_hash: std::collections::HashMap<[u8; 32], &String> = ctx
+        .amendments
+        .iter()
+        .map(|name| (crate::crypto::sha512_first_half(name.as_bytes()), name))
+        .collect();
+
     if let Some(name) = params.get("feature").and_then(Value::as_str) {
-        let enabled = ctx.amendments.contains(name);
+        let hash = amendment_feature_hash(name).ok_or_else(|| invalid_field("feature"))?;
+        let enabled = enabled_hashes.contains(&hash);
+        let supported = ctx.amendments.contains(name) || configured_by_hash.contains_key(&hash);
         let mut obj = serde_json::Map::new();
         obj.insert(
             name.to_string(),
-            json!({ "enabled": enabled, "supported": enabled }),
+            json!({ "enabled": enabled, "supported": supported || enabled }),
         );
         return Ok(json!({ "features": obj }));
     }
 
     let mut features = serde_json::Map::new();
     for name in &ctx.amendments {
-        features.insert(name.clone(), json!({ "enabled": true, "supported": true }));
+        let hash = crate::crypto::sha512_first_half(name.as_bytes());
+        features.insert(
+            name.clone(),
+            json!({ "enabled": enabled_hashes.contains(&hash), "supported": true }),
+        );
+    }
+    for hash in enabled_hashes {
+        if configured_by_hash.contains_key(&hash) {
+            continue;
+        }
+        features.insert(
+            hex::encode_upper(hash),
+            json!({ "enabled": true, "supported": true }),
+        );
     }
     Ok(json!({ "features": features }))
 }
@@ -4914,15 +6993,14 @@ pub fn sign(params: &Value, _ctx: &NodeContext) -> Result<Value, RpcError> {
                 .get("issuer")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::invalid_params("IOU Amount missing 'issuer'"))?;
-            let value_f64 = value_str
-                .parse::<f64>()
+            let value = crate::transaction::amount::IouValue::parse_decimal(value_str)
                 .map_err(|_| RpcError::invalid_params("invalid Amount value"))?;
             let currency = crate::transaction::amount::Currency::from_code(currency_str)
                 .map_err(|_| RpcError::invalid_params("invalid Amount currency"))?;
             let issuer = decode_account(issuer_str)
                 .map_err(|_| RpcError::invalid_params("invalid Amount issuer"))?;
             builder = builder.amount(Amount::Iou {
-                value: crate::transaction::amount::IouValue::from_f64(value_f64),
+                value,
                 currency,
                 issuer,
             });
@@ -5069,10 +7147,11 @@ pub fn simulate(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
         payload.extend_from_slice(&blob);
         crate::crypto::sha512_first_half(&payload)
     };
-    let sim_ctx = crate::ledger::apply::TxContext::from_parent(
+    let mut sim_ctx = crate::ledger::apply::TxContext::from_parent(
         &ctx.ledger_header,
         ctx.ledger_header.close_time,
     );
+    sim_ctx.network_id = ctx.network_id;
 
     let mut sim_state = {
         let mut state = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -5110,6 +7189,7 @@ pub fn simulate(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
             sim_ctx.ledger_seq,
             0,
             result.ter.token(),
+            payment_delivered_amount_hint(&parsed, result.ter.token()),
         );
         if binary {
             out["meta_blob"] = json!(hex::encode_upper(meta_blob));
@@ -5130,10 +7210,105 @@ pub fn simulate(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
     Ok(out)
 }
 
+fn payment_delivered_amount_hint<'a>(
+    tx: &'a crate::transaction::parse::ParsedTx,
+    result: &str,
+) -> Option<&'a crate::transaction::amount::Amount> {
+    const TF_PARTIAL_PAYMENT: u32 = 0x0002_0000;
+    (result == "tesSUCCESS" && tx.tx_type == 0 && (tx.flags & TF_PARTIAL_PAYMENT) == 0)
+        .then_some(tx.amount.as_ref())
+        .flatten()
+}
+
 // ── ledger_data ──────────────────────────────────────────────────────────────
 
+fn ledger_data_type_code(type_name: &str) -> Option<u16> {
+    match type_name {
+        "account" | "account_root" => Some(0x0061),
+        "amendments" => Some(0x0066),
+        "directory" | "directory_node" => Some(0x0064),
+        "fee" | "fee_settings" => Some(0x0073),
+        "hashes" | "ledger_hashes" => Some(0x0068),
+        "offer" => Some(0x006F),
+        "state" | "ripple_state" => Some(0x0072),
+        "check" => Some(0x0043),
+        "escrow" => Some(0x0075),
+        "payment_channel" => Some(0x0078),
+        "deposit_preauth" => Some(0x0070),
+        "ticket" => Some(0x0054),
+        "signer_list" => Some(0x0053),
+        "nft_page" => Some(0x0050),
+        "nft_offer" => Some(0x0037),
+        "amm" => Some(0x0079),
+        "did" => Some(0x0049),
+        "oracle" => Some(0x0080),
+        "credential" => Some(0x0081),
+        "permissioned_domain" => Some(0x0082),
+        "mpt_issuance" => Some(0x007E),
+        "mptoken" => Some(0x007F),
+        "vault" => Some(0x0084),
+        _ => None,
+    }
+}
+
+fn parse_ledger_data_type(params: &Value) -> Result<Option<u16>, RpcError> {
+    match params.get("type") {
+        None => Ok(None),
+        Some(Value::String(s)) => ledger_data_type_code(s)
+            .map(Some)
+            .ok_or_else(|| invalid_field("type")),
+        Some(_) => Err(invalid_field_not_string("type")),
+    }
+}
+
+fn ledger_data_raw_matches_type(raw: &[u8], filter: Option<u16>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    crate::ledger::meta::parse_sle(raw)
+        .map(|parsed| parsed.entry_type == filter)
+        .unwrap_or(false)
+}
+
+fn ledger_data_entry_json(key: crate::ledger::Key, raw: Vec<u8>, binary: bool) -> Value {
+    if binary {
+        json!({
+            "index": hex::encode_upper(key.0),
+            "data":  hex::encode_upper(raw),
+        })
+    } else {
+        raw_object_summary(&key.0, &raw).unwrap_or_else(|| {
+            json!({
+                "LedgerEntryType": "Unknown",
+                "index": hex::encode_upper(key.0),
+                "data": hex::encode_upper(raw),
+            })
+        })
+    }
+}
+
+fn ledger_data_ledger_envelope(seq: u32, hdr: &crate::ledger::LedgerHeader) -> Value {
+    json!({
+        "ledger_index": seq.to_string(),
+        "ledger_hash": hex::encode_upper(hdr.hash),
+        "parent_hash": hex::encode_upper(hdr.parent_hash),
+        "total_coins": hdr.total_coins.to_string(),
+        "close_time": hdr.close_time,
+        "closed": true,
+        "accepted": true,
+        "transaction_hash": hex::encode_upper(hdr.transaction_hash),
+        "account_hash": hex::encode_upper(hdr.account_hash),
+        "parent_close_time": hdr.parent_close_time,
+        "close_time_resolution": hdr.close_time_resolution,
+        "close_flags": hdr.close_flags,
+    })
+}
+
 pub fn ledger_data(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
-    let limit = parse_ledger_data_limit(params, 256, 256)?;
+    let binary = parse_bool_field(params, "binary")?.unwrap_or(false);
+    let max_limit = if binary { 256 } else { 2048 };
+    let limit = parse_ledger_data_limit(params, 256, max_limit)?;
+    let type_filter = parse_ledger_data_type(params)?;
 
     // Check if a specific historical ledger is requested
     let requested_seq = resolve_ledger_selector(params, ctx)?;
@@ -5149,14 +7324,9 @@ pub fn ledger_data(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
             historical_state_map(target_seq, ctx, "historical ledger enumeration unavailable")?;
         let marker = parse_ledger_data_marker(params)?;
 
-        if let Some(mark) = marker {
-            if map.get(&crate::ledger::Key(mark)).is_none() {
-                return Err(RpcError::invalid_params("invalid marker"));
-            }
-        }
-
         let mut state_objects: Vec<Value> = Vec::with_capacity(limit);
         let mut last_key: Option<[u8; 32]> = None;
+        let mut truncated = false;
         let mut next_key = marker
             .map(crate::ledger::Key)
             .and_then(|mark| map.upper_bound_lazy(&mark))
@@ -5172,24 +7342,27 @@ pub fn ledger_data(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
             let data = map
                 .get(&key)
                 .ok_or_else(|| RpcError::internal("historical ledger entry enumeration failed"))?;
-            state_objects.push(json!({
-                "index": hex::encode_upper(key.0),
-                "data":  hex::encode_upper(data),
-            }));
-            last_key = Some(key.0);
-            if state_objects.len() >= limit {
-                break;
+            if ledger_data_raw_matches_type(&data, type_filter) {
+                if state_objects.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                state_objects.push(ledger_data_entry_json(key, data, binary));
+                last_key = Some(key.0);
             }
             next_key = map.upper_bound_lazy(&key);
         }
 
-        let truncated = state_objects.len() == limit;
         let mut result = json!({
             "ledger_index": target_seq,
             "ledger_hash":  hex::encode_upper(header.hash),
             "state":        state_objects,
             "historical":   true,
+            "validated":    ledger_seq_is_validated(ctx, target_seq, Some(&hex::encode_upper(header.hash))),
         });
+        if marker.is_none() {
+            result["ledger"] = ledger_data_ledger_envelope(target_seq, &header);
+        }
         if truncated {
             result["truncated"] = json!(true);
             if let Some(lk) = last_key {
@@ -5202,36 +7375,35 @@ pub fn ledger_data(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
     // Current ledger — serve raw binary SLEs in key order with exact paging.
     let marker = parse_ledger_data_marker(params)?;
     let ls = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(mark) = marker {
-        if ls.get_raw(&crate::ledger::Key(mark)).is_none() {
-            return Err(RpcError::invalid_params("invalid marker"));
-        }
-    }
     let mut entries = ls.iter_raw_entries();
     entries.sort_by_key(|(key, _)| key.0);
     let mut state_objects: Vec<Value> = Vec::with_capacity(limit);
     let mut last_key: Option<[u8; 32]> = None;
+    let mut truncated = false;
     for (key, data) in entries {
         if let Some(after) = marker {
             if key.0 <= after {
                 continue;
             }
         }
-        state_objects.push(json!({
-            "index": hex::encode_upper(key.0),
-            "data":  hex::encode_upper(data),
-        }));
-        last_key = Some(key.0);
-        if state_objects.len() >= limit {
-            break;
+        if ledger_data_raw_matches_type(&data, type_filter) {
+            if state_objects.len() >= limit {
+                truncated = true;
+                break;
+            }
+            state_objects.push(ledger_data_entry_json(key, data.to_vec(), binary));
+            last_key = Some(key.0);
         }
     }
-    let truncated = state_objects.len() == limit;
     let mut result = json!({
         "ledger_index": ctx.ledger_seq,
         "ledger_hash":  ctx.ledger_hash,
         "state":        state_objects,
+        "validated":    ledger_seq_is_validated(ctx, ctx.ledger_seq, Some(&ctx.ledger_hash)),
     });
+    if marker.is_none() {
+        result["ledger"] = ledger_data_ledger_envelope(ctx.ledger_seq, &ctx.ledger_header);
+    }
     if truncated {
         result["truncated"] = json!(true);
         if let Some(lk) = last_key {
@@ -5247,7 +7419,7 @@ pub fn account_lines(params: &Value, ctx: &NodeContext) -> Result<Value, RpcErro
     let address = params.get("account").and_then(Value::as_str).unwrap_or("");
     let account_id = parse_account_field(params, "account")?;
     let limit = parse_limit_field(params, 200, 400)?;
-    let marker = parse_hex_key_marker(params)?;
+    let marker = parse_key_hint_marker(params)?;
     let requested_seq = resolve_ledger_selector(params, ctx)?.unwrap_or(ctx.ledger_seq);
     let is_historical = requested_seq != ctx.ledger_seq;
     let peer = match params.get("peer") {
@@ -5337,17 +7509,47 @@ pub fn account_lines(params: &Value, ctx: &NodeContext) -> Result<Value, RpcErro
     let mut next_marker: Option<[u8; 32]> = None;
 
     if is_historical {
-        if ctx
-            .history
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_ledger(requested_seq)
-            .is_none()
-        {
-            return Err(lgr_not_found());
+        let lines = collect_account_trustlines(&account_id, requested_seq, ctx)?;
+        if let Some(mark) = marker {
+            let marker_matches = lines.iter().any(|(key, tl)| {
+                if key.0 != mark {
+                    return false;
+                }
+                let peer_id = if account_id == tl.low_account {
+                    tl.high_account
+                } else {
+                    tl.low_account
+                };
+                peer.map(|p| p == peer_id).unwrap_or(true)
+            });
+            if !marker_matches {
+                return Err(RpcError::invalid_params("invalid marker"));
+            }
         }
-        // Historical trust-line enumeration not available (no object_history CF).
-        return Err(RpcError::internal("historical account_lines not available"));
+        let mut last_returned: Option<[u8; 32]> = None;
+        for (key, tl) in &lines {
+            if let Some(after) = marker {
+                if key.0 <= after {
+                    continue;
+                }
+            }
+            let peer_id = if account_id == tl.low_account {
+                tl.high_account
+            } else {
+                tl.low_account
+            };
+            if let Some(peer_filter) = peer {
+                if peer_filter != peer_id {
+                    continue;
+                }
+            }
+            if line_values.len() == limit {
+                next_marker = last_returned;
+                break;
+            }
+            line_values.push(line_json(tl));
+            last_returned = Some(key.0);
+        }
     } else if let Some(ref cl) = ctx.closed_ledger {
         // New path: read from ClosedLedger via ReadView + owner directory walk
         use crate::ledger::views::ReadView;
@@ -5492,32 +7694,13 @@ pub fn account_lines(params: &Value, ctx: &NodeContext) -> Result<Value, RpcErro
         "lines":   line_values,
     });
     if let Some(m) = next_marker {
-        result["marker"] = json!(hex::encode_upper(m));
+        result["marker"] = json!(format_key_hint_marker(m));
     }
     Ok(result)
 }
 
 fn format_iou_value(v: &crate::transaction::amount::IouValue) -> String {
-    if v.mantissa == 0 {
-        return "0".to_string();
-    }
-    // Simple decimal formatting
-    let abs = v.mantissa.unsigned_abs();
-    let sign = if v.mantissa < 0 { "-" } else { "" };
-    if v.exponent >= 0 {
-        let zeros = (v.exponent as usize).min(80); // cap to prevent huge alloc
-        format!("{}{}{}", sign, abs, "0".repeat(zeros))
-    } else {
-        let exp = (-v.exponent) as usize;
-        let s = format!("{:0>width$}", abs, width = exp + 1);
-        let (int, frac) = s.split_at(s.len() - exp);
-        let frac = frac.trim_end_matches('0');
-        if frac.is_empty() {
-            format!("{}{}", sign, int)
-        } else {
-            format!("{}{}.{}", sign, int, frac)
-        }
-    }
+    v.to_decimal_string()
 }
 
 fn positive_iou_string(v: &crate::transaction::amount::IouValue) -> String {
@@ -5607,19 +7790,34 @@ fn offer_quality_string(off: &crate::ledger::offer::Offer) -> String {
     }
 }
 
-fn owner_funds_current(
+fn owner_funds_amount_string(amount: &crate::transaction::amount::Amount) -> String {
+    match amount {
+        crate::transaction::amount::Amount::Xrp(drops) => drops.to_string(),
+        crate::transaction::amount::Amount::Iou { value, .. } => positive_iou_string(value),
+        crate::transaction::amount::Amount::Mpt(_) => "0".to_string(),
+    }
+}
+
+fn owner_funds_amount_current(
     ls: &crate::ledger::LedgerState,
     off: &crate::ledger::offer::Offer,
-) -> Option<String> {
+) -> Option<crate::transaction::amount::Amount> {
     match &off.taker_gets {
-        crate::transaction::amount::Amount::Xrp(_) => {
-            Some(ls.get_account(&off.account)?.balance.to_string())
-        }
+        crate::transaction::amount::Amount::Xrp(_) => Some(
+            crate::transaction::amount::Amount::Xrp(ls.get_account(&off.account)?.balance),
+        ),
         crate::transaction::amount::Amount::Iou {
             currency, issuer, ..
         } => {
+            if &off.account == issuer {
+                return Some(off.taker_gets.clone());
+            }
             let tl = ls.get_trustline_for(&off.account, issuer, currency)?;
-            Some(positive_iou_string(&tl.balance_for(&off.account)))
+            Some(crate::transaction::amount::Amount::Iou {
+                value: tl.balance_for(&off.account),
+                currency: currency.clone(),
+                issuer: *issuer,
+            })
         }
         crate::transaction::amount::Amount::Mpt(_) => None,
     }
@@ -5649,7 +7847,7 @@ pub fn account_tx(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
     let account_id = parse_account_field(params, "account")?;
 
     let limit = parse_limit_field(params, 200, 400)?;
-    let marker = parse_hex_key_marker(params)?;
+    let marker = parse_account_tx_marker(params)?;
     let binary = parse_bool_field(params, "binary")?.unwrap_or(false);
     let count = parse_bool_field(params, "count")?.unwrap_or(false);
     let forward = parse_bool_field(params, "forward")?.unwrap_or(false);
@@ -5701,6 +7899,26 @@ pub fn account_tx(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
             return Err(lgr_not_found());
         }
     }
+    if let Some(min) = range_min {
+        if min > ctx.ledger_seq && history.get_ledger(min).is_none() {
+            return Err(RpcError {
+                code: "invalidLgrRange",
+                error_code: 79,
+                message: "Invalid ledger range.".to_string(),
+                extra: None,
+            });
+        }
+    }
+    if let Some(max) = range_max {
+        if max > ctx.ledger_seq && history.get_ledger(max).is_none() {
+            return Err(RpcError {
+                code: "invalidLgrRange",
+                error_code: 79,
+                message: "Invalid ledger range.".to_string(),
+                extra: None,
+            });
+        }
+    }
 
     let tx_hashes = history.get_account_txs(&account_id);
     let mut seen = std::collections::HashSet::new();
@@ -5721,9 +7939,9 @@ pub fn account_tx(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
         txs.reverse();
     }
 
-    let start = if let Some(mark) = marker {
+    let start = if let Some((ledger, seq)) = marker {
         txs.iter()
-            .position(|rec| rec.hash == mark)
+            .position(|rec| rec.ledger_seq == ledger && rec.tx_index == seq)
             .map(|idx| idx + 1)
             .ok_or_else(|| RpcError::invalid_params("invalid marker"))?
     } else {
@@ -5732,27 +7950,35 @@ pub fn account_tx(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
     let start = start.saturating_add(offset);
 
     let mut transactions: Vec<Value> = Vec::new();
-    let mut next_marker: Option<[u8; 32]> = None;
-    let mut last_returned: Option<[u8; 32]> = None;
+    let mut next_marker: Option<(u32, u32)> = None;
+    let mut last_returned: Option<(u32, u32)> = None;
     for rec in txs.iter().skip(start) {
         if transactions.len() == limit {
             next_marker = last_returned;
             break;
         }
         transactions.push(tx_record_response(rec, ctx, binary));
-        last_returned = Some(rec.hash);
+        last_returned = Some((rec.ledger_seq, rec.tx_index));
     }
 
     let mut result = json!({
         "account":      address,
+        "ledger_index_min": range_min.map(i64::from).unwrap_or(-1),
+        "ledger_index_max": range_max.map(i64::from).unwrap_or(-1),
         "limit":        limit,
         "transactions": transactions,
+        "validated":    range_max
+            .map(|max| ledger_seq_is_validated(ctx, max, None))
+            .unwrap_or(true),
     });
     if count {
         result["count"] = json!(total_count);
     }
-    if let Some(mark) = next_marker {
-        result["marker"] = json!(hex::encode_upper(mark));
+    if let Some((ledger, seq)) = next_marker {
+        result["marker"] = json!({
+            "ledger": ledger,
+            "seq": seq,
+        });
     }
     Ok(result)
 }
@@ -5771,16 +7997,31 @@ pub fn book_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
 
     let taker_pays = parse_currency_spec(params.get("taker_pays"))?;
     let taker_gets = parse_currency_spec(params.get("taker_gets"))?;
+    if taker_pays == taker_gets {
+        return Err(RpcError::bad_market());
+    }
+    let domain_id = parse_permissioned_domain_id(params)?;
+    let taker = match params.get("taker") {
+        None => None,
+        Some(Value::String(s)) => Some(decode_account(s).map_err(|_| invalid_field("taker"))?),
+        Some(_) => return Err(invalid_field("taker")),
+    };
 
     let book_key = BookKey {
         pays_currency: taker_pays.0,
         pays_issuer: taker_pays.1,
         gets_currency: taker_gets.0,
         gets_issuer: taker_gets.1,
+        domain_id,
     };
     let mut next_marker: Option<[u8; 32]> = None;
     let mut offers_out: Vec<Value> = Vec::new();
-    let offer_json = |off: &crate::ledger::offer::Offer, owner_funds: Option<String>| {
+    let offer_json = |off: &crate::ledger::offer::Offer,
+                      owner_funds: Option<String>,
+                      funded: Option<(
+        crate::transaction::amount::Amount,
+        crate::transaction::amount::Amount,
+    )>| {
         let mut out = json!({
             "Account":    crate::crypto::base58::encode_account(&off.account),
             "BookDirectory": hex::encode_upper(off.book_directory),
@@ -5795,6 +8036,13 @@ pub fn book_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
         });
         if let Some(funds) = owner_funds {
             out["owner_funds"] = json!(funds);
+        }
+        if let Some((taker_gets_funded, taker_pays_funded)) = funded {
+            out["taker_gets_funded"] = format_amount(&taker_gets_funded);
+            out["taker_pays_funded"] = format_amount(&taker_pays_funded);
+        }
+        if let Some(domain) = off.domain_id {
+            out["DomainID"] = json!(hex::encode_upper(domain));
         }
         out
     };
@@ -5811,14 +8059,51 @@ pub fn book_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
 
     let mut matching: Vec<(crate::ledger::Key, crate::ledger::offer::Offer)> = Vec::new();
     if is_historical {
-        // Historical book_offers enumeration not available (no object_history CF).
-        return Err(RpcError::internal("historical book_offers not available"));
+        let (_, mut map) =
+            historical_state_map(requested_seq, ctx, "historical book_offers not available")?;
+        matching = collect_historical_state_entries(&mut map)?
+            .into_iter()
+            .filter_map(|(key, raw)| {
+                let offer = crate::ledger::offer::Offer::decode_from_sle(&raw)?;
+                let offer_book = BookKey::from_amounts_with_domain(
+                    &offer.taker_pays,
+                    &offer.taker_gets,
+                    offer.domain_id,
+                );
+                (offer_book == book_key).then_some((key, offer))
+            })
+            .collect();
     } else {
         let ls = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(domain_id) = domain_id.as_ref() {
+            if let Some(taker) = taker.as_ref() {
+                validate_permissioned_domain_member(
+                    &ls,
+                    taker,
+                    domain_id,
+                    ctx.ledger_header.close_time,
+                    "taker",
+                )?;
+            } else if !permissioned_domain_exists(&ls, domain_id) {
+                return Err(lgr_not_found());
+            }
+        }
         if let Some(book) = ls.get_book(&book_key) {
             matching = book
                 .iter_by_quality()
                 .filter_map(|key| ls.get_offer(key).cloned().map(|off| (*key, off)))
+                .filter(|(_, off)| {
+                    if let Some(domain_id) = domain_id.as_ref() {
+                        crate::ledger::tx::permissioned_domain::account_in_domain(
+                            &ls,
+                            &off.account,
+                            domain_id,
+                            ctx.ledger_header.close_time,
+                        )
+                    } else {
+                        true
+                    }
+                })
                 .collect();
             if let Some(mark) = marker {
                 if !matching.iter().any(|(key, _)| key.0 == mark) {
@@ -5827,6 +8112,8 @@ pub fn book_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
             }
             let mut last_returned: Option<[u8; 32]> = None;
             let mut past_marker = marker.is_none();
+            let mut owner_balances =
+                std::collections::HashMap::<[u8; 20], crate::transaction::amount::Amount>::new();
             for (key, off) in matching {
                 if !past_marker {
                     if Some(key.0) == marker {
@@ -5838,10 +8125,61 @@ pub fn book_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
                     next_marker = last_returned;
                     break;
                 }
-                offers_out.push(offer_json(&off, owner_funds_current(&ls, &off)));
+                let (owner_funds_amount, owner_funds, remaining_funds) =
+                    if let Some(funds) = owner_balances.get(&off.account).cloned() {
+                        (
+                            Some(funds.clone()),
+                            None,
+                            Some(crate::ledger::offer::subtract_amount(
+                                &funds,
+                                &off.taker_gets,
+                            )),
+                        )
+                    } else {
+                        let funds = owner_funds_amount_current(&ls, &off);
+                        let remaining = funds.as_ref().map(|funds| {
+                            crate::ledger::offer::subtract_amount(funds, &off.taker_gets)
+                        });
+                        (
+                            funds.clone(),
+                            funds.as_ref().map(owner_funds_amount_string),
+                            remaining,
+                        )
+                    };
+                let funded = owner_funds_amount.as_ref().and_then(|funds| {
+                    let funds_value = amount_as_f64(funds)?;
+                    let gets_value = amount_as_f64(&off.taker_gets)?;
+                    (funds_value > 0.0 && funds_value < gets_value)
+                        .then(|| {
+                            crate::ledger::tx::flow::quote_offer_for_desired_output(
+                                &off, funds, true,
+                            )
+                            .map(|quote| (quote.output, quote.input))
+                        })
+                        .flatten()
+                });
+                if let Some(remaining) = remaining_funds {
+                    owner_balances.insert(off.account, remaining);
+                }
+                offers_out.push(offer_json(&off, owner_funds, funded));
                 last_returned = Some(key.0);
             }
-            let mut result = json!({ "offers": offers_out });
+            let ledger_hash = if requested_seq == ctx.ledger_seq {
+                ctx.ledger_hash.clone()
+            } else {
+                ctx.history
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_ledger(requested_seq)
+                    .map(|rec| hex::encode_upper(rec.header.hash))
+                    .unwrap_or_else(|| ctx.ledger_hash.clone())
+            };
+            let mut result = json!({
+                "ledger_hash": ledger_hash,
+                "ledger_index": requested_seq,
+                "offers": offers_out,
+                "validated": ledger_seq_is_validated(ctx, requested_seq, Some(&ledger_hash)),
+            });
             if let Some(m) = next_marker {
                 result["marker"] = json!(hex::encode_upper(m));
             }
@@ -5884,10 +8222,25 @@ pub fn book_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError>
         } else {
             None
         };
-        offers_out.push(offer_json(&off, owner_funds));
+        offers_out.push(offer_json(&off, owner_funds, None));
         last_returned = Some(key.0);
     }
-    let mut result = json!({ "offers": offers_out });
+    let ledger_hash = if requested_seq == ctx.ledger_seq {
+        ctx.ledger_hash.clone()
+    } else {
+        ctx.history
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_ledger(requested_seq)
+            .map(|rec| hex::encode_upper(rec.header.hash))
+            .unwrap_or_else(|| ctx.ledger_hash.clone())
+    };
+    let mut result = json!({
+        "ledger_hash": ledger_hash,
+        "ledger_index": requested_seq,
+        "offers": offers_out,
+        "validated": ledger_seq_is_validated(ctx, requested_seq, Some(&ledger_hash)),
+    });
     if let Some(m) = next_marker {
         result["marker"] = json!(hex::encode_upper(m));
     }
@@ -5968,84 +8321,160 @@ pub(crate) fn format_amount(a: &crate::transaction::amount::Amount) -> Value {
 fn tx_type_name(tx_type: u16) -> &'static str {
     match tx_type {
         0 => "Payment",
+        1 => "EscrowCreate",
+        2 => "EscrowFinish",
         3 => "AccountSet",
+        4 => "EscrowCancel",
+        5 => "SetRegularKey",
         7 => "OfferCreate",
         8 => "OfferCancel",
+        10 => "TicketCreate",
+        12 => "SignerListSet",
+        13 => "PaymentChannelCreate",
+        14 => "PaymentChannelFund",
+        15 => "PaymentChannelClaim",
+        16 => "CheckCreate",
+        17 => "CheckCash",
+        18 => "CheckCancel",
+        19 => "DepositPreauth",
         20 => "TrustSet",
-        21 => "CheckCreate",
-        22 => "CheckCash",
-        23 => "CheckCancel",
-        24 => "TicketCreate",
-        25 => "SignerListSet",
-        26 => "NFTokenMint",
-        27 => "NFTokenBurn",
-        28 => "NFTokenCreateOffer",
-        29 => "NFTokenCancelOffer",
-        30 => "NFTokenAcceptOffer",
-        31 => "Clawback",
-        33 => "SetRegularKey",
-        40 => "EscrowCreate",
-        41 => "EscrowFinish",
-        42 => "EscrowCancel",
-        43 => "PaymentChannelCreate",
-        44 => "PaymentChannelFund",
-        45 => "PaymentChannelClaim",
-        58 => "DepositPreauth",
-        59 => "AccountDelete",
-        60 => "MPTokenIssuanceCreate",
-        61 => "MPTokenIssuanceDestroy",
-        62 => "MPTokenIssuanceSet",
-        63 => "MPTokenAuthorize",
-        64 => "VaultCreate",
-        65 => "VaultDelete",
-        66 => "VaultDeposit",
-        67 => "VaultWithdraw",
-        68 => "AMMCreate",
-        69 => "AMMDeposit",
-        70 => "AMMWithdraw",
-        71 => "AMMDelete",
-        72 => "LoanBrokerSet",
-        73 => "LoanBrokerDelete",
-        74 => "LoanSet",
-        75 => "LoanDelete",
+        21 => "AccountDelete",
+        25 => "NFTokenMint",
+        26 => "NFTokenBurn",
+        27 => "NFTokenCreateOffer",
+        28 => "NFTokenCancelOffer",
+        29 => "NFTokenAcceptOffer",
+        30 => "Clawback",
+        31 => "AMMClawback",
+        35 => "AMMCreate",
+        36 => "AMMDeposit",
+        37 => "AMMWithdraw",
+        38 => "AMMVote",
+        39 => "AMMBid",
+        40 => "AMMDelete",
+        41 => "XChainCreateClaimID",
+        42 => "XChainCommit",
+        43 => "XChainClaim",
+        44 => "XChainAccountCreateCommit",
+        45 => "XChainAddClaimAttestation",
+        46 => "XChainAddAccountCreateAttestation",
+        47 => "XChainModifyBridge",
+        48 => "XChainCreateBridge",
+        49 => "DIDSet",
+        50 => "DIDDelete",
+        51 => "OracleSet",
+        52 => "OracleDelete",
+        53 => "LedgerStateFix",
+        54 => "MPTokenIssuanceCreate",
+        55 => "MPTokenIssuanceDestroy",
+        56 => "MPTokenIssuanceSet",
+        57 => "MPTokenAuthorize",
+        58 => "CredentialCreate",
+        59 => "CredentialAccept",
+        60 => "CredentialDelete",
+        61 => "NFTokenModify",
+        62 => "PermissionedDomainSet",
+        63 => "PermissionedDomainDelete",
+        64 => "DelegateSet",
+        65 => "VaultCreate",
+        66 => "VaultSet",
+        67 => "VaultDelete",
+        68 => "VaultDeposit",
+        69 => "VaultWithdraw",
+        70 => "VaultClawback",
+        71 => "Batch",
+        74 => "LoanBrokerSet",
+        75 => "LoanBrokerDelete",
+        76 => "LoanBrokerCoverDeposit",
+        77 => "LoanBrokerCoverWithdraw",
+        78 => "LoanBrokerCoverClawback",
+        80 => "LoanSet",
+        81 => "LoanDelete",
+        82 => "LoanManage",
+        84 => "LoanPay",
+        100 => "EnableAmendment",
+        101 => "SetFee",
+        102 => "UNLModify",
         _ => "Unknown",
     }
 }
 
 fn metadata_field_name(type_code: u16, field_code: u16) -> String {
     match (type_code, field_code) {
+        (1, 1) => "LedgerEntryType",
+        (1, 4) => "TransferFee",
+        (1, 5) => "TradingFee",
         (2, 2) => "Flags",
         (2, 4) => "Sequence",
+        (2, 5) => "PreviousTxnLgrSeq",
         (2, 10) => "Expiration",
         (2, 11) => "TransferRate",
         (2, 13) => "OwnerCount",
         (2, 28) => "TransactionIndex",
         (2, 33) => "SetFlag",
         (2, 34) => "ClearFlag",
-        (2, 41) => "TicketCount",
+        (2, 40) => "TicketCount",
+        (2, 41) => "TicketSequence",
+        (2, 50) => "FirstNFTokenSequence",
+        (2, 51) => "OracleDocumentID",
+        (2, 53) => "MutableFlags",
         (3, 3) => "BookNode",
         (3, 4) => "OwnerNode",
+        (3, 6) => "ExchangeRate",
         (3, 7) => "LowNode",
         (3, 8) => "HighNode",
         (3, 9) => "DestinationNode",
+        (3, 25) => "OutstandingAmount",
+        (3, 26) => "MPTAmount",
+        (3, 27) => "IssuerNode",
+        (3, 28) => "SubjectNode",
+        (3, 29) => "LockedAmount",
+        (5, 8) => "RootIndex",
         (5, 5) => "PreviousTxnID",
         (5, 6) => "LedgerIndex",
         (5, 10) => "NFTokenID",
         (5, 16) => "BookDirectory",
+        (5, 34) => "DomainID",
+        (5, 35) => "VaultID",
+        (5, 37) => "LoanBrokerID",
+        (5, 38) => "LoanID",
         (6, 2) => "Balance",
         (6, 4) => "TakerPays",
         (6, 5) => "TakerGets",
         (6, 6) => "LowLimit",
         (6, 7) => "HighLimit",
+        (6, 18) => "DeliveredAmount",
         (7, 5) => "URI",
         (7, 7) => "Domain",
+        (7, 26) => "DIDDocument",
+        (7, 27) => "Data",
+        (7, 28) => "AssetClass",
+        (7, 29) => "Provider",
+        (7, 30) => "MPTokenMetadata",
+        (7, 31) => "CredentialType",
         (8, 1) => "Account",
         (8, 2) => "Owner",
         (8, 3) => "Destination",
         (8, 4) => "Issuer",
+        (8, 5) => "Authorize",
+        (8, 6) => "Unauthorize",
+        (8, 8) => "RegularKey",
+        (8, 9) => "NFTokenMinter",
+        (8, 11) => "Holder",
+        (8, 24) => "Subject",
+        (16, 5) => "AssetScale",
+        (19, 1) => "Indexes",
+        (21, 1) => "MPTokenIssuanceID",
+        (21, 2) => "ShareMPTID",
+        (24, 3) => "Asset",
+        (24, 4) => "Asset2",
         _ => return format!("field_{type_code}_{field_code}"),
     }
     .to_string()
+}
+
+fn parse_vector256_hexes(data: &[u8]) -> Vec<String> {
+    data.chunks_exact(32).map(hex::encode_upper).collect()
 }
 
 fn metadata_fields_json(fields: &[crate::ledger::meta::ParsedField]) -> Value {
@@ -6077,6 +8506,10 @@ fn metadata_fields_json(fields: &[crate::ledger::meta::ParsedField]) -> Value {
                 account.copy_from_slice(&field.data);
                 json!(crate::crypto::base58::encode_account(&account))
             }
+            16 if !field.data.is_empty() => json!(field.data[0]),
+            19 => json!(parse_vector256_hexes(&field.data)),
+            21 if field.data.len() == 24 => json!(hex::encode_upper(&field.data)),
+            24 => json!(hex::encode_upper(&field.data)),
             _ => json!(hex::encode_upper(&field.data)),
         };
         out.insert(name, value);
@@ -6096,6 +8529,10 @@ pub(crate) fn metadata_json(meta_blob: &[u8], result: &str) -> Value {
     out.insert("TransactionResult".to_string(), json!(result));
     if let Some(index) = tx_index {
         out.insert("TransactionIndex".to_string(), json!(index));
+    }
+    if let Some(delivered) = crate::ledger::meta::parse_metadata_summary(meta_blob).delivered_amount
+    {
+        out.insert("delivered_amount".to_string(), format_amount(&delivered));
     }
 
     let affected: Vec<Value> = nodes
@@ -6247,6 +8684,35 @@ pub(crate) fn parsed_tx_json(parsed: &crate::transaction::ParsedTx) -> Value {
     if let Some(amount) = parsed.deliver_min.as_ref() {
         out["DeliverMin"] = format_amount(amount);
     }
+    if let Some(amount) = parsed.amount2.as_ref() {
+        out["Amount2"] = format_amount(amount);
+    }
+    if let Some(amount) = parsed.bid_min.as_ref() {
+        out["BidMin"] = format_amount(amount);
+    }
+    if let Some(amount) = parsed.bid_max.as_ref() {
+        out["BidMax"] = format_amount(amount);
+    }
+    if let Some(amount) = parsed.lp_token_out.as_ref() {
+        out["LPTokenOut"] = format_amount(amount);
+    }
+    if let Some(amount) = parsed.lp_token_in.as_ref() {
+        out["LPTokenIn"] = format_amount(amount);
+    }
+    if let Some(amount) = parsed.eprice.as_ref() {
+        out["EPrice"] = format_amount(amount);
+    }
+    let auth_accounts = crate::transaction::parse::parsed_auth_accounts(parsed);
+    if !auth_accounts.is_empty() {
+        out["AuthAccounts"] = json!(auth_accounts
+            .iter()
+            .map(|account| json!({
+                "AuthAccount": {
+                    "Account": crate::crypto::base58::encode_account(account),
+                }
+            }))
+            .collect::<Vec<_>>());
+    }
     if let Some(offer_sequence) = parsed.offer_sequence {
         out["OfferSequence"] = json!(offer_sequence);
     }
@@ -6279,7 +8745,7 @@ fn tx_record_response(
     let mut out = json!({
         "hash": hex::encode_upper(rec.hash),
         "ledger_index": rec.ledger_seq,
-        "validated": true,
+        "validated": ledger_seq_is_validated(ctx, rec.ledger_seq, None),
     });
 
     {
@@ -6289,7 +8755,10 @@ fn tx_record_response(
             .map(|r| &r.header)
             .or_else(|| (rec.ledger_seq == ctx.ledger_seq).then_some(&ctx.ledger_header))
         {
-            out["ledger_hash"] = json!(hex::encode_upper(header.hash));
+            let ledger_hash = hex::encode_upper(header.hash);
+            let validated = ledger_seq_is_validated(ctx, rec.ledger_seq, Some(&ledger_hash));
+            out["ledger_hash"] = json!(ledger_hash);
+            out["validated"] = json!(validated);
             out["close_time_iso"] = json!(close_time_iso_string(header.close_time));
         }
     }
@@ -6319,10 +8788,22 @@ pub fn book_changes(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError
         .or_else(|| params.get("ledger_index"))
         .or_else(|| params.get("ledger_hash"))
         .is_some();
+    let mut current_selector = !explicit_ledger
+        || params
+            .get("ledger_index")
+            .and_then(Value::as_str)
+            .map(|s| matches!(s, "current" | "closed"))
+            .unwrap_or(false);
     let requested_seq = if let Some(ledger) = params.get("ledger") {
         match ledger {
-            Value::String(s) if matches!(s.as_str(), "current" | "closed" | "validated") => {
+            Value::String(s) if matches!(s.as_str(), "current" | "closed") => {
+                current_selector = true;
                 ctx.ledger_seq
+            }
+            Value::String(s) if s == "validated" => {
+                validated_head_from_master(ctx.ledger_master_snapshot.as_ref())
+                    .map(|(seq, _)| seq)
+                    .unwrap_or(ctx.ledger_seq)
             }
             Value::String(s) => s
                 .parse::<u32>()
@@ -6333,6 +8814,15 @@ pub fn book_changes(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError
                 .ok_or_else(|| RpcError::invalid_params("invalid ledger"))?,
             _ => return Err(RpcError::invalid_params("invalid ledger")),
         }
+    } else if params
+        .get("ledger_index")
+        .and_then(Value::as_str)
+        .map(|s| s == "validated")
+        .unwrap_or(false)
+    {
+        validated_head_from_master(ctx.ledger_master_snapshot.as_ref())
+            .map(|(seq, _)| seq)
+            .unwrap_or(ctx.ledger_seq)
     } else {
         resolve_ledger_selector(params, ctx)?.unwrap_or(ctx.ledger_seq)
     };
@@ -6496,7 +8986,9 @@ pub fn book_changes(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError
 
     Ok(json!({
         "type": "bookChanges",
-        "validated": explicit_ledger,
+        "validated": !current_selector
+            && explicit_ledger
+            && ledger_seq_is_validated(ctx, requested_seq, Some(&hex::encode_upper(header.hash))),
         "ledger_index": requested_seq,
         "ledger_hash": hex::encode_upper(header.hash),
         "ledger_time": header.close_time,
@@ -6510,7 +9002,7 @@ pub fn account_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcErr
     let address = params.get("account").and_then(Value::as_str).unwrap_or("");
     let account_id = parse_account_field(params, "account")?;
     let limit = parse_limit_field(params, 200, 400)?;
-    let marker = parse_hex_key_marker(params)?;
+    let marker = parse_key_hint_marker(params)?;
     let requested_seq = resolve_ledger_selector(params, ctx)?.unwrap_or(ctx.ledger_seq);
     let is_historical = requested_seq != ctx.ledger_seq;
 
@@ -6528,10 +9020,45 @@ pub fn account_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcErr
     let mut offers_out: Vec<Value> = Vec::new();
 
     if is_historical {
-        // Historical account_offers enumeration not available (no object_history CF).
-        return Err(RpcError::internal(
+        let (_, mut map) = historical_state_map(
+            requested_seq,
+            ctx,
             "historical account_offers not available",
-        ));
+        )?;
+        if map
+            .get(&crate::ledger::keylet::account(&account_id).key)
+            .is_none()
+        {
+            return Err(RpcError::not_found(address));
+        }
+        let mut offers: Vec<(crate::ledger::Key, crate::ledger::offer::Offer)> =
+            collect_historical_state_entries(&mut map)?
+                .into_iter()
+                .filter_map(|(key, raw)| {
+                    let offer = crate::ledger::offer::Offer::decode_from_sle(&raw)?;
+                    (offer.account == account_id).then_some((key, offer))
+                })
+                .collect();
+        offers.sort_by_key(|(key, _)| key.0);
+        if let Some(mark) = marker {
+            if !offers.iter().any(|(key, _)| key.0 == mark) {
+                return Err(RpcError::invalid_params("invalid marker"));
+            }
+        }
+        let mut last_returned: Option<[u8; 32]> = None;
+        for (key, off) in offers {
+            if let Some(mark) = marker {
+                if key.0 <= mark {
+                    continue;
+                }
+            }
+            if offers_out.len() == limit {
+                next_marker = last_returned;
+                break;
+            }
+            offers_out.push(offer_json(&off));
+            last_returned = Some(key.0);
+        }
     } else {
         let ls = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
         if ls.get_account(&account_id).is_none() {
@@ -6570,76 +9097,76 @@ pub fn account_offers(params: &Value, ctx: &NodeContext) -> Result<Value, RpcErr
         "offers":  offers_out,
     });
     if let Some(m) = next_marker {
-        result["marker"] = json!(hex::encode_upper(m));
+        result["marker"] = json!(format_key_hint_marker(m));
     }
     Ok(result)
 }
 
 // ── submit ────────────────────────────────────────────────────────────────────
 
-/// Negative codes are `tem` (malformed) — transaction is rejected immediately.
-/// Codes ≥ 100 are `tec` (claimed cost) — fee is claimed but tx not applied.
-struct EngineResult {
-    code: &'static str,
-    numeric: i32,
-    message: &'static str,
+type EngineResult = crate::ledger::ter::TxResult;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitMode {
+    Single,
+    Multi,
 }
 
-impl EngineResult {
-    const SUCCESS: Self = Self {
-        code: "tesSUCCESS",
-        numeric: 0,
-        message: "The transaction was applied.",
-    };
-    const BAD_SIGNATURE: Self = Self {
-        code: "temBAD_SIGNATURE",
-        numeric: -281,
-        message: "Transaction's signing key is not authorized.",
-    };
-    const BAD_AUTH: Self = Self {
-        code: "temBAD_AUTH_MASTER",
-        numeric: -272,
-        message: "The transaction's signing key is not authorized by the account.",
-    };
-    const NO_ACCOUNT: Self = Self {
-        code: "terNO_ACCOUNT",
-        numeric: -96,
-        message: "The account does not exist.",
-    };
-    const PAST_SEQ: Self = Self {
-        code: "tefPAST_SEQ",
-        numeric: -190,
-        message: "This sequence number has already passed.",
-    };
-    const PRE_SEQ: Self = Self {
-        code: "terPRE_SEQ",
-        numeric: -95,
-        message: "Missing/inapplicable prior transaction.",
-    };
-    const INSUF_FEE: Self = Self {
-        code: "terINSUF_FEE_B",
-        numeric: -97,
-        message: "Account balance can't pay fee.",
-    };
-    const INSUFFICIENT_PAYMENT: Self = Self {
-        code: "tecINSUFFICIENT_FUNDS",
-        numeric: 148,
-        message: "Insufficient balance to send.",
-    };
-    const INSUF_RESERVE: Self = Self {
-        code: "tecINSUFFICIENT_RESERVE",
-        numeric: 141,
-        message: "Insufficient reserve to complete transaction.",
-    };
+fn required_submit_fee_drops(ctx: &NodeContext, queued_transactions: usize) -> u64 {
+    let base_fee = ctx.fees.base.max(1);
+    let open_fee_level = ctx
+        .tx_pool
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .metrics
+        .escalated_fee_level(queued_transactions as u64 + 1);
+    let open_fee = crate::ledger::pool::FeeMetrics::fee_level_to_drops(open_fee_level, base_fee);
+    let load_factor = u64::from(
+        ctx.load_snapshot
+            .load_factor_server()
+            .max(ctx.load_snapshot.load_base),
+    );
+    let load_base = u64::from(ctx.load_snapshot.load_base.max(1));
+    let load_fee = (u128::from(base_fee) * u128::from(load_factor))
+        .div_ceil(u128::from(load_base))
+        .min(u128::from(u64::MAX)) as u64;
+    base_fee.max(open_fee).max(load_fee)
 }
 
 pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> {
+    submit_inner(params, ctx, SubmitMode::Single)
+}
+
+pub fn submit_multisigned(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> {
+    submit_inner(params, ctx, SubmitMode::Multi)
+}
+
+fn submit_inner(
+    params: &Value,
+    ctx: &mut NodeContext,
+    mode: SubmitMode,
+) -> Result<Value, RpcError> {
     const MAX_TX_BLOB_BYTES: usize = 1_048_576;
 
-    let blob_hex = params
-        .get("tx_blob")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::invalid_params("missing 'tx_blob' field"))?;
+    let signed_from_json;
+    let blob_hex = if let Some(blob) = params.get("tx_blob").and_then(Value::as_str) {
+        blob
+    } else if params.get("tx_json").is_some() {
+        if !ctx.admin_rpc_enabled {
+            return Err(RpcError::not_supported(
+                "Signing is not supported by this server.",
+            ));
+        }
+        signed_from_json = sign(params, ctx)?;
+        signed_from_json
+            .get("tx_blob")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::internal("signing did not produce tx_blob"))?
+    } else {
+        return Err(RpcError::invalid_params(
+            "missing 'tx_blob' or 'tx_json' field",
+        ));
+    };
 
     if blob_hex.len() > MAX_TX_BLOB_BYTES.saturating_mul(2) {
         return Err(RpcError::invalid_params("tx_blob too large"));
@@ -6649,7 +9176,10 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
         hex::decode(blob_hex).map_err(|_| RpcError::invalid_params("tx_blob is not valid hex"))?;
 
     if blob.len() < 10 {
-        return Err(RpcError::invalid_params("tx_blob too short"));
+        return Err(RpcError::invalid_transaction(
+            "Invalid transaction.",
+            Some("Transaction length invalid"),
+        ));
     }
     if blob.len() > MAX_TX_BLOB_BYTES {
         return Err(RpcError::invalid_params("tx_blob too large"));
@@ -6667,49 +9197,57 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
     // Parse the binary blob into its fields.
     let parsed = match crate::transaction::parse_blob(&blob) {
         Ok(p) => p,
-        Err(e) => return Err(RpcError::invalid_params(&format!("tx parse error: {e}"))),
+        Err(e) => {
+            return Err(RpcError::invalid_transaction(
+                "Invalid transaction.",
+                Some(&format!("Transaction parse error: {e}")),
+            ))
+        }
     };
 
     // ── 1. Signature verification ─────────────────────────────────────────────
-    let sig_ok = if parsed.signing_pubkey.first() == Some(&0xED)
-        && parsed.signing_pubkey.len() == 33
-    {
-        // Ed25519 key (0xED prefix + 32-byte key)
-        let ed_key = &parsed.signing_pubkey[1..]; // strip 0xED prefix
-        use ed25519_dalek::Verifier;
-        (|| -> bool {
-            let Ok(sig_bytes): Result<[u8; 64], _> = parsed.signature.as_slice().try_into() else {
-                return false;
+    let signing_account = match mode {
+        SubmitMode::Single => match crate::transaction::auth::verify_single_signature(&parsed) {
+            Ok(account) => Some(account),
+            Err(_) => {
+                return Ok(engine_result_response(
+                    crate::ledger::ter::TEM_BAD_SIGNATURE,
+                    ctx,
+                    blob_hex,
+                    &tx_hash_hex,
+                    parsed.sequence,
+                    parsed.sequence,
+                ))
+            }
+        },
+        SubmitMode::Multi => {
+            if parsed.signers.is_empty() {
+                return Ok(engine_result_response(
+                    crate::ledger::ter::TEM_BAD_SIGNATURE,
+                    ctx,
+                    blob_hex,
+                    &tx_hash_hex,
+                    parsed.sequence,
+                    parsed.sequence,
+                ));
+            }
+            let auth = {
+                let mut state = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+                crate::ledger::tx::check_submit_auth(&mut state, &parsed)
             };
-            let Ok(pk_bytes): Result<[u8; 32], _> = ed_key.try_into() else {
-                return false;
-            };
-            let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes) else {
-                return false;
-            };
-            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-            // Ed25519 needs raw signing payload (it hashes internally), NOT the SHA512Half hash
-            vk.verify(&parsed.signing_payload, &sig).is_ok()
-        })()
-    } else {
-        // secp256k1: signing_hash is already SHA512Half — use verify_digest to avoid double-hashing
-        crate::crypto::keys::verify_secp256k1_digest(
-            &parsed.signing_pubkey,
-            &parsed.signing_hash,
-            &parsed.signature,
-        )
+            if auth.is_err() {
+                return Ok(engine_result_response(
+                    crate::ledger::ter::TEF_BAD_AUTH_MASTER,
+                    ctx,
+                    blob_hex,
+                    &tx_hash_hex,
+                    parsed.sequence,
+                    parsed.sequence,
+                ));
+            }
+            None
+        }
     };
-    if !sig_ok {
-        return Ok(engine_result_response(
-            &EngineResult::BAD_SIGNATURE,
-            ctx,
-            blob_hex,
-            &tx_hash_hex,
-            parsed.sequence,
-            parsed.sequence,
-        ));
-    }
-
     // ── 2–3. Look up account (used for regular key check + existence) ────────
     let account_root = if let Some(ref cl) = ctx.closed_ledger {
         use crate::ledger::views::ReadView;
@@ -6726,16 +9264,30 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
 
     // ── 2. Confirm the signing key matches the account ────────────────────────
     // Accept the master key OR the regular key (if set).
-    let derived_account = crate::crypto::account_id(&parsed.signing_pubkey);
-    if derived_account != parsed.account {
-        let is_regular = account_root
+    if let Some(signing_account) = signing_account {
+        if signing_account != parsed.account {
+            let is_regular = account_root
+                .as_ref()
+                .and_then(|a| a.regular_key)
+                .map(|rk| rk == signing_account)
+                .unwrap_or(false);
+            if !is_regular {
+                return Ok(engine_result_response(
+                    crate::ledger::ter::TEF_BAD_AUTH_MASTER,
+                    ctx,
+                    blob_hex,
+                    &tx_hash_hex,
+                    parsed.sequence,
+                    parsed.sequence,
+                ));
+            }
+        } else if account_root
             .as_ref()
-            .and_then(|a| a.regular_key)
-            .map(|rk| rk == derived_account)
-            .unwrap_or(false);
-        if !is_regular {
+            .map(|a| (a.flags & crate::ledger::account::LSF_DISABLE_MASTER) != 0)
+            .unwrap_or(false)
+        {
             return Ok(engine_result_response(
-                &EngineResult::BAD_AUTH,
+                crate::ledger::ter::TEF_MASTER_DISABLED,
                 ctx,
                 blob_hex,
                 &tx_hash_hex,
@@ -6750,7 +9302,7 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
         Some(r) => r,
         None => {
             return Ok(engine_result_response(
-                &EngineResult::NO_ACCOUNT,
+                crate::ledger::ter::TER_NO_ACCOUNT,
                 ctx,
                 blob_hex,
                 &tx_hash_hex,
@@ -6772,7 +9324,7 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
     // ── 4. Sequence number check ──────────────────────────────────────────────
     if parsed.sequence < account_root.sequence {
         return Ok(engine_result_response(
-            &EngineResult::PAST_SEQ,
+            crate::ledger::ter::TEF_PAST_SEQ,
             ctx,
             blob_hex,
             &tx_hash_hex,
@@ -6782,7 +9334,7 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
     }
     if parsed.sequence > next_seq {
         return Ok(engine_result_response(
-            &EngineResult::PRE_SEQ,
+            crate::ledger::ter::TER_PRE_SEQ,
             ctx,
             blob_hex,
             &tx_hash_hex,
@@ -6794,7 +9346,19 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
     // ── 5. Minimum fee check ──────────────────────────────────────────────────
     if parsed.fee < ctx.fees.base {
         return Ok(engine_result_response(
-            &EngineResult::INSUF_FEE,
+            crate::ledger::ter::TER_INSUF_FEE_B,
+            ctx,
+            blob_hex,
+            &tx_hash_hex,
+            avail_seq,
+            next_seq,
+        ));
+    }
+    let queued_transactions = ctx.tx_pool.read().unwrap_or_else(|e| e.into_inner()).len();
+    let required_fee = required_submit_fee_drops(ctx, queued_transactions);
+    if parsed.fee < required_fee {
+        return Ok(engine_result_response(
+            crate::ledger::ter::TEL_INSUF_FEE_P,
             ctx,
             blob_hex,
             &tx_hash_hex,
@@ -6806,7 +9370,7 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
     // ── 6. Balance checks ─────────────────────────────────────────────────────
     if account_root.balance < parsed.fee {
         return Ok(engine_result_response(
-            &EngineResult::INSUF_FEE,
+            crate::ledger::ter::TER_INSUF_FEE_B,
             ctx,
             blob_hex,
             &tx_hash_hex,
@@ -6818,7 +9382,7 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
         let total = send.saturating_add(parsed.fee);
         if account_root.balance < total {
             return Ok(engine_result_response(
-                &EngineResult::INSUFFICIENT_PAYMENT,
+                crate::ledger::ter::TEC_INSUFFICIENT_FUNDS,
                 ctx,
                 blob_hex,
                 &tx_hash_hex,
@@ -6852,7 +9416,7 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
                 25 // NFTokenMint (owner_count++)
             ) {
                 return Ok(engine_result_response(
-                    &EngineResult::INSUF_RESERVE,
+                    crate::ledger::ter::TEC_INSUFFICIENT_RESERVE,
                     ctx,
                     blob_hex,
                     &tx_hash_hex,
@@ -6864,15 +9428,26 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
     }
 
     // ── All checks passed — add to transaction pool and broadcast ───────────
-    ctx.tx_pool
+    let inserted = ctx
+        .tx_pool
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .insert(tx_hash, blob.clone(), &parsed);
+    if !inserted {
+        return Ok(engine_result_response(
+            crate::ledger::ter::TEL_CAN_NOT_QUEUE,
+            ctx,
+            blob_hex,
+            &tx_hash_hex,
+            avail_seq,
+            next_seq,
+        ));
+    }
     ctx.broadcast_queue
         .push(crate::network::relay::encode_transaction(&blob));
 
     Ok(engine_result_response(
-        &EngineResult::SUCCESS,
+        crate::ledger::ter::TES_SUCCESS,
         ctx,
         blob_hex,
         &tx_hash_hex,
@@ -6882,16 +9457,28 @@ pub fn submit(params: &Value, ctx: &mut NodeContext) -> Result<Value, RpcError> 
 }
 
 fn engine_result_response(
-    res: &EngineResult,
+    res: EngineResult,
     ctx: &NodeContext,
     blob_hex: &str,
     hash_hex: &str,
     seq_avail: u32,
     seq_next: u32,
 ) -> Value {
-    let applied = res.numeric == 0;
-    let accepted = res.numeric >= 0; // tec codes are "accepted" (fee claimed)
+    let applied = res.is_tes_success();
+    let accepted = res.is_tes_success() || res.is_tec_claim();
     let broadcast = applied; // broadcast when tesSUCCESS and tx was added to broadcast queue
+
+    let tx_json = hex::decode(blob_hex)
+        .ok()
+        .and_then(|blob| crate::transaction::parse_blob(&blob).ok())
+        .map(|parsed| {
+            let mut tx = parsed_tx_json(&parsed);
+            if let Some(obj) = tx.as_object_mut() {
+                obj.insert("hash".to_string(), json!(hash_hex));
+            }
+            tx
+        })
+        .unwrap_or_else(|| json!({ "hash": hash_hex }));
 
     json!({
         "status":                   "success",
@@ -6900,17 +9487,15 @@ fn engine_result_response(
         "account_sequence_next":    seq_next,
         "applied":                  applied,
         "broadcast":                broadcast,
-        "engine_result":            res.code,
-        "engine_result_code":       res.numeric,
-        "engine_result_message":    res.message,
+        "engine_result":            res.token(),
+        "engine_result_code":       res.code(),
+        "engine_result_message":    crate::ledger::ter::code_to_message(res.code()),
         "kept":                     accepted,
         "queued":                   false,
-        "open_ledger_cost":         ctx.fees.base.to_string(),
+        "open_ledger_cost":         required_submit_fee_drops(ctx, ctx.load_snapshot.queued_transactions).to_string(),
         "validated_ledger_index":   ctx.ledger_seq,
         "tx_blob":                  blob_hex,
-        "tx_json": {
-            "hash": hash_hex,
-        },
+        "tx_json":                  tx_json,
     })
 }
 
@@ -7094,6 +9679,11 @@ pub fn tx_history(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
 
 pub fn ledger(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
     let (seq, hdr, tx_hashes) = lookup_requested_ledger(params, ctx)?;
+    let transactions_requested = parse_bool_field(params, "transactions")?.unwrap_or(false);
+    let expand = parse_bool_field(params, "expand")?.unwrap_or(false);
+    let binary = parse_bool_field(params, "binary")?.unwrap_or(false);
+    let owner_funds = parse_bool_field(params, "owner_funds")?.unwrap_or(false);
+    let queue = parse_bool_field(params, "queue")?.unwrap_or(false);
 
     let hash_hex = hex::encode_upper(hdr.hash);
     let parent_hex = hex::encode_upper(hdr.parent_hash);
@@ -7117,17 +9707,71 @@ pub fn ledger(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
         },
         "ledger_hash":  hash_hex,
         "ledger_index": seq,
-        "validated":    true,
+        "validated":    ledger_seq_is_validated(ctx, seq, Some(&hash_hex)),
     });
 
     // Include transactions if requested
-    if params
-        .get("transactions")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let tx_list: Vec<String> = tx_hashes.iter().map(hex::encode_upper).collect();
+    if transactions_requested {
+        let tx_list: Vec<Value> = if expand || binary || owner_funds {
+            let history = ctx.history.read().unwrap_or_else(|e| e.into_inner());
+            tx_hashes
+                .iter()
+                .map(|hash| {
+                    if let Some(rec) = history.get_tx(hash) {
+                        if binary {
+                            let mut tx = json!({
+                                "tx_blob": hex::encode_upper(&rec.blob),
+                                "hash": hex::encode_upper(rec.hash),
+                            });
+                            if !rec.meta.is_empty() {
+                                tx["meta_blob"] = json!(hex::encode_upper(&rec.meta));
+                            }
+                            tx
+                        } else if let Ok(parsed) = crate::transaction::parse_blob(&rec.blob) {
+                            let mut tx = parsed_tx_json(&parsed);
+                            tx["hash"] = json!(hex::encode_upper(rec.hash));
+                            if !rec.meta.is_empty() {
+                                tx["metaData"] = metadata_json(&rec.meta, &rec.result);
+                            }
+                            tx
+                        } else {
+                            json!(hex::encode_upper(hash))
+                        }
+                    } else {
+                        json!(hex::encode_upper(hash))
+                    }
+                })
+                .collect()
+        } else {
+            tx_hashes
+                .iter()
+                .map(|hash| json!(hex::encode_upper(hash)))
+                .collect()
+        };
         response["ledger"]["transactions"] = json!(tx_list);
+    }
+    if queue {
+        let queued_entries = ctx
+            .tx_pool
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot_entries();
+        let queued = queued_entries
+            .into_iter()
+            .map(|entry| {
+                if binary {
+                    json!({"tx_blob": hex::encode_upper(entry.blob)})
+                } else {
+                    crate::transaction::parse_blob(&entry.blob)
+                        .map(|parsed| parsed_tx_json(&parsed))
+                        .unwrap_or_else(|_| json!({"tx_blob": hex::encode_upper(entry.blob)}))
+                }
+            })
+            .collect::<Vec<_>>();
+        response["queue_data"] = json!({
+            "txn_count": queued.len(),
+            "transactions": queued,
+        });
     }
 
     Ok(response)
@@ -7247,10 +9891,18 @@ fn sle_entry_type_name(entry_type: u16) -> String {
         0x0075 => "Escrow",
         0x0078 => "PayChannel",
         0x0079 => "AMM",
+        0x0069 => "Bridge",
+        0x0071 => "XChainOwnedClaimID",
+        0x0074 => "XChainOwnedCreateAccountClaimID",
         0x007e => "MPTokenIssuance",
         0x007f => "MPToken",
+        0x0080 => "Oracle",
         0x0081 => "Credential",
+        0x0082 => "PermissionedDomain",
+        0x0083 => "Delegate",
         0x0084 => "Vault",
+        0x0088 => "LoanBroker",
+        0x0089 => "Loan",
         other => return format!("Unknown({other:#06x})"),
     }
     .to_string()
@@ -7355,9 +10007,16 @@ fn account_object_type_matches(entry_type: u16, type_filter: Option<&str>) -> bo
         Some("payment_channel") => entry_type == 0x0078,
         Some("ticket") => entry_type == 0x0054,
         Some("deposit_preauth") => entry_type == 0x0070,
+        Some("signer_list") => entry_type == 0x0053,
         Some("did") => entry_type == 0x0049,
         Some("nft_page") => entry_type == 0x0050,
         Some("nft_offer") => entry_type == 0x0037,
+        Some("amm") => entry_type == 0x0079,
+        Some("oracle") => entry_type == 0x0080,
+        Some("credential") => entry_type == 0x0081,
+        Some("permissioned_domain") => entry_type == 0x0082,
+        Some("mpt_issuance") => entry_type == 0x007E,
+        Some("mptoken") => entry_type == 0x007F,
         Some(_) => false,
     }
 }
@@ -7366,8 +10025,23 @@ fn parse_account_objects_type(params: &Value) -> Result<Option<String>, RpcError
     match params.get("type") {
         None => Ok(None),
         Some(Value::String(s)) => match s.as_str() {
-            "state" | "offer" | "check" | "escrow" | "payment_channel" | "ticket"
-            | "deposit_preauth" | "did" | "nft_page" | "nft_offer" => Ok(Some(s.clone())),
+            "state"
+            | "offer"
+            | "check"
+            | "escrow"
+            | "payment_channel"
+            | "ticket"
+            | "deposit_preauth"
+            | "signer_list"
+            | "did"
+            | "nft_page"
+            | "nft_offer"
+            | "amm"
+            | "oracle"
+            | "credential"
+            | "permissioned_domain"
+            | "mpt_issuance"
+            | "mptoken" => Ok(Some(s.clone())),
             _ => Err(invalid_field("type")),
         },
         Some(_) => Err(invalid_field_not_string("type")),
@@ -7409,6 +10083,11 @@ fn raw_object_summary(key: &[u8; 32], raw: &[u8]) -> Option<Value> {
         "LedgerEntryType": sle_entry_type_name(parsed.entry_type),
         "index": hex::encode_upper(key),
     });
+    if let Some(fields) = metadata_fields_json(&parsed.fields).as_object() {
+        for (name, value) in fields {
+            out[name] = value.clone();
+        }
+    }
     match parsed.entry_type {
         0x0072 => {
             let tl = decode_ripple_state_any(raw)?;
@@ -7565,13 +10244,72 @@ fn signer_list_key(account: &[u8; 20]) -> crate::ledger::Key {
     crate::ledger::Key(crate::crypto::sha512_first_half(&data))
 }
 
+fn parse_hex_exact<const N: usize>(value: &Value, field: &str) -> Result<[u8; N], RpcError> {
+    let s = value
+        .as_str()
+        .ok_or_else(|| invalid_field_not_string(field))?;
+    let bytes = hex::decode(s).map_err(|_| invalid_field(field))?;
+    if bytes.len() != N {
+        return Err(invalid_field(field));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn permissioned_domain_key(account: &[u8; 20], sequence: u32) -> crate::ledger::Key {
+    let mut data = Vec::with_capacity(26);
+    data.extend_from_slice(&[0x00, 0x6D]);
+    data.extend_from_slice(account);
+    data.extend_from_slice(&sequence.to_be_bytes());
+    crate::ledger::Key(crate::crypto::sha512_first_half(&data))
+}
+
+fn loan_broker_key(owner: &[u8; 20], sequence: u32) -> crate::ledger::Key {
+    let mut data = Vec::with_capacity(26);
+    data.extend_from_slice(&[0x00, 0x6C]);
+    data.extend_from_slice(owner);
+    data.extend_from_slice(&sequence.to_be_bytes());
+    crate::ledger::Key(crate::crypto::sha512_first_half(&data))
+}
+
+fn loan_key(broker_id: &[u8; 32], sequence: u32) -> crate::ledger::Key {
+    let mut data = Vec::with_capacity(38);
+    data.extend_from_slice(&[0x00, 0x4C]);
+    data.extend_from_slice(broker_id);
+    data.extend_from_slice(&sequence.to_be_bytes());
+    crate::ledger::Key(crate::crypto::sha512_first_half(&data))
+}
+
 fn resolve_ledger_entry_key(params: &Value) -> Result<crate::ledger::Key, RpcError> {
     if let Some(index) = params.get("index") {
         return parse_key_from_hex(index, "index");
     }
+    if params.get("amendments").is_some() {
+        return Ok(crate::ledger::keylet::amendments().key);
+    }
+    if params.get("fee").is_some() || params.get("fees").is_some() {
+        return Ok(crate::ledger::keylet::fees().key);
+    }
+    if params.get("negative_unl").is_some() {
+        return Ok(crate::ledger::keylet::negative_unl().key);
+    }
+    if let Some(hashes) = params.get("ledger_hashes").or_else(|| params.get("hashes")) {
+        if hashes.is_boolean() {
+            return Ok(crate::ledger::keylet::skip().key);
+        }
+        let seq = parse_u32_value(hashes, "ledger_hashes")?;
+        return Ok(crate::ledger::keylet::skip_for_ledger(seq).key);
+    }
     if let Some(account) = params.get("account_root") {
         let account_id = parse_account_value(account, "account_root")?;
         return Ok(crate::ledger::account::shamap_key(&account_id));
+    }
+    if let Some(directory) = params.get("directory") {
+        return parse_key_from_hex(directory, "directory");
+    }
+    if let Some(amm) = params.get("amm") {
+        return parse_key_from_hex(amm, "amm");
     }
     if let Some(check) = params.get("check") {
         return parse_key_from_hex(check, "check");
@@ -7665,6 +10403,156 @@ fn resolve_ledger_entry_key(params: &Value) -> Result<crate::ledger::Key, RpcErr
         let account_id = parse_account_value(account, "signer_list")?;
         return Ok(signer_list_key(&account_id));
     }
+    if let Some(oracle) = params.get("oracle") {
+        return match oracle {
+            Value::String(_) => parse_key_from_hex(oracle, "oracle"),
+            Value::Object(map) => {
+                let account = parse_account_value(
+                    map.get("account").ok_or_else(|| invalid_field("oracle"))?,
+                    "account",
+                )?;
+                let document_id = parse_u32_value(
+                    map.get("oracle_document_id")
+                        .or_else(|| map.get("OracleDocumentID"))
+                        .ok_or_else(|| invalid_field("oracle_document_id"))?,
+                    "oracle_document_id",
+                )?;
+                Ok(crate::ledger::keylet::oracle(&account, document_id).key)
+            }
+            _ => Err(invalid_field("oracle")),
+        };
+    }
+    if let Some(credential) = params.get("credential") {
+        return match credential {
+            Value::String(_) => parse_key_from_hex(credential, "credential"),
+            Value::Object(map) => {
+                let subject = parse_account_value(
+                    map.get("subject").ok_or_else(|| invalid_field("subject"))?,
+                    "subject",
+                )?;
+                let issuer = parse_account_value(
+                    map.get("issuer").ok_or_else(|| invalid_field("issuer"))?,
+                    "issuer",
+                )?;
+                let credential_type_raw = map
+                    .get("credential_type")
+                    .or_else(|| map.get("CredentialType"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_field("credential_type"))?;
+                let credential_type = if credential_type_raw.len() % 2 == 0 {
+                    hex::decode(credential_type_raw)
+                        .unwrap_or_else(|_| credential_type_raw.as_bytes().to_vec())
+                } else {
+                    credential_type_raw.as_bytes().to_vec()
+                };
+                Ok(crate::ledger::keylet::credential(&subject, &issuer, &credential_type).key)
+            }
+            _ => Err(invalid_field("credential")),
+        };
+    }
+    if let Some(mpt) = params.get("mpt_issuance") {
+        let id = parse_hex_exact::<24>(mpt, "mpt_issuance")?;
+        return Ok(crate::ledger::keylet::mpt_issuance(&id).key);
+    }
+    if let Some(mptoken) = params.get("mptoken") {
+        return match mptoken {
+            Value::String(_) => parse_key_from_hex(mptoken, "mptoken"),
+            Value::Object(map) => {
+                let id = parse_hex_exact::<24>(
+                    map.get("mpt_issuance_id")
+                        .or_else(|| map.get("MPTokenIssuanceID"))
+                        .ok_or_else(|| invalid_field("mpt_issuance_id"))?,
+                    "mpt_issuance_id",
+                )?;
+                let holder = parse_account_value(
+                    map.get("account")
+                        .or_else(|| map.get("holder"))
+                        .ok_or_else(|| invalid_field("account"))?,
+                    "account",
+                )?;
+                Ok(crate::ledger::keylet::mptoken(&id, &holder).key)
+            }
+            _ => Err(invalid_field("mptoken")),
+        };
+    }
+    if let Some(domain) = params.get("permissioned_domain") {
+        return match domain {
+            Value::String(_) => parse_key_from_hex(domain, "permissioned_domain"),
+            Value::Object(map) => {
+                let owner = parse_account_value(
+                    map.get("owner").ok_or_else(|| invalid_field("owner"))?,
+                    "owner",
+                )?;
+                let seq = parse_u32_value(
+                    map.get("seq")
+                        .or_else(|| map.get("sequence"))
+                        .ok_or_else(|| invalid_field("seq"))?,
+                    "seq",
+                )?;
+                Ok(permissioned_domain_key(&owner, seq))
+            }
+            _ => Err(invalid_field("permissioned_domain")),
+        };
+    }
+    if let Some(vault) = params.get("vault") {
+        return match vault {
+            Value::String(_) => parse_key_from_hex(vault, "vault"),
+            Value::Object(map) => {
+                let owner = parse_account_value(
+                    map.get("owner").ok_or_else(|| invalid_field("owner"))?,
+                    "owner",
+                )?;
+                let seq = parse_u32_value(
+                    map.get("seq")
+                        .or_else(|| map.get("sequence"))
+                        .ok_or_else(|| invalid_field("seq"))?,
+                    "seq",
+                )?;
+                Ok(crate::ledger::tx::vault_key(&owner, seq))
+            }
+            _ => Err(invalid_field("vault")),
+        };
+    }
+    if let Some(broker) = params.get("loan_broker") {
+        return match broker {
+            Value::String(_) => parse_key_from_hex(broker, "loan_broker"),
+            Value::Object(map) => {
+                let owner = parse_account_value(
+                    map.get("owner").ok_or_else(|| invalid_field("owner"))?,
+                    "owner",
+                )?;
+                let seq = parse_u32_value(
+                    map.get("seq")
+                        .or_else(|| map.get("sequence"))
+                        .ok_or_else(|| invalid_field("seq"))?,
+                    "seq",
+                )?;
+                Ok(loan_broker_key(&owner, seq))
+            }
+            _ => Err(invalid_field("loan_broker")),
+        };
+    }
+    if let Some(loan) = params.get("loan") {
+        return match loan {
+            Value::String(_) => parse_key_from_hex(loan, "loan"),
+            Value::Object(map) => {
+                let broker = parse_hex_exact::<32>(
+                    map.get("loan_broker_id")
+                        .or_else(|| map.get("LoanBrokerID"))
+                        .ok_or_else(|| invalid_field("loan_broker_id"))?,
+                    "loan_broker_id",
+                )?;
+                let seq = parse_u32_value(
+                    map.get("seq")
+                        .or_else(|| map.get("sequence"))
+                        .ok_or_else(|| invalid_field("seq"))?,
+                    "seq",
+                )?;
+                Ok(loan_key(&broker, seq))
+            }
+            _ => Err(invalid_field("loan")),
+        };
+    }
     for field in ["ripple_state", "state"] {
         if let Some(spec) = params.get(field) {
             return match spec {
@@ -7695,16 +10583,61 @@ fn resolve_ledger_entry_key(params: &Value) -> Result<crate::ledger::Key, RpcErr
             };
         }
     }
-    Err(RpcError::invalid_params(
-        "missing ledger entry selector (supported: index, account_root, check, escrow, offer, payment_channel, ticket, deposit_preauth, nft_offer, nft_page, did, signer_list, ripple_state, state)",
-    ))
+    Err(RpcError::invalid_params("missing ledger entry selector"))
+}
+
+fn ledger_entry_selector_count(params: &Value) -> usize {
+    [
+        "index",
+        "amendments",
+        "fee",
+        "fees",
+        "negative_unl",
+        "ledger_hashes",
+        "hashes",
+        "account_root",
+        "directory",
+        "amm",
+        "check",
+        "payment_channel",
+        "offer",
+        "escrow",
+        "ticket",
+        "deposit_preauth",
+        "nft_offer",
+        "nft_page",
+        "did",
+        "signer_list",
+        "oracle",
+        "credential",
+        "mpt_issuance",
+        "mptoken",
+        "permissioned_domain",
+        "vault",
+        "loan_broker",
+        "loan",
+        "ripple_state",
+        "state",
+    ]
+    .into_iter()
+    .filter(|field| params.get(*field).is_some())
+    .count()
 }
 
 pub fn ledger_entry(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
+    if ledger_entry_selector_count(params) > 1 {
+        return Err(RpcError::invalid_params("Too many fields provided."));
+    }
     let key = resolve_ledger_entry_key(params)?;
     let binary = parse_bool_field(params, "binary")?.unwrap_or(false);
     let requested_seq = resolve_ledger_selector(params, ctx)?.unwrap_or(ctx.ledger_seq);
     let is_historical = requested_seq != ctx.ledger_seq;
+    let requested_ledger_hash = if requested_seq == ctx.ledger_seq {
+        ctx.ledger_hash.clone()
+    } else {
+        hex::encode_upper(historical_ledger_header(requested_seq, ctx)?.hash)
+    };
+    let validated = ledger_seq_is_validated(ctx, requested_seq, Some(&requested_ledger_hash));
 
     let raw = if is_historical {
         let header = {
@@ -7726,13 +10659,14 @@ pub fn ledger_entry(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError
         ls.get_raw_owned(&key)
     };
 
-    let raw = raw.ok_or_else(|| RpcError::not_found("ledger entry"))?;
+    let raw = raw.ok_or_else(|| RpcError::entry_not_found(hex::encode_upper(key.0)))?;
     if binary {
         return Ok(json!({
             "index": hex::encode_upper(key.0),
+            "ledger_hash": requested_ledger_hash,
             "ledger_index": requested_seq,
             "node_binary": hex::encode_upper(raw),
-            "validated": true,
+            "validated": validated,
         }));
     }
 
@@ -7758,20 +10692,21 @@ pub fn ledger_entry(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError
 
     Ok(json!({
         "index": hex::encode_upper(key.0),
+        "ledger_hash": requested_ledger_hash,
         "ledger_index": requested_seq,
         "node": node,
-        "validated": true,
+        "validated": validated,
     }))
 }
 
 pub fn account_objects(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
     let address = params.get("account").and_then(Value::as_str).unwrap_or("");
     let account_id = parse_account_field(params, "account")?;
-    let limit = parse_limit_field(params, 200, 400)?;
+    let limit = parse_limit_field_clamped(params, 200, 10, 400)?;
     let marker = match params.get("marker") {
         None => None,
         Some(Value::String(s)) => {
-            let (_, entry) = s.split_once(',').ok_or_else(|| invalid_field("marker"))?;
+            let (entry, _) = s.split_once(',').ok_or_else(|| invalid_field("marker"))?;
             let bytes = hex::decode(entry).map_err(|_| invalid_field("marker"))?;
             if bytes.len() != 32 {
                 return Err(invalid_field("marker"));
@@ -7785,6 +10720,12 @@ pub fn account_objects(params: &Value, ctx: &NodeContext) -> Result<Value, RpcEr
     let type_filter = parse_account_objects_type(params)?;
     let requested_seq = resolve_ledger_selector(params, ctx)?.unwrap_or(ctx.ledger_seq);
     let is_historical = requested_seq != ctx.ledger_seq;
+    let requested_ledger_hash = if requested_seq == ctx.ledger_seq {
+        ctx.ledger_hash.clone()
+    } else {
+        hex::encode_upper(historical_ledger_header(requested_seq, ctx)?.hash)
+    };
+    let validated = ledger_seq_is_validated(ctx, requested_seq, Some(&requested_ledger_hash));
 
     let mut objects: Vec<(crate::ledger::Key, Value)> = Vec::new();
     if is_historical {
@@ -7860,9 +10801,13 @@ pub fn account_objects(params: &Value, ctx: &NodeContext) -> Result<Value, RpcEr
     let mut result = json!({
         "account": address,
         "account_objects": out,
+        "ledger_hash": requested_ledger_hash,
+        "ledger_index": requested_seq,
+        "limit": limit,
+        "validated": validated,
     });
     if let Some(m) = next_marker {
-        result["marker"] = json!(format!("0,{}", hex::encode_upper(m)));
+        result["marker"] = json!(format!("{},0", hex::encode_upper(m)));
     }
     Ok(result)
 }
@@ -8124,7 +11069,7 @@ pub fn noripple_check(params: &Value, ctx: &NodeContext) -> Result<Value, RpcErr
     let mut result = json!({
         "ledger_hash": ledger_hash,
         "ledger_index": requested_seq,
-        "validated": true,
+        "validated": ledger_seq_is_validated(ctx, requested_seq, Some(&ledger_hash)),
         "problems": [],
     });
 
@@ -8223,7 +11168,7 @@ pub fn owner_info(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> 
         "account": address,
         "account_data": account_data["account_data"].clone(),
         "ledger_current_index": ctx.ledger_seq,
-        "validated": true,
+        "validated": account_data["validated"].as_bool().unwrap_or(false),
         "account_objects": account_objects["account_objects"].clone(),
         "lines": account_lines["lines"].clone(),
         "offers": account_offers["offers"].clone(),
@@ -8386,7 +11331,7 @@ pub fn amm_info(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
     let trading_fee = parsed
         .fields
         .iter()
-        .find(|f| f.type_code == 1 && f.field_code == 2 && f.data.len() == 2)
+        .find(|f| f.type_code == 1 && f.field_code == 5 && f.data.len() == 2)
         .map(|f| u16::from_be_bytes([f.data[0], f.data[1]]) as u32)
         .unwrap_or(0);
     let pool1 = parsed
@@ -8516,27 +11461,100 @@ pub fn ledger_current(ctx: &NodeContext) -> Result<Value, RpcError> {
 
 // ── deposit_authorized ────────────────────────────────────────────────────────
 
+fn parse_deposit_authorized_credentials(
+    params: &Value,
+) -> Result<Vec<([u8; 32], String)>, RpcError> {
+    let Some(raw) = params.get("credentials") else {
+        return Ok(Vec::new());
+    };
+    let credentials = raw.as_array().ok_or_else(|| invalid_field("credentials"))?;
+    if credentials.is_empty() {
+        return Err(invalid_field("credentials"));
+    }
+
+    let mut out = Vec::with_capacity(credentials.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for value in credentials {
+        let s = value.as_str().ok_or_else(|| invalid_field("credentials"))?;
+        if s.len() != 64 {
+            return Err(invalid_field("credentials"));
+        }
+        let bytes = hex::decode(s).map_err(|_| invalid_field("credentials"))?;
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        if !seen.insert(key) {
+            return Err(bad_credentials());
+        }
+        out.push((key, s.to_ascii_uppercase()));
+    }
+    Ok(out)
+}
+
+fn credential_preauth_key(
+    destination: &[u8; 20],
+    credentials: &[([u8; 20], Vec<u8>)],
+) -> crate::ledger::Key {
+    let mut data = Vec::with_capacity(2 + 20 + credentials.len() * 32);
+    data.extend_from_slice(&[0x00, b'P']);
+    data.extend_from_slice(destination);
+    for (issuer, credential_type) in credentials {
+        let mut credential_hash_input = Vec::with_capacity(20 + credential_type.len());
+        credential_hash_input.extend_from_slice(issuer);
+        credential_hash_input.extend_from_slice(credential_type);
+        data.extend_from_slice(&crate::crypto::sha512_first_half(&credential_hash_input));
+    }
+    crate::ledger::Key(crate::crypto::sha512_first_half(&data))
+}
+
+fn accepted_credential_pair(
+    raw: &[u8],
+    source: &[u8; 20],
+    close_time: u64,
+) -> Result<([u8; 20], Vec<u8>), RpcError> {
+    let parsed = crate::ledger::meta::parse_sle(raw).ok_or_else(bad_credentials)?;
+    if parsed.entry_type != 0x0081 {
+        return Err(bad_credentials());
+    }
+    if sle_account_field(&parsed, 24) != Some(*source) {
+        return Err(bad_credentials());
+    }
+    let flags = sle_u32_field(&parsed, 2).unwrap_or(0);
+    if flags & crate::ledger::tx::credential::LSF_ACCEPTED == 0 {
+        return Err(bad_credentials());
+    }
+    if let Some(expiration) = sle_u32_field(&parsed, 10) {
+        if expiration != 0 && u64::from(expiration) < close_time {
+            return Err(bad_credentials());
+        }
+    }
+    let issuer = sle_account_field(&parsed, 4).ok_or_else(bad_credentials)?;
+    let credential_type = sle_blob_field(&parsed, 31).ok_or_else(bad_credentials)?;
+    if credential_type.is_empty() {
+        return Err(bad_credentials());
+    }
+    Ok((issuer, credential_type))
+}
+
 pub fn deposit_authorized(params: &Value, ctx: &NodeContext) -> Result<Value, RpcError> {
     let source_id = parse_account_field(params, "source_account")?;
     let dest_id = parse_account_field(params, "destination_account")?;
+    let credential_ids = parse_deposit_authorized_credentials(params)?;
+    let credential_strings: Vec<String> = credential_ids.iter().map(|(_, s)| s.clone()).collect();
+    let close_time = ctx.ledger_header.close_time;
 
-    let (has_deposit_auth, preauth_exists) = if let Some(ref cl) = ctx.closed_ledger {
+    let (has_deposit_auth, preauth_exists, credential_preauth_exists) = if let Some(ref cl) =
+        ctx.closed_ledger
+    {
         // New path: read from ClosedLedger via ReadView
         use crate::ledger::views::ReadView;
+        let source_kl = crate::ledger::keylet::account(&source_id);
+        if cl.read(&source_kl).is_none() {
+            return Err(src_act_not_found());
+        }
         let dest_kl = crate::ledger::keylet::account(&dest_id);
-        let dest_sle = cl.read(&dest_kl).ok_or_else(|| RpcError {
-            code: "actNotFound",
-            error_code: 19,
-            message: "Destination account not found.".into(),
-            extra: None,
-        })?;
+        let dest_sle = cl.read(&dest_kl).ok_or_else(dst_act_not_found)?;
         let dest_acct =
-            crate::ledger::AccountRoot::decode(dest_sle.data()).map_err(|_| RpcError {
-                code: "actNotFound",
-                error_code: 19,
-                message: "Destination account not found.".into(),
-                extra: None,
-            })?;
+            crate::ledger::AccountRoot::decode(dest_sle.data()).map_err(|_| dst_act_not_found())?;
         let deposit_auth_flag = crate::ledger::account::LSF_DEPOSIT_AUTH;
         let has_da = dest_acct.flags & deposit_auth_flag != 0;
         let preauth = if has_da && source_id != dest_id {
@@ -8545,25 +11563,63 @@ pub fn deposit_authorized(params: &Value, ctx: &NodeContext) -> Result<Value, Rp
         } else {
             false
         };
-        (has_da, preauth)
+        let credential_preauth = if has_da && source_id != dest_id && !credential_ids.is_empty() {
+            let mut pairs = Vec::with_capacity(credential_ids.len());
+            for (key, _) in &credential_ids {
+                let raw = cl
+                    .get_raw(&crate::ledger::Key(*key))
+                    .ok_or_else(bad_credentials)?;
+                pairs.push(accepted_credential_pair(&raw, &source_id, close_time)?);
+            }
+            pairs.sort();
+            pairs.dedup();
+            if pairs.len() != credential_ids.len() {
+                return Err(bad_credentials());
+            }
+            cl.get_raw(&credential_preauth_key(&dest_id, &pairs))
+                .is_some()
+        } else {
+            false
+        };
+        (has_da, preauth, credential_preauth)
     } else {
         // Legacy path: in-memory state
         let state = ctx.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
-        let dest_acct = state.get_account(&dest_id).ok_or_else(|| RpcError {
-            code: "actNotFound",
-            error_code: 19,
-            message: "Destination account not found.".into(),
-            extra: None,
-        })?;
+        if state.get_account(&source_id).is_none() {
+            return Err(src_act_not_found());
+        }
+        let dest_acct = state.get_account(&dest_id).ok_or_else(dst_act_not_found)?;
         let deposit_auth_flag = crate::ledger::account::LSF_DEPOSIT_AUTH;
         let has_da = dest_acct.flags & deposit_auth_flag != 0;
         let preauth = if has_da && source_id != dest_id {
             let key = crate::ledger::deposit_preauth::shamap_key(&dest_id, &source_id);
             state.deposit_preauths.contains_key(&key)
+                || state.get_raw_owned(&key).is_some()
+                || state.get_committed_raw_owned(&key).is_some()
         } else {
             false
         };
-        (has_da, preauth)
+        let credential_preauth = if has_da && source_id != dest_id && !credential_ids.is_empty() {
+            let mut pairs = Vec::with_capacity(credential_ids.len());
+            for (key, _) in &credential_ids {
+                let key = crate::ledger::Key(*key);
+                let raw = state
+                    .get_raw_owned(&key)
+                    .or_else(|| state.get_committed_raw_owned(&key))
+                    .ok_or_else(bad_credentials)?;
+                pairs.push(accepted_credential_pair(&raw, &source_id, close_time)?);
+            }
+            pairs.sort();
+            pairs.dedup();
+            if pairs.len() != credential_ids.len() {
+                return Err(bad_credentials());
+            }
+            let key = credential_preauth_key(&dest_id, &pairs);
+            state.get_raw_owned(&key).is_some() || state.get_committed_raw_owned(&key).is_some()
+        } else {
+            false
+        };
+        (has_da, preauth, credential_preauth)
     };
 
     let authorized = if !has_deposit_auth {
@@ -8571,16 +11627,20 @@ pub fn deposit_authorized(params: &Value, ctx: &NodeContext) -> Result<Value, Rp
     } else if source_id == dest_id {
         true
     } else {
-        preauth_exists
+        preauth_exists || credential_preauth_exists
     };
 
-    Ok(json!({
+    let mut result = json!({
         "deposit_authorized": authorized,
         "source_account": params.get("source_account").and_then(Value::as_str).unwrap_or(""),
         "destination_account": params.get("destination_account").and_then(Value::as_str).unwrap_or(""),
         "ledger_hash": ctx.ledger_hash,
         "ledger_current_index": ctx.ledger_seq,
-    }))
+    });
+    if !credential_strings.is_empty() {
+        result["credentials"] = json!(credential_strings);
+    }
+    Ok(result)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -8599,6 +11659,21 @@ mod tests {
         }
     }
 
+    fn validator_key_bytes() -> Vec<u8> {
+        crate::crypto::keys::Secp256k1KeyPair::generate().public_key_bytes()
+    }
+
+    fn mark_validated(ctx: &mut NodeContext, seq: u32, hash: impl Into<String>) {
+        let hash = hash.into();
+        ctx.ledger_master_snapshot = Some(crate::ledger::master::LedgerMasterSnapshot {
+            validated_seq: seq,
+            validated_hash: hash.clone(),
+            open_ledger_seq: seq.saturating_add(1),
+            recent_validated: vec![crate::ledger::master::RecentValidatedLedger { seq, hash }],
+            ..Default::default()
+        });
+    }
+
     fn req(method: &str, params: Value) -> RpcRequest {
         RpcRequest {
             method: method.into(),
@@ -8607,11 +11682,56 @@ mod tests {
         }
     }
 
+    fn active_fetch_snapshot() -> crate::rpc::FetchInfoSnapshot {
+        crate::rpc::FetchInfoSnapshot {
+            key: "348928".to_string(),
+            hash: "C2".repeat(32),
+            sync_active: true,
+            sync_in_progress: true,
+            sync_done: false,
+            pending_sync_anchor: Some(format!("348928:{}", "C2".repeat(32))),
+            target_seq: 348928,
+            target_hash: "C2".repeat(32),
+            target_account_hash: "A1".repeat(32),
+            computed_root_hash: "B2".repeat(32),
+            root_matches: false,
+            ready: false,
+            readiness: "blocked".to_string(),
+            readiness_blockers: vec![
+                "state_root_mismatch".to_string(),
+                "pending_sync_anchor".to_string(),
+                "sync_not_done".to_string(),
+            ],
+            have_header: true,
+            have_state: false,
+            have_transactions: false,
+            needed_state_hashes: vec!["BF".repeat(32)],
+            backend_fetch_errors: 2,
+            peers: 2,
+            timeouts: 1,
+            in_flight: 8,
+            outstanding_cookies: 5,
+            outstanding_object_queries: 3,
+            recent_nodes: 7,
+            useful_idle_secs: 11,
+            response_idle_secs: 13,
+            queue_len: 2,
+            queue_bytes: 4096,
+            inner_nodes: 12,
+            state_nodes: 34,
+            pass: 3,
+            new_objects: 55,
+            tail_stuck_hash: Some("AA".repeat(32)),
+            tail_stuck_retries: 4,
+        }
+    }
+
     // ── server_info ───────────────────────────────────────────────────────────
 
     #[test]
     fn test_server_info_shape() {
         let mut c = ctx();
+        mark_validated(&mut c, 1000, "A".repeat(64));
         c.open_ledger_snapshot = Some(crate::ledger::open_ledger::OpenLedgerSnapshot {
             ledger_current_index: 1001,
             parent_ledger_index: 1000,
@@ -8637,6 +11757,11 @@ mod tests {
         assert_eq!(r["info"]["validated_ledger"]["seq"], 1000);
         assert!(r["info"]["tracked_inbound_ledgers"].is_number());
         assert!(r["info"]["failed_inbound_ledgers"].is_number());
+        assert!(r["info"]["validated_ready"].is_boolean());
+        assert_eq!(
+            r["info"]["stored_ledger_range"],
+            r["info"]["complete_ledgers"]
+        );
         assert_eq!(r["info"]["open_ledger_revision"], json!(9));
         assert_eq!(r["info"]["open_ledger_accept_count"], json!(3));
         assert!(r["info"]["state_accounting"]["disconnected"]["transitions"].is_string());
@@ -8644,6 +11769,18 @@ mod tests {
         // server_state depends on ledger age, sync state, and peer availability.
         let state = r["info"]["server_state"].as_str().unwrap();
         assert!(["full", "tracking", "syncing", "connected", "disconnected"].contains(&state));
+    }
+
+    #[test]
+    fn test_server_info_without_validated_snapshot_does_not_report_local_ledger() {
+        let mut c = ctx();
+        let resp = dispatch(req("server_info", json!({})), &mut c);
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["info"]["validated_ledger"]["seq"], json!(0));
+        assert_eq!(
+            resp.result["info"]["validated_ledger"]["hash"],
+            json!(ZERO_LEDGER_HASH)
+        );
     }
 
     #[test]
@@ -8721,6 +11858,11 @@ mod tests {
             resp.result["state"]["load_factor_local"],
             json!(crate::network::load::LOAD_BASE * 3)
         );
+        assert!(resp.result["state"]["validated_ready"].is_boolean());
+        assert_eq!(
+            resp.result["state"]["stored_ledger_range"],
+            resp.result["state"]["complete_ledgers"]
+        );
         assert!(
             resp.result["state"]["state_accounting"]["disconnected"]["duration_us"].is_string()
         );
@@ -8763,8 +11905,10 @@ mod tests {
     #[test]
     fn test_server_info_uses_validator_list_quorum() {
         let mut c = ctx();
+        let first = validator_key_bytes();
+        let second = validator_key_bytes();
         c.validator_list_manager = Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::validator_list::ValidatorListManager::new(vec![vec![1u8; 33], vec![2u8; 33]], 1),
+            crate::validator_list::ValidatorListManager::new(vec![first, second], 1),
         )));
         let resp = dispatch(req("server_info", json!({})), &mut c);
         assert_eq!(resp.result["status"], "success");
@@ -8774,12 +11918,70 @@ mod tests {
     #[test]
     fn test_server_state_uses_validator_list_quorum() {
         let mut c = ctx();
+        let first = validator_key_bytes();
+        let second = validator_key_bytes();
         c.validator_list_manager = Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::validator_list::ValidatorListManager::new(vec![vec![1u8; 33], vec![2u8; 33]], 1),
+            crate::validator_list::ValidatorListManager::new(vec![first, second], 1),
         )));
         let resp = dispatch(req("server_state", json!({})), &mut c);
         assert_eq!(resp.result["status"], "success");
         assert_eq!(resp.result["state"]["validation_quorum"], json!(2));
+    }
+
+    #[test]
+    fn test_server_info_has_no_fake_quorum_without_validator_list() {
+        let mut c = ctx();
+        c.amendments.insert("featureA".to_string());
+        let resp = dispatch(req("server_info", json!({})), &mut c);
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["info"]["validation_quorum"], json!(0));
+    }
+
+    #[test]
+    fn test_server_info_applies_negative_unl_to_validation_quorum() {
+        let validators = (0..5).map(|_| validator_key_bytes()).collect::<Vec<_>>();
+        let manager = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::validator_list::ValidatorListManager::new(validators.clone(), 1),
+        ));
+
+        let mut c = ctx();
+        c.validator_list_manager = Some(manager);
+        let negative_unl_key = crate::ledger::keylet::negative_unl().key;
+        c.ledger_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_raw(
+                negative_unl_key,
+                crate::ledger::serialize_negative_unl(
+                    &[validators[0].clone(), validators[1].clone()],
+                    None,
+                    None,
+                ),
+            );
+
+        let info = dispatch(req("server_info", json!({})), &mut c);
+        assert_eq!(info.result["status"], "success");
+        assert_eq!(info.result["info"]["validation_quorum"], json!(3));
+
+        let validators_resp = dispatch(req("validators", json!({})), &mut c);
+        assert_eq!(
+            validators_resp.result["trusted_validator_keys"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_book_changes_current_is_not_validated_without_validated_head() {
+        let mut c = ctx();
+        c.ledger_header.sequence = 1000;
+        c.ledger_header.hash = [0xAA; 32];
+        let resp = dispatch(req("book_changes", json!({})), &mut c);
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["ledger_index"], json!(1000));
+        assert_eq!(resp.result["validated"], json!(false));
     }
 
     #[test]
@@ -8824,9 +12026,11 @@ mod tests {
 
     #[test]
     fn test_ledger_header_includes_blob() {
+        let mut c = ctx();
+        mark_validated(&mut c, 1000, "A".repeat(64));
         let resp = dispatch(
             req("ledger_header", json!({"ledger_index": "validated"})),
-            &mut ctx(),
+            &mut c,
         );
         assert_eq!(resp.result["status"], "success");
         assert_eq!(resp.result["ledger"]["ledger_index"], "1000");
@@ -8880,6 +12084,22 @@ mod tests {
         c.fetch_info = Some(crate::rpc::FetchInfoSnapshot {
             key: "348928".to_string(),
             hash: "C2".repeat(32),
+            sync_active: true,
+            sync_in_progress: true,
+            sync_done: false,
+            pending_sync_anchor: Some(format!("348928:{}", "C2".repeat(32))),
+            target_seq: 348928,
+            target_hash: "C2".repeat(32),
+            target_account_hash: "A1".repeat(32),
+            computed_root_hash: "B2".repeat(32),
+            root_matches: false,
+            ready: false,
+            readiness: "blocked".to_string(),
+            readiness_blockers: vec![
+                "state_root_mismatch".to_string(),
+                "pending_sync_anchor".to_string(),
+                "sync_not_done".to_string(),
+            ],
             have_header: true,
             have_state: false,
             have_transactions: false,
@@ -8888,6 +12108,13 @@ mod tests {
             peers: 2,
             timeouts: 1,
             in_flight: 8,
+            outstanding_cookies: 5,
+            outstanding_object_queries: 3,
+            recent_nodes: 7,
+            useful_idle_secs: 11,
+            response_idle_secs: 13,
+            queue_len: 2,
+            queue_bytes: 4096,
             inner_nodes: 12,
             state_nodes: 34,
             pass: 3,
@@ -8901,6 +12128,15 @@ mod tests {
         assert_eq!(resp.result["info"]["348928"]["peers"], 2);
         assert_eq!(resp.result["info"]["348928"]["have_header"], true);
         assert_eq!(resp.result["info"]["348928"]["have_state"], false);
+        assert_eq!(resp.result["info"]["348928"]["sync_active"], true);
+        assert_eq!(resp.result["info"]["348928"]["root_matches"], false);
+        assert_eq!(resp.result["info"]["348928"]["ready"], false);
+        assert_eq!(resp.result["info"]["348928"]["readiness"], "blocked");
+        assert_eq!(
+            resp.result["info"]["348928"]["readiness_blockers"][0],
+            "state_root_mismatch"
+        );
+        assert_eq!(resp.result["info"]["348928"]["queue_len"], 2);
         assert_eq!(resp.result["info"]["348928"]["backend_fetch_errors"], 2);
         assert_eq!(resp.result["info"]["348928"]["timeouts"], 1);
         assert!(clear_flag.load(std::sync::atomic::Ordering::SeqCst));
@@ -9162,8 +12398,23 @@ mod tests {
         let first = dispatch(req("server_definitions", json!({})), &mut c);
         assert_eq!(first.result["status"], "success");
         assert!(first.result["FIELDS"].is_array());
-        assert!(first.result["LEDGER_ENTRY_TYPES"].is_array());
-        assert!(first.result["TRANSACTION_TYPES"].is_array());
+        assert!(first.result["LEDGER_ENTRY_TYPES"].is_object());
+        assert!(first.result["TRANSACTION_TYPES"].is_object());
+        assert_eq!(first.result["TRANSACTION_TYPES"]["Batch"], 71);
+        assert_eq!(first.result["TRANSACTION_TYPES"]["VaultCreate"], 65);
+        assert_eq!(first.result["TRANSACTION_TYPES"]["XChainCommit"], 42);
+        assert_eq!(first.result["TRANSACTION_RESULTS"]["tecDIR_FULL"], 121);
+        assert_eq!(first.result["TYPES"]["Currency"], 26);
+        assert_eq!(first.result["TYPES"]["XChainBridge"], 25);
+        assert!(first.result["FIELDS"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field[0] == "CredentialIDs"));
+        assert_eq!(
+            first.result["hash"],
+            "018742D1E0312286F3E85CAC71750BC86AE9C4316A8E810FE4BFE1D8468A9191"
+        );
         let hash = first.result["hash"].as_str().unwrap().to_string();
 
         let second = dispatch(req("server_definitions", json!({ "hash": hash })), &mut c);
@@ -9446,6 +12697,14 @@ mod tests {
             store_unchecked_ops: 4,
             batch_store_ops: 5,
             batch_store_nodes: 19,
+            fetch_total_ms: 21,
+            fetch_max_ms: 8,
+            store_total_ms: 34,
+            store_max_ms: 13,
+            batch_store_total_ms: 55,
+            batch_store_max_ms: 21,
+            flush_total_ms: 89,
+            flush_max_ms: 34,
             flush_ops: 2,
             last_flush_unix: Some(88),
             last_flush_duration_ms: Some(9),
@@ -9466,6 +12725,8 @@ mod tests {
             node_store.result["node_store"]["last_flush_duration_ms"],
             json!(9)
         );
+        assert_eq!(node_store.result["node_store"]["fetch_total_ms"], json!(21));
+        assert_eq!(node_store.result["node_store"]["flush_max_ms"], json!(34));
         c.fetch_pack_snapshot = Some(crate::ledger::fetch_pack::FetchPackSnapshot {
             tracked: 2,
             stashed_total: 7,
@@ -9488,6 +12749,7 @@ mod tests {
             last_flush_unix: Some(77),
             last_flush_duration_ms: Some(12),
             last_flush_error: Some("flush busy".into()),
+            bytes: 128,
             entries: vec![crate::ledger::fetch_pack::FetchPackEntrySummary {
                 hash: "FE".repeat(32),
                 size: 128,
@@ -9499,6 +12761,7 @@ mod tests {
         let fetch_pack = dispatch(req("print", json!({"params": ["fetch_pack"]})), &mut c);
         assert_eq!(fetch_pack.result["status"], "success");
         assert_eq!(fetch_pack.result["fetch_pack"]["tracked"], json!(2));
+        assert_eq!(fetch_pack.result["fetch_pack"]["bytes"], json!(128));
         assert_eq!(
             fetch_pack.result["fetch_pack"]["backend_fill_total"],
             json!(8)
@@ -9554,6 +12817,11 @@ mod tests {
         c.inbound_ledgers_snapshot = Some(crate::ledger::inbound::InboundLedgersSnapshot {
             active: 2,
             complete: 1,
+            header_complete: 1,
+            state_complete: 0,
+            tx_complete: 0,
+            full_complete: 0,
+            tx_missing_nodes_total: 1,
             failed: 0,
             retry_ready: 1,
             stale: 0,
@@ -9572,12 +12840,20 @@ mod tests {
             history: 1,
             generic: 0,
             consensus: 1,
+            header_responses_total: 2,
+            tx_node_responses_total: 3,
+            state_tree_complete_total: 4,
             entries: vec![crate::ledger::inbound::InboundLedgerSummary {
                 ledger_hash: "CD".repeat(32),
                 ledger_seq: 9,
                 reason: "history".into(),
                 has_header: true,
+                has_state: false,
                 has_transactions: false,
+                tx_complete: false,
+                tx_missing_nodes: 1,
+                state_root_known: true,
+                full_complete: false,
                 complete: false,
                 failed: false,
                 timeout_count: 2,
@@ -9956,9 +13232,10 @@ mod tests {
 
     #[test]
     fn test_validators_shape() {
-        let static_validator = vec![3u8; 33];
-        let publisher_key = hex::encode([8u8; 33]);
-        let listed_validator = hex::encode([9u8; 33]);
+        let static_validator = validator_key_bytes();
+        let publisher_key = hex::encode(validator_key_bytes());
+        let listed_validator = hex::encode(validator_key_bytes());
+        let signing_key = validator_key_bytes();
         let manager = std::sync::Arc::new(std::sync::Mutex::new(
             crate::validator_list::ValidatorListManager::new(vec![static_validator.clone()], 1),
         ));
@@ -9969,7 +13246,7 @@ mod tests {
                 publisher_key: publisher_key.clone(),
                 manifest: Some(crate::validator_list::CachedManifestInfo {
                     master_key: publisher_key.clone().to_uppercase(),
-                    signing_key: hex::encode([0xAAu8; 33]).to_uppercase(),
+                    signing_key: hex::encode(&signing_key).to_uppercase(),
                     sequence: 9,
                     domain: Some("vl.example".to_string()),
                     raw_manifest: "ZHVtbXk=".to_string(),
@@ -10007,7 +13284,7 @@ mod tests {
                 crate::crypto::base58::PREFIX_NODE_PUBLIC,
                 &hex::decode(&publisher_key).unwrap()
             )],
-            crate::crypto::base58::encode(crate::crypto::base58::PREFIX_NODE_PUBLIC, &[0xAAu8; 33])
+            crate::crypto::base58::encode(crate::crypto::base58::PREFIX_NODE_PUBLIC, &signing_key)
         );
         assert!(
             resp.result["trusted_validator_keys"]
@@ -10024,9 +13301,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let publisher_key = hex::encode([7u8; 33]);
-        let current_validator = hex::encode([9u8; 33]);
-        let future_validator = hex::encode([10u8; 33]);
+        let publisher_key = hex::encode(validator_key_bytes());
+        let current_validator = hex::encode(validator_key_bytes());
+        let future_validator = hex::encode(validator_key_bytes());
         let manager = std::sync::Arc::new(std::sync::Mutex::new(
             crate::validator_list::ValidatorListManager::new(Vec::new(), 1),
         ));
@@ -10083,9 +13360,9 @@ mod tests {
 
     #[test]
     fn test_unl_list_shape() {
-        let static_validator = vec![3u8; 33];
-        let publisher_key = hex::encode([8u8; 33]);
-        let listed_validator = hex::encode([9u8; 33]);
+        let static_validator = validator_key_bytes();
+        let publisher_key = hex::encode(validator_key_bytes());
+        let listed_validator = hex::encode(validator_key_bytes());
         let manager = std::sync::Arc::new(std::sync::Mutex::new(
             crate::validator_list::ValidatorListManager::new(vec![static_validator.clone()], 1),
         ));
@@ -10199,7 +13476,7 @@ mod tests {
                 },
                 ParsedField {
                     type_code: 1,
-                    field_code: 2,
+                    field_code: 5,
                     data: 500u16.to_be_bytes().to_vec(),
                 },
                 ParsedField {
@@ -10336,6 +13613,7 @@ mod tests {
                     flags: 0,
                     regular_key: None,
                     minted_nftokens: 0,
+                    first_nftoken_sequence: 0,
                     burned_nftokens: 0,
                     transfer_rate: 0,
                     domain: Vec::new(),
@@ -10506,12 +13784,13 @@ mod tests {
         let kp = Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb").unwrap();
         let account_id = crate::crypto::account_id(&kp.public_key_bytes());
 
-        let ctx = NodeContext {
+        let mut ctx = NodeContext {
             ledger_seq: 1,
             ledger_hash: "A".repeat(64),
             admin_rpc_enabled: true,
             ..Default::default()
         };
+        mark_validated(&mut ctx, 1, "A".repeat(64));
         ctx.ledger_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -10523,6 +13802,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -10563,6 +13843,7 @@ mod tests {
                     flags: 0,
                     regular_key: None,
                     minted_nftokens: 0,
+                    first_nftoken_sequence: 0,
                     burned_nftokens: 0,
                     transfer_rate: 0,
                     domain: Vec::new(),
@@ -10678,6 +13959,11 @@ mod tests {
         assert_eq!(data["Sequence"], 1);
         assert_eq!(data["OwnerCount"], 0);
         assert_eq!(data["LedgerEntryType"], "AccountRoot");
+        assert_eq!(resp.result["account_flags"]["defaultRipple"], false);
+        assert_eq!(resp.result["account_flags"]["disableMasterKey"], false);
+        assert_eq!(resp.result["account_flags"]["requireDestinationTag"], false);
+        assert_eq!(resp.result["ledger_index"], 1);
+        assert_eq!(resp.result["ledger_hash"], "A".repeat(64));
         // index is a 64-char uppercase hex string
         let index = data["index"].as_str().unwrap();
         assert_eq!(index.len(), 64);
@@ -10707,6 +13993,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -10779,6 +14066,120 @@ mod tests {
     }
 
     #[test]
+    fn test_account_info_live_flags_and_queue_data() {
+        let mut c = ctx_with_genesis();
+        let account =
+            crate::crypto::base58::decode_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
+        {
+            let ls = &mut *c.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut root = ls.get_account(&account).cloned().unwrap();
+            root.flags = crate::ledger::account::LSF_DEFAULT_RIPPLE
+                | crate::ledger::account::LSF_DEPOSIT_AUTH
+                | crate::ledger::account::LSF_REQUIRE_DEST_TAG;
+            ls.insert_account(root);
+        }
+        let resp = dispatch(
+            req(
+                "account_info",
+                json!({
+                    "account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                    "queue": true,
+                    "signer_lists": true
+                }),
+            ),
+            &mut c,
+        );
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["account_flags"]["defaultRipple"], true);
+        assert_eq!(resp.result["account_flags"]["depositAuth"], true);
+        assert_eq!(resp.result["account_flags"]["requireDestinationTag"], true);
+        assert_eq!(resp.result["queue_data"]["txn_count"], 0);
+        assert!(resp.result.get("signer_lists").is_none());
+    }
+
+    #[test]
+    fn test_account_info_accepts_ident_alias() {
+        let mut c = ctx_with_genesis();
+        let resp = dispatch(
+            req(
+                "account_info",
+                json!({
+                    "ident": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+                }),
+            ),
+            &mut c,
+        );
+
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(
+            resp.result["account_data"]["Account"],
+            "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+        );
+    }
+
+    #[test]
+    fn test_account_info_queue_rejects_validated_ledger() {
+        let mut c = ctx_with_genesis();
+        let resp = dispatch(
+            req(
+                "account_info",
+                json!({
+                    "account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                    "ledger_index": "validated",
+                    "queue": true
+                }),
+            ),
+            &mut c,
+        );
+
+        assert_eq!(resp.result["status"], "error");
+        assert_eq!(resp.result["error"], "invalidParams");
+    }
+
+    #[test]
+    fn test_deposit_authorized_credential_expiration_boundary_is_inclusive() {
+        let source = [0x51; 20];
+        let issuer = [0x52; 20];
+        let raw = crate::ledger::meta::build_sle(
+            0x0081,
+            &[
+                crate::ledger::meta::ParsedField {
+                    type_code: 2,
+                    field_code: 2,
+                    data: crate::ledger::tx::credential::LSF_ACCEPTED
+                        .to_be_bytes()
+                        .to_vec(),
+                },
+                crate::ledger::meta::ParsedField {
+                    type_code: 2,
+                    field_code: 10,
+                    data: 100u32.to_be_bytes().to_vec(),
+                },
+                crate::ledger::meta::ParsedField {
+                    type_code: 8,
+                    field_code: 24,
+                    data: source.to_vec(),
+                },
+                crate::ledger::meta::ParsedField {
+                    type_code: 8,
+                    field_code: 4,
+                    data: issuer.to_vec(),
+                },
+                crate::ledger::meta::ParsedField {
+                    type_code: 7,
+                    field_code: 31,
+                    data: b"KYC".to_vec(),
+                },
+            ],
+            None,
+            None,
+        );
+
+        assert!(accepted_credential_pair(&raw, &source, 100).is_ok());
+        assert!(accepted_credential_pair(&raw, &source, 101).is_err());
+    }
+
+    #[test]
     fn test_account_lines_peer_filter() {
         let (mut c, alice_id, bob_id, _) = ctx_with_trustlines_and_offers();
         let alice_addr = crate::crypto::base58::encode_account(&alice_id);
@@ -10826,6 +14227,7 @@ mod tests {
             &mut c,
         );
         let marker = first.result["marker"].as_str().unwrap().to_string();
+        assert!(marker.contains(','));
         assert_eq!(first.result["lines"].as_array().unwrap().len(), 1);
 
         let second = dispatch(
@@ -10865,6 +14267,7 @@ mod tests {
                     flags: 0,
                     regular_key: None,
                     minted_nftokens: 0,
+                    first_nftoken_sequence: 0,
                     burned_nftokens: 0,
                     transfer_rate: 0,
                     domain: Vec::new(),
@@ -10924,6 +14327,9 @@ mod tests {
             crate::crypto::base58::decode_account("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe").unwrap();
 
         let mut c = ctx();
+        let ledger_seq = c.ledger_seq;
+        let ledger_hash = c.ledger_hash.clone();
+        mark_validated(&mut c, ledger_seq, ledger_hash);
         {
             let ls = &mut *c.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
             ls.insert_account(AccountRoot {
@@ -10934,6 +14340,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -10951,6 +14358,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -11025,7 +14433,7 @@ mod tests {
         );
         let account = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_string();
         let destination = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
-        let ctx = ctx_with_genesis();
+        let mut ctx = ctx_with_genesis();
 
         for (seq, amount) in [(10u32, 1_000_000u64), (11, 2_000_000), (12, 3_000_000)] {
             let signed = TxBuilder::payment()
@@ -11065,6 +14473,21 @@ mod tests {
                 );
         }
 
+        mark_validated(&mut ctx, 12, hex::encode_upper([12u8; 32]));
+        if let Some(snapshot) = ctx.ledger_master_snapshot.as_mut() {
+            snapshot
+                .recent_validated
+                .push(crate::ledger::master::RecentValidatedLedger {
+                    seq: 11,
+                    hash: hex::encode_upper([11u8; 32]),
+                });
+            snapshot
+                .recent_validated
+                .push(crate::ledger::master::RecentValidatedLedger {
+                    seq: 10,
+                    hash: hex::encode_upper([10u8; 32]),
+                });
+        }
         (ctx, account)
     }
 
@@ -11154,11 +14577,12 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_requires_admin_rpc() {
+    fn test_submit_is_public_user_rpc() {
         let mut c = NodeContext::default();
         c.admin_rpc_enabled = false;
         let resp = dispatch(req("submit", json!({"tx_blob": "ABCD"})), &mut c);
-        assert_eq!(resp.result["error"], "forbidden");
+        assert_eq!(resp.result["error"], "invalidTransaction");
+        assert_eq!(resp.result["error_exception"], "Transaction length invalid");
     }
 
     #[test]
@@ -11189,6 +14613,21 @@ mod tests {
         assert_eq!(resp.result["engine_result"], "tesSUCCESS");
         let hash = resp.result["tx_json"]["hash"].as_str().unwrap();
         assert_eq!(hash.len(), 64);
+    }
+
+    #[test]
+    fn test_submit_rejects_below_current_load_fee() {
+        let blob = genesis_payment(1, 1_000_000);
+        let mut c = ctx_with_genesis();
+        c.load_snapshot.local_fee = crate::network::load::LOAD_BASE * 4;
+
+        let resp = dispatch(req("submit", json!({"tx_blob": blob})), &mut c);
+
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["engine_result"], "telINSUF_FEE_P");
+        assert_eq!(resp.result["applied"], false);
+        assert_eq!(c.tx_pool.read().unwrap_or_else(|e| e.into_inner()).len(), 0);
+        assert!(c.broadcast_queue.is_empty());
     }
 
     #[test]
@@ -11274,6 +14713,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -11529,7 +14969,9 @@ mod tests {
         );
         assert_eq!(first.result["status"], "success");
         assert_eq!(first.result["transactions"].as_array().unwrap().len(), 1);
-        let marker = first.result["marker"].as_str().unwrap().to_string();
+        assert_eq!(first.result["marker"]["ledger"], 12);
+        assert_eq!(first.result["marker"]["seq"], 0);
+        let marker = first.result["marker"].clone();
 
         let second = dispatch(
             req(
@@ -11706,6 +15148,7 @@ mod tests {
             &mut c,
         );
         let marker = first.result["marker"].as_str().unwrap().to_string();
+        assert!(marker.contains(','));
         assert_eq!(first.result["offers"].as_array().unwrap().len(), 1);
 
         let second = dispatch(
@@ -11721,6 +15164,81 @@ mod tests {
         );
         assert_eq!(second.result["offers"].as_array().unwrap().len(), 1);
         assert_ne!(first.result["offers"][0], second.result["offers"][0]);
+    }
+
+    #[test]
+    fn test_account_offers_historical_uses_nudb_root_and_marker() {
+        use crate::ledger::node_store::NuDBNodeStore;
+        use crate::ledger::{offer::Offer, AccountRoot};
+        use crate::transaction::amount::{Amount, Currency, IouValue};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = std::sync::Arc::new(NuDBNodeStore::open(tmp.path()).unwrap());
+        let mut state = crate::ledger::LedgerState::new();
+        state.set_nudb_shamap(crate::ledger::SHAMap::with_backend(
+            crate::ledger::MapType::AccountState,
+            backend,
+        ));
+
+        let account = [0x51; 20];
+        let issuer = [0x52; 20];
+        for id in [account, issuer] {
+            state.insert_account(AccountRoot {
+                account_id: id,
+                balance: 1_000_000_000,
+                sequence: 1,
+                owner_count: 0,
+                flags: 0,
+                regular_key: None,
+                minted_nftokens: 0,
+                first_nftoken_sequence: 0,
+                burned_nftokens: 0,
+                transfer_rate: 0,
+                domain: Vec::new(),
+                tick_size: 0,
+                ticket_count: 0,
+                previous_txn_id: [0u8; 32],
+                previous_txn_lgr_seq: 0,
+                raw_sle: None,
+            });
+        }
+        for sequence in [7, 8] {
+            state.insert_offer(Offer {
+                account,
+                sequence,
+                taker_pays: Amount::Xrp(sequence as u64 * 1_000_000),
+                taker_gets: Amount::Iou {
+                    value: IouValue::from_f64(sequence as f64),
+                    currency: Currency::from_code("USD").unwrap(),
+                    issuer,
+                },
+                flags: 0,
+                book_directory: [0u8; 32],
+                book_node: 0,
+                owner_node: 0,
+                expiration: None,
+                domain_id: None,
+                additional_books: Vec::new(),
+                previous_txn_id: [0u8; 32],
+                previous_txn_lgr_seq: 0,
+                raw_sle: None,
+            });
+        }
+
+        let mut c = ctx_with_historical_state(state, 500, [0x99; 32]);
+        let first = dispatch(
+            req(
+                "account_offers",
+                json!({
+                    "account": crate::crypto::base58::encode_account(&account),
+                    "ledger_index": 500,
+                    "limit": 1
+                }),
+            ),
+            &mut c,
+        );
+        assert_eq!(first.result["status"], "success");
+        assert_eq!(first.result["offers"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -11777,6 +15295,7 @@ mod tests {
                     flags: 0,
                     regular_key: None,
                     minted_nftokens: 0,
+                    first_nftoken_sequence: 0,
                     burned_nftokens: 0,
                     transfer_rate: 0,
                     domain: Vec::new(),
@@ -11819,6 +15338,26 @@ mod tests {
                 previous_txn_lgr_seq: 0,
                 raw_sle: None,
             });
+            ls.insert_offer(Offer {
+                account: owner,
+                sequence: 6,
+                taker_pays: Amount::Xrp(8_000_000_000),
+                taker_gets: Amount::Iou {
+                    value: IouValue::from_f64(20.0),
+                    currency: Currency::from_code("USD").unwrap(),
+                    issuer,
+                },
+                flags: 0,
+                book_directory: [0xAC; 32],
+                book_node: 0,
+                owner_node: 0,
+                expiration: None,
+                domain_id: None,
+                additional_books: Vec::new(),
+                previous_txn_id: [0u8; 32],
+                previous_txn_lgr_seq: 0,
+                raw_sle: None,
+            });
         }
 
         let resp = dispatch(
@@ -11832,6 +15371,7 @@ mod tests {
             &mut c,
         );
         assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["offers"].as_array().unwrap().len(), 2);
         let offer = &resp.result["offers"][0];
         assert_eq!(
             offer["Account"],
@@ -11841,7 +15381,22 @@ mod tests {
         assert_eq!(offer["BookDirectory"], hex::encode_upper([0xAB; 32]));
         assert_eq!(offer["BookNode"], "0");
         assert_eq!(offer["OwnerNode"], "0");
-        assert_eq!(offer["owner_funds"], "100");
+        let owner_funds_count = resp.result["offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|offer| offer.get("owner_funds").is_some())
+            .count();
+        assert_eq!(owner_funds_count, 1);
+        assert_eq!(
+            resp.result["offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|offer| offer.get("owner_funds"))
+                .unwrap(),
+            "100"
+        );
         assert_eq!(offer["quality"], "400000000");
     }
 
@@ -11900,6 +15455,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -11917,6 +15473,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -12021,6 +15578,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -12199,6 +15757,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -12244,6 +15803,25 @@ mod tests {
         };
         state.insert_raw(chan_a.key(), chan_a.to_sle_binary());
         state.insert_raw(chan_b.key(), chan_b.to_sle_binary());
+        for sequence in 3..14 {
+            let chan = crate::ledger::PayChannel {
+                account: owner,
+                destination: if sequence % 2 == 0 { dest_a } else { dest_b },
+                amount: 20_000_000 + sequence as u64,
+                balance: 2_000_000,
+                settle_delay: 7200,
+                public_key: vec![0x03; 33],
+                sequence,
+                cancel_after: 0,
+                expiration: 0,
+                owner_node: 0,
+                destination_node: 0,
+                source_tag: None,
+                destination_tag: None,
+                raw_sle: None,
+            };
+            state.insert_raw(chan.key(), chan.to_sle_binary());
+        }
 
         let mut c = ctx_with_historical_state(state, 500, [0x66; 32]);
         let owner_addr = crate::crypto::base58::encode_account(&owner);
@@ -12255,7 +15833,7 @@ mod tests {
                     "account": owner_addr,
                     "ledger_index": 500,
                     "type": "payment_channel",
-                    "limit": 1
+                    "limit": 2
                 }),
             ),
             &mut c,
@@ -12266,7 +15844,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            10
         );
         assert_eq!(
             first_objects.result["account_objects"][0]["LedgerEntryType"],
@@ -12281,7 +15859,7 @@ mod tests {
                     "account": crate::crypto::base58::encode_account(&owner),
                     "ledger_index": 500,
                     "type": "payment_channel",
-                    "limit": 1,
+                    "limit": 2,
                     "marker": marker
                 }),
             ),
@@ -12293,7 +15871,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            3
         );
         assert_ne!(
             first_objects.result["account_objects"][0]["index"],
@@ -12365,6 +15943,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -12381,7 +15960,8 @@ mod tests {
                     &alice_id,
                     token_id,
                     Some(vec![serial as u8, serial as u8 + 1]),
-                );
+                )
+                .expect("test NFT page insert should fit");
             }
         }
         (ctx, alice_id)
@@ -12444,6 +16024,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -12455,7 +16036,9 @@ mod tests {
         });
         for serial in 1..=2u32 {
             let token_id = crate::ledger::nftoken::make_nftoken_id(0x0008, 100, &owner, 7, serial);
-            state.insert_nftoken_paged(&owner, token_id, Some(vec![serial as u8]));
+            state
+                .insert_nftoken_paged(&owner, token_id, Some(vec![serial as u8]))
+                .expect("test NFT page insert should fit");
         }
 
         let mut c = ctx_with_historical_state(state, 500, [0x67; 32]);
@@ -12593,12 +16176,63 @@ mod tests {
     }
 
     #[test]
+    fn test_ledger_entry_rejects_multiple_selectors() {
+        let mut c = ctx_with_genesis();
+        let account_id =
+            crate::crypto::base58::decode_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
+        let key = crate::ledger::account::shamap_key(&account_id);
+
+        let resp = dispatch(
+            req(
+                "ledger_entry",
+                json!({
+                    "index": hex::encode_upper(key.0),
+                    "account_root": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+                }),
+            ),
+            &mut c,
+        );
+
+        assert_eq!(resp.result["status"], "error");
+        assert_eq!(resp.result["error"], "invalidParams");
+        assert_eq!(
+            resp.result["error_message"],
+            "Invalid parameters: Too many fields provided."
+        );
+    }
+
+    #[test]
+    fn test_ledger_entry_absent_index_returns_entry_not_found_with_index() {
+        let mut c = ctx_with_genesis();
+        let missing = [0xFEu8; 32];
+
+        let resp = dispatch(
+            req(
+                "ledger_entry",
+                json!({
+                    "index": hex::encode_upper(missing)
+                }),
+            ),
+            &mut c,
+        );
+
+        assert_eq!(resp.result["status"], "error");
+        assert_eq!(resp.result["error"], "entryNotFound");
+        assert_eq!(resp.result["error_code"], 98);
+        assert_eq!(resp.result["error_message"], "Entry not found.");
+        assert_eq!(resp.result["index"], hex::encode_upper(missing));
+    }
+
+    #[test]
     fn test_ledger_entry_object_selectors() {
         let mut c = ctx_with_genesis();
         let owner =
             crate::crypto::base58::decode_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
         let other =
             crate::crypto::base58::decode_account("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe").unwrap();
+        let mut mptid = [0u8; 24];
+        mptid[..4].copy_from_slice(&42u32.to_be_bytes());
+        mptid[4..].copy_from_slice(&owner);
         {
             let ls = &mut *c.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
             ls.insert_check(crate::ledger::Check {
@@ -12611,6 +16245,7 @@ mod tests {
                 destination_node: 0,
                 source_tag: None,
                 destination_tag: None,
+                invoice_id: None,
                 raw_sle: None,
             });
             ls.insert_escrow(crate::ledger::Escrow {
@@ -12676,6 +16311,83 @@ mod tests {
                 previous_txn_lgrseq: 0,
                 raw_sle: None,
             });
+            let oracle_key = crate::ledger::keylet::oracle(&owner, 77).key;
+            ls.insert_raw(
+                oracle_key,
+                crate::ledger::meta::build_sle(
+                    0x0080,
+                    &[
+                        crate::ledger::meta::ParsedField {
+                            type_code: 8,
+                            field_code: 1,
+                            data: owner.to_vec(),
+                        },
+                        crate::ledger::meta::ParsedField {
+                            type_code: 2,
+                            field_code: 51,
+                            data: 77u32.to_be_bytes().to_vec(),
+                        },
+                    ],
+                    None,
+                    None,
+                ),
+            );
+            let credential_type = b"KYC".to_vec();
+            let credential_key =
+                crate::ledger::keylet::credential(&owner, &other, &credential_type).key;
+            ls.insert_raw(
+                credential_key,
+                crate::ledger::meta::build_sle(
+                    0x0081,
+                    &[
+                        crate::ledger::meta::ParsedField {
+                            type_code: 8,
+                            field_code: 24,
+                            data: owner.to_vec(),
+                        },
+                        crate::ledger::meta::ParsedField {
+                            type_code: 8,
+                            field_code: 4,
+                            data: other.to_vec(),
+                        },
+                        crate::ledger::meta::ParsedField {
+                            type_code: 7,
+                            field_code: 31,
+                            data: credential_type.clone(),
+                        },
+                    ],
+                    None,
+                    None,
+                ),
+            );
+            let mpt_key = crate::ledger::keylet::mpt_issuance(&mptid).key;
+            ls.insert_raw(
+                mpt_key,
+                crate::ledger::meta::build_sle(
+                    0x007E,
+                    &[crate::ledger::meta::ParsedField {
+                        type_code: 21,
+                        field_code: 1,
+                        data: mptid.to_vec(),
+                    }],
+                    None,
+                    None,
+                ),
+            );
+            let domain_key = permissioned_domain_key(&owner, 88);
+            ls.insert_raw(
+                domain_key,
+                crate::ledger::meta::build_sle(
+                    0x0082,
+                    &[crate::ledger::meta::ParsedField {
+                        type_code: 8,
+                        field_code: 2,
+                        data: owner.to_vec(),
+                    }],
+                    None,
+                    None,
+                ),
+            );
         }
 
         let cases = [
@@ -12702,6 +16414,22 @@ mod tests {
             (
                 json!({"deposit_preauth": {"owner": crate::crypto::base58::encode_account(&owner), "authorized": crate::crypto::base58::encode_account(&other)}}),
                 "DepositPreauth",
+            ),
+            (
+                json!({"oracle": {"account": crate::crypto::base58::encode_account(&owner), "oracle_document_id": 77}}),
+                "Oracle",
+            ),
+            (
+                json!({"credential": {"subject": crate::crypto::base58::encode_account(&owner), "issuer": crate::crypto::base58::encode_account(&other), "credential_type": "4B5943"}}),
+                "Credential",
+            ),
+            (
+                json!({"mpt_issuance": hex::encode_upper(mptid)}),
+                "MPTokenIssuance",
+            ),
+            (
+                json!({"permissioned_domain": {"owner": crate::crypto::base58::encode_account(&owner), "seq": 88}}),
+                "PermissionedDomain",
             ),
         ];
 
@@ -12767,26 +16495,28 @@ mod tests {
         let (mut c, alice_id, _, _) = ctx_with_trustlines_and_offers();
         {
             let ls = &mut *c.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
-            ls.insert_offer(Offer {
-                account: alice_id,
-                sequence: 9,
-                taker_pays: Amount::Xrp(3_000_000),
-                taker_gets: Amount::Iou {
-                    value: IouValue::from_f64(3.0),
-                    currency: Currency::from_code("USD").unwrap(),
-                    issuer: alice_id,
-                },
-                flags: 0,
-                book_directory: [0u8; 32],
-                book_node: 0,
-                owner_node: 0,
-                expiration: None,
-                domain_id: None,
-                additional_books: Vec::new(),
-                previous_txn_id: [0u8; 32],
-                previous_txn_lgr_seq: 0,
-                raw_sle: None,
-            });
+            for sequence in 9..21 {
+                ls.insert_offer(Offer {
+                    account: alice_id,
+                    sequence,
+                    taker_pays: Amount::Xrp(3_000_000 + sequence as u64),
+                    taker_gets: Amount::Iou {
+                        value: IouValue::from_f64(3.0),
+                        currency: Currency::from_code("USD").unwrap(),
+                        issuer: alice_id,
+                    },
+                    flags: 0,
+                    book_directory: [0u8; 32],
+                    book_node: 0,
+                    owner_node: 0,
+                    expiration: None,
+                    domain_id: None,
+                    additional_books: Vec::new(),
+                    previous_txn_id: [0u8; 32],
+                    previous_txn_lgr_seq: 0,
+                    raw_sle: None,
+                });
+            }
         }
         let first = dispatch(
             req(
@@ -12794,13 +16524,17 @@ mod tests {
                 json!({
                     "account": crate::crypto::base58::encode_account(&alice_id),
                     "type": "offer",
-                    "limit": 1
+                    "limit": 2
                 }),
             ),
             &mut c,
         );
         assert_eq!(first.result["status"], "success");
-        assert_eq!(first.result["account_objects"].as_array().unwrap().len(), 1);
+        assert_eq!(first.result["limit"], 10);
+        assert_eq!(
+            first.result["account_objects"].as_array().unwrap().len(),
+            10
+        );
         assert_eq!(
             first.result["account_objects"][0]["LedgerEntryType"],
             "Offer"
@@ -12813,17 +16547,17 @@ mod tests {
                 json!({
                     "account": crate::crypto::base58::encode_account(&alice_id),
                     "type": "offer",
-                    "limit": 1,
+                    "limit": 2,
                     "marker": marker
                 }),
             ),
             &mut c,
         );
         assert_eq!(second.result["status"], "success");
-        assert_eq!(
-            second.result["account_objects"].as_array().unwrap().len(),
-            1
-        );
+        assert!(!second.result["account_objects"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_ne!(
             first.result["account_objects"][0]["index"],
             second.result["account_objects"][0]["index"]
@@ -12875,19 +16609,6 @@ mod tests {
             "Invalid parameters: Invalid field 'account'."
         );
 
-        let first = dispatch(
-            req(
-                "account_objects",
-                json!({
-                    "account": crate::crypto::base58::encode_account(&alice_id),
-                    "type": "offer",
-                    "limit": 1
-                }),
-            ),
-            &mut c,
-        );
-        let marker = first.result["marker"].as_str().unwrap().to_string();
-
         let bad_marker_type = dispatch(
             req(
                 "account_objects",
@@ -12909,7 +16630,7 @@ mod tests {
                 "account_objects",
                 json!({
                     "account": crate::crypto::base58::encode_account(&alice_id),
-                    "marker": marker.replace(',', "")
+                    "marker": "not-a-live-marker"
                 }),
             ),
             &mut c,
@@ -12924,6 +16645,29 @@ mod tests {
     #[test]
     fn test_account_objects_invalid_type_and_limit_messages() {
         let (mut c, alice_id, _, _) = ctx_with_trustlines_and_offers();
+
+        for filter in [
+            "signer_list",
+            "amm",
+            "oracle",
+            "credential",
+            "permissioned_domain",
+            "mpt_issuance",
+            "mptoken",
+        ] {
+            let resp = dispatch(
+                req(
+                    "account_objects",
+                    json!({
+                        "account": crate::crypto::base58::encode_account(&alice_id),
+                        "type": filter
+                    }),
+                ),
+                &mut c,
+            );
+            assert_eq!(resp.result["status"], "success", "filter {filter}");
+            assert!(resp.result["account_objects"].is_array(), "filter {filter}");
+        }
 
         let bad_type_kind = dispatch(
             req(
@@ -13001,6 +16745,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -13088,10 +16833,9 @@ mod tests {
 
     #[test]
     fn test_ledger_current() {
-        let resp = dispatch(
-            req("ledger", json!({"ledger_index": "validated"})),
-            &mut ctx(),
-        );
+        let mut c = ctx();
+        mark_validated(&mut c, 1000, "A".repeat(64));
+        let resp = dispatch(req("ledger", json!({"ledger_index": "validated"})), &mut c);
         assert_eq!(resp.result["status"], "success");
         assert_eq!(resp.result["ledger_index"], 1000);
     }
@@ -13198,6 +16942,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -13241,6 +16986,13 @@ mod tests {
             resp.result["error_message"],
             "Invalid parameters: Invalid field 'limit', not integer."
         );
+
+        let resp = dispatch(req("ledger_data", json!({"limit": 0})), &mut ctx());
+        assert_eq!(resp.result["error"], "invalidParams");
+        assert_eq!(
+            resp.result["error_message"],
+            "Invalid parameters: Invalid field 'limit'."
+        );
     }
 
     #[test]
@@ -13266,6 +17018,7 @@ mod tests {
                     flags: 0,
                     regular_key: None,
                     minted_nftokens: 0,
+                    first_nftoken_sequence: 0,
                     burned_nftokens: 0,
                     transfer_rate: 0,
                     domain: Vec::new(),
@@ -13278,10 +17031,84 @@ mod tests {
             }
         }
 
-        let resp = dispatch(req("ledger_data", json!({"limit": 1000})), &mut c);
+        let resp = dispatch(
+            req("ledger_data", json!({"binary": true, "limit": 1000})),
+            &mut c,
+        );
         assert_eq!(resp.result["status"], "success");
         assert_eq!(resp.result["state"].as_array().unwrap().len(), 256);
         assert_eq!(resp.result["truncated"], true);
+    }
+
+    #[test]
+    fn test_ledger_data_json_type_filter_and_limit_cap() {
+        use crate::crypto::keys::Secp256k1KeyPair;
+        use crate::ledger::AccountRoot;
+
+        let mut c = ctx();
+        {
+            let ls = &mut *c.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..300 {
+                let kp = if i == 0 {
+                    Secp256k1KeyPair::from_seed("snoPBrXtMeMyMHUVTgbuqAfg1SUTb").unwrap()
+                } else {
+                    Secp256k1KeyPair::generate()
+                };
+                let account_id = crate::crypto::account_id(&kp.public_key_bytes());
+                ls.insert_account(AccountRoot {
+                    account_id,
+                    balance: 1_000_000 + i,
+                    sequence: 1,
+                    owner_count: 0,
+                    flags: 0,
+                    regular_key: None,
+                    minted_nftokens: 0,
+                    first_nftoken_sequence: 0,
+                    burned_nftokens: 0,
+                    transfer_rate: 0,
+                    domain: Vec::new(),
+                    tick_size: 0,
+                    ticket_count: 0,
+                    previous_txn_id: [0u8; 32],
+                    previous_txn_lgr_seq: 0,
+                    raw_sle: None,
+                });
+            }
+        }
+
+        let resp = dispatch(
+            req(
+                "ledger_data",
+                json!({"binary": false, "type": "account", "limit": 1000}),
+            ),
+            &mut c,
+        );
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["state"].as_array().unwrap().len(), 300);
+        assert!(resp.result["state"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["LedgerEntryType"] == "AccountRoot"));
+        assert!(resp.result["state"][0].get("data").is_none());
+        assert!(resp.result.get("ledger").is_some());
+    }
+
+    #[test]
+    fn test_ledger_data_omitted_binary_defaults_to_json() {
+        let (mut c, _, _, _) = ctx_with_trustlines_and_offers();
+
+        let resp = dispatch(req("ledger_data", json!({"limit": 1})), &mut c);
+        assert_eq!(resp.result["status"], "success");
+        assert!(resp.result["state"][0].get("LedgerEntryType").is_some());
+        assert!(resp.result["state"][0].get("data").is_none());
+
+        let binary = dispatch(
+            req("ledger_data", json!({"binary": true, "limit": 1})),
+            &mut c,
+        );
+        assert_eq!(binary.result["status"], "success");
+        assert!(binary.result["state"][0]["data"].is_string());
     }
 
     #[test]
@@ -13300,6 +17127,20 @@ mod tests {
             first.result["state"][0]["index"],
             second.result["state"][0]["index"]
         );
+    }
+
+    #[test]
+    fn test_ledger_data_current_accepts_nonexistent_marker_cursor() {
+        let (mut c, _, _, _) = ctx_with_trustlines_and_offers();
+        let marker = hex::encode_upper([0u8; 32]);
+
+        let resp = dispatch(
+            req("ledger_data", json!({"limit": 1, "marker": marker})),
+            &mut c,
+        );
+
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["state"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -13327,6 +17168,7 @@ mod tests {
                 flags: 0,
                 regular_key: None,
                 minted_nftokens: 0,
+                first_nftoken_sequence: 0,
                 burned_nftokens: 0,
                 transfer_rate: 0,
                 domain: Vec::new(),
@@ -13514,22 +17356,8 @@ mod tests {
             ),
             &mut c,
         );
-        assert_eq!(create.result["status"], "success");
-        assert_eq!(create.result["type"], "path_find");
-        assert!(create.result["alternatives"].is_array());
-
-        let status = dispatch(
-            req(
-                "path_find",
-                json!({
-                    "client_id": 7,
-                    "subcommand": "status"
-                }),
-            ),
-            &mut c,
-        );
-        assert_eq!(status.result["status"], "success");
-        assert_eq!(status.result["type"], "path_find");
+        assert_eq!(create.result["status"], "error");
+        assert_eq!(create.result["error"], "noEvents");
 
         let close = dispatch(
             req(
@@ -13541,8 +17369,30 @@ mod tests {
             ),
             &mut c,
         );
-        assert_eq!(close.result["status"], "success");
-        assert_eq!(close.result["closed"], true);
+        assert_eq!(close.result["status"], "error");
+        assert_eq!(close.result["error"], "noPathRequest");
+    }
+
+    #[test]
+    fn test_ripple_path_find_keeps_http_request_shape() {
+        let mut c = ctx();
+        let resp = dispatch(
+            req(
+                "ripple_path_find",
+                json!({
+                    "source_account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                    "destination_account": "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh",
+                    "destination_amount": "1"
+                }),
+            ),
+            &mut c,
+        );
+        assert_eq!(resp.result["status"], "success");
+        assert!(resp.result["alternatives"].is_array());
+        assert_eq!(
+            resp.result["destination_account"],
+            "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+        );
     }
 
     #[test]
@@ -13559,7 +17409,183 @@ mod tests {
             &mut c,
         );
         assert_eq!(status.result["status"], "error");
-        assert_eq!(status.result["error"], "invalidParams");
+        assert_eq!(status.result["error"], "noEvents");
+    }
+
+    #[test]
+    fn test_ripple_path_find_ranks_with_ripplecalc_liquidity() {
+        use crate::ledger::{offer::Offer, trustline::RippleState, AccountRoot};
+        use crate::transaction::amount::{Amount, Currency, IouValue};
+
+        fn account(account_id: [u8; 20], balance: u64) -> AccountRoot {
+            AccountRoot {
+                account_id,
+                balance,
+                sequence: 1,
+                owner_count: 0,
+                flags: 0,
+                regular_key: None,
+                minted_nftokens: 0,
+                first_nftoken_sequence: 0,
+                burned_nftokens: 0,
+                transfer_rate: 0,
+                domain: Vec::new(),
+                tick_size: 0,
+                ticket_count: 0,
+                previous_txn_id: [0u8; 32],
+                previous_txn_lgr_seq: 0,
+                raw_sle: None,
+            }
+        }
+
+        fn iou(currency: &Currency, issuer: [u8; 20], value: f64) -> Amount {
+            Amount::Iou {
+                value: IouValue::from_f64(value),
+                currency: currency.clone(),
+                issuer,
+            }
+        }
+
+        fn allow(
+            ls: &mut crate::ledger::LedgerState,
+            holder: [u8; 20],
+            issuer: [u8; 20],
+            currency: Currency,
+            limit: f64,
+        ) {
+            let mut line = RippleState::new(&holder, &issuer, currency);
+            line.set_limit_for(&holder, IouValue::from_f64(limit));
+            ls.insert_trustline(line);
+        }
+
+        fn fund(
+            ls: &mut crate::ledger::LedgerState,
+            holder: [u8; 20],
+            issuer: [u8; 20],
+            currency: Currency,
+            value: f64,
+        ) {
+            let mut line = RippleState::new(&holder, &issuer, currency);
+            line.set_limit_for(&holder, IouValue::from_f64(value * 2.0));
+            line.transfer(&issuer, &IouValue::from_f64(value));
+            ls.insert_trustline(line);
+        }
+
+        let source = [0x10; 20];
+        let destination = [0x11; 20];
+        let usd_issuer = [0x12; 20];
+        let eur_issuer = [0x13; 20];
+        let direct_maker = [0x14; 20];
+        let eur_maker = [0x15; 20];
+        let usd_maker = [0x16; 20];
+        let usd = Currency::from_code("USD").unwrap();
+        let eur = Currency::from_code("EUR").unwrap();
+        let mut c = ctx();
+
+        {
+            let ls = &mut *c.ledger_state.lock().unwrap_or_else(|e| e.into_inner());
+            for account_id in [
+                source,
+                destination,
+                usd_issuer,
+                eur_issuer,
+                direct_maker,
+                eur_maker,
+                usd_maker,
+            ] {
+                ls.insert_account(account(account_id, 1_000_000_000));
+            }
+            allow(ls, destination, usd_issuer, usd.clone(), 100.0);
+            fund(ls, direct_maker, usd_issuer, usd.clone(), 10.0);
+            fund(ls, eur_maker, eur_issuer, eur.clone(), 10.0);
+            fund(ls, usd_maker, usd_issuer, usd.clone(), 10.0);
+            allow(ls, usd_maker, eur_issuer, eur.clone(), 100.0);
+
+            ls.insert_offer(Offer {
+                account: direct_maker,
+                sequence: 1,
+                taker_pays: Amount::Xrp(20_000_000),
+                taker_gets: iou(&usd, usd_issuer, 10.0),
+                flags: 0,
+                book_directory: [0u8; 32],
+                book_node: 0,
+                owner_node: 0,
+                expiration: None,
+                domain_id: None,
+                additional_books: Vec::new(),
+                previous_txn_id: [0u8; 32],
+                previous_txn_lgr_seq: 0,
+                raw_sle: None,
+            });
+            ls.insert_offer(Offer {
+                account: eur_maker,
+                sequence: 1,
+                taker_pays: Amount::Xrp(10_000_000),
+                taker_gets: iou(&eur, eur_issuer, 10.0),
+                flags: 0,
+                book_directory: [0u8; 32],
+                book_node: 0,
+                owner_node: 0,
+                expiration: None,
+                domain_id: None,
+                additional_books: Vec::new(),
+                previous_txn_id: [0u8; 32],
+                previous_txn_lgr_seq: 0,
+                raw_sle: None,
+            });
+            ls.insert_offer(Offer {
+                account: usd_maker,
+                sequence: 1,
+                taker_pays: iou(&eur, eur_issuer, 10.0),
+                taker_gets: iou(&usd, usd_issuer, 10.0),
+                flags: 0,
+                book_directory: [0u8; 32],
+                book_node: 0,
+                owner_node: 0,
+                expiration: None,
+                domain_id: None,
+                additional_books: Vec::new(),
+                previous_txn_id: [0u8; 32],
+                previous_txn_lgr_seq: 0,
+                raw_sle: None,
+            });
+        }
+
+        let response = dispatch(
+            req(
+                "ripple_path_find",
+                json!({
+                    "source_account": crate::crypto::base58::encode_account(&source),
+                    "destination_account": crate::crypto::base58::encode_account(&destination),
+                    "destination_amount": {
+                        "value": "10",
+                        "currency": "USD",
+                        "issuer": crate::crypto::base58::encode_account(&usd_issuer)
+                    },
+                    "source_currencies": [{"currency": "XRP"}]
+                }),
+            ),
+            &mut c,
+        );
+
+        assert_eq!(response.result["status"], "success");
+        let alternatives = response.result["alternatives"].as_array().unwrap();
+        assert!(alternatives.len() >= 2, "{alternatives:?}");
+        assert_eq!(alternatives[0]["source_amount"], json!("10000000"));
+        assert_eq!(
+            alternatives[0]["paths_computed"][0][0]["currency"],
+            json!("EUR")
+        );
+        assert_eq!(alternatives[1]["source_amount"], json!("20000000"));
+        assert_eq!(
+            c.ledger_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_account(&source)
+                .unwrap()
+                .balance,
+            1_000_000_000
+        );
     }
 
     #[test]
@@ -13762,6 +17788,294 @@ mod tests {
         assert!(resp.result["engine_result"].is_string());
         assert!(resp.result["tx_json"]["Fee"].is_string());
         assert!(resp.result["tx_json"]["Sequence"].is_number());
+    }
+
+    #[test]
+    fn test_simulate_preserves_unsigned_multisign_shape() {
+        let mut c = ctx_with_genesis();
+        let genesis = crate::crypto::base58::encode_account(
+            &crate::crypto::base58::decode_account("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap(),
+        );
+        let signer = crate::crypto::base58::encode_account(
+            &crate::crypto::base58::decode_account("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe").unwrap(),
+        );
+
+        let resp = dispatch(
+            req(
+                "simulate",
+                json!({
+                    "tx_json": {
+                        "TransactionType": "AccountSet",
+                        "Account": genesis,
+                        "SetFlag": 1,
+                        "SigningPubKey": "",
+                        "Signers": [{
+                            "Signer": {
+                                "Account": signer,
+                                "SigningPubKey": "",
+                                "TxnSignature": ""
+                            }
+                        }]
+                    }
+                }),
+            ),
+            &mut c,
+        );
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["tx_json"]["SigningPubKey"], "");
+        assert_eq!(
+            resp.result["tx_json"]["Signers"][0]["Signer"]["TxnSignature"],
+            ""
+        );
+    }
+
+    #[test]
+    fn test_sync_metrics_shape_includes_load_jobs_and_counters() {
+        let mut c = ctx();
+        c.load_snapshot.queue_depth = 17;
+        c.load_snapshot.queue_capacity = 64;
+        c.load_snapshot.queue_job_types = vec![crate::network::load::JobTypeSnapshot {
+            job_type: "ledger_data".to_string(),
+            waiting: 3,
+            in_progress: 1,
+            over_target: true,
+        }];
+        c.sync_metrics = Some(crate::sync_runtime::SyncMetricsSnapshot {
+            queued_responses_total: 5,
+            gate_invalid_total: 1,
+            gate_lock_busy_total: 2,
+            max_lock_wait_ms: 77,
+            completion_true_total: 3,
+            diff_sync_discarded_total: 4,
+            object_fallback_duplicate_total: 6,
+            worker_lanes: vec![crate::sync_runtime::SyncWorkerLaneMetricsSnapshot {
+                lane: "sync_data_apply".to_string(),
+                enqueued_total: 9,
+                started_total: 8,
+                completed_total: 7,
+                failed_total: 1,
+                in_flight: 1,
+                max_in_flight: 2,
+                queue_capacity: 1,
+                max_queue_depth: 3,
+                backpressure_total: 4,
+                max_backpressure_ms: 55,
+            }],
+            ..Default::default()
+        });
+        c.node_store_snapshot = Some(crate::ledger::node_store::NodeStoreSnapshot {
+            fetch_total_ms: 10,
+            flush_max_ms: 12,
+            ..Default::default()
+        });
+        c.sync_peer_usefulness = vec![crate::rpc::SyncPeerUsefulnessSnapshot {
+            peer_id: "7".to_string(),
+            address: "127.0.0.1:51235".to_string(),
+            useful_score: 99,
+            useful_nodes_total: 1234,
+            duplicate_score: 3,
+            duplicate_responses_total: 45,
+            last_useful_secs: Some(2),
+            latency: Some(11),
+            ledger_range: Some((10, 20)),
+        }];
+
+        let resp = dispatch(req("sync_metrics", json!({})), &mut c);
+        assert_eq!(resp.result["status"], "success");
+        assert_eq!(resp.result["load"]["queue_depth"], 17);
+        assert_eq!(
+            resp.result["job_queue"]["job_types"][0]["job_type"],
+            "ledger_data"
+        );
+        assert_eq!(
+            resp.result["job_queue"]["job_types"][0]["over_target"],
+            true
+        );
+        assert_eq!(resp.result["counters"]["queued_responses_total"], 5);
+        assert_eq!(resp.result["counters"]["gate_invalid_total"], 1);
+        assert_eq!(resp.result["counters"]["gate_lock_busy_total"], 2);
+        assert_eq!(resp.result["counters"]["max_lock_wait_ms"], 77);
+        assert_eq!(resp.result["counters"]["completion_true_total"], 3);
+        assert_eq!(resp.result["counters"]["diff_sync_discarded_total"], 4);
+        assert_eq!(
+            resp.result["counters"]["object_fallback_duplicate_total"],
+            6
+        );
+        assert_eq!(
+            resp.result["counters"]["worker_lanes"][0]["lane"],
+            "sync_data_apply"
+        );
+        assert_eq!(
+            resp.result["counters"]["worker_lanes"][0]["enqueued_total"],
+            9
+        );
+        assert_eq!(
+            resp.result["counters"]["worker_lanes"][0]["max_queue_depth"],
+            3
+        );
+        assert_eq!(
+            resp.result["counters"]["worker_lanes"][0]["queue_capacity"],
+            1
+        );
+        assert_eq!(
+            resp.result["counters"]["worker_lanes"][0]["backpressure_total"],
+            4
+        );
+        assert_eq!(
+            resp.result["counters"]["worker_lanes"][0]["max_backpressure_ms"],
+            55
+        );
+        assert_eq!(resp.result["sync_peers"][0]["useful_score"], 99);
+        assert_eq!(resp.result["sync_peers"][0]["useful_nodes_total"], 1234);
+        assert_eq!(resp.result["node_store"]["fetch_total_ms"], 10);
+        assert_eq!(resp.result["node_store"]["flush_max_ms"], 12);
+    }
+
+    #[test]
+    fn test_sync_metrics_requires_admin_rpc() {
+        let mut c = ctx();
+        c.admin_rpc_enabled = false;
+        let resp = dispatch(req("sync_metrics", json!({})), &mut c);
+        assert_eq!(resp.result["status"], "error");
+        assert_eq!(resp.result["error"], "forbidden");
+    }
+
+    #[test]
+    fn test_metrics_text_exposes_core_gauges_and_escapes_labels() {
+        let mut c = ctx();
+        c.peer_count = 4;
+        c.object_count = 9;
+        c.load_snapshot.queue_depth = 11;
+        c.load_snapshot.queue_job_types = vec![crate::network::load::JobTypeSnapshot {
+            job_type: "ledger\"data".to_string(),
+            waiting: 2,
+            in_progress: 1,
+            over_target: false,
+        }];
+        c.sync_metrics = Some(crate::sync_runtime::SyncMetricsSnapshot {
+            dropped_responses_total: 3,
+            slow_route_messages_total: 4,
+            completion_checks_total: 5,
+            diff_sync_queued_total: 6,
+            diff_sync_discarded_total: 7,
+            object_fallback_responses_total: 8,
+            worker_lanes: vec![crate::sync_runtime::SyncWorkerLaneMetricsSnapshot {
+                lane: "sync\"parse".to_string(),
+                enqueued_total: 11,
+                started_total: 10,
+                completed_total: 9,
+                failed_total: 1,
+                in_flight: 1,
+                max_in_flight: 4,
+                queue_capacity: 16,
+                max_queue_depth: 6,
+                backpressure_total: 2,
+                max_backpressure_ms: 33,
+            }],
+            ..Default::default()
+        });
+        c.node_store_snapshot = Some(crate::ledger::node_store::NodeStoreSnapshot {
+            fetch_total_ms: 13,
+            store_max_ms: 21,
+            flush_ops: 2,
+            flush_total_ms: 34,
+            ..Default::default()
+        });
+        c.sync_peer_usefulness = vec![crate::rpc::SyncPeerUsefulnessSnapshot {
+            peer_id: "7".to_string(),
+            address: "127.0.0.1:51235".to_string(),
+            useful_score: 99,
+            useful_nodes_total: 1234,
+            duplicate_score: 3,
+            duplicate_responses_total: 45,
+            last_useful_secs: Some(2),
+            latency: None,
+            ledger_range: None,
+        }];
+
+        let text = metrics_text(&c);
+        assert!(text.contains("xledgrs_ledger_seq 1000\n"));
+        assert!(text.contains("xledgrs_peer_count 4\n"));
+        assert!(text.contains("xledgrs_load_queue_depth 11\n"));
+        assert!(text.contains("xledgrs_job_waiting{job_type=\"ledger\\\"data\"} 2\n"));
+        assert!(text.contains("xledgrs_sync_dropped_responses_total 3\n"));
+        assert!(text.contains("xledgrs_sync_completion_checks_total 5\n"));
+        assert!(text.contains("xledgrs_diff_sync_queued_total 6\n"));
+        assert!(text.contains("xledgrs_diff_sync_discarded_total 7\n"));
+        assert!(text.contains("xledgrs_object_fallback_responses_total 8\n"));
+        assert!(
+            text.contains("xledgrs_sync_worker_lane_enqueued_total{lane=\"sync\\\"parse\"} 11\n")
+        );
+        assert!(
+            text.contains("xledgrs_sync_worker_lane_completed_total{lane=\"sync\\\"parse\"} 9\n")
+        );
+        assert!(
+            text.contains("xledgrs_sync_worker_lane_max_queue_depth{lane=\"sync\\\"parse\"} 6\n")
+        );
+        assert!(
+            text.contains("xledgrs_sync_worker_lane_queue_capacity{lane=\"sync\\\"parse\"} 16\n")
+        );
+        assert!(text
+            .contains("xledgrs_sync_worker_lane_backpressure_total{lane=\"sync\\\"parse\"} 2\n"));
+        assert!(text
+            .contains("xledgrs_sync_worker_lane_max_backpressure_ms{lane=\"sync\\\"parse\"} 33\n"));
+        assert!(text.contains("xledgrs_route_slow_messages_total 4\n"));
+        assert!(text.contains("xledgrs_node_store_fetch_total_ms 13\n"));
+        assert!(text.contains("xledgrs_node_store_store_max_ms 21\n"));
+        assert!(text.contains("xledgrs_node_store_flush_ops_total 2\n"));
+        assert!(text.contains("xledgrs_node_store_flush_total_ms 34\n"));
+        assert!(text.contains(
+            "xledgrs_sync_peer_useful_score{peer_id=\"7\",address=\"127.0.0.1:51235\"} 99\n"
+        ));
+        assert!(text.contains(
+            "xledgrs_sync_peer_useful_nodes_total{peer_id=\"7\",address=\"127.0.0.1:51235\"} 1234\n"
+        ));
+    }
+
+    #[test]
+    fn test_metrics_outputs_remain_available_during_active_sync() {
+        let mut c = ctx();
+        c.fetch_info = Some(active_fetch_snapshot());
+        c.sync_metrics = Some(crate::sync_runtime::SyncMetricsSnapshot {
+            queued_responses_total: 5,
+            max_queue_len: 2,
+            completion_checks_total: 1,
+            object_fallback_requests_total: 3,
+            ..Default::default()
+        });
+
+        let json_resp = dispatch(req("sync_metrics", json!({})), &mut c);
+        assert_eq!(json_resp.result["status"], "success");
+        assert_eq!(json_resp.result["sync"]["active"], true);
+        assert_eq!(json_resp.result["sync"]["in_progress"], true);
+        assert_eq!(json_resp.result["sync"]["target_seq"], 348928);
+        assert_eq!(json_resp.result["sync"]["queue_len"], 2);
+        assert_eq!(json_resp.result["counters"]["queued_responses_total"], 5);
+        assert_eq!(json_resp.result["counters"]["max_queue_len"], 2);
+        assert_eq!(json_resp.result["counters"]["completion_checks_total"], 1);
+        assert_eq!(
+            json_resp.result["counters"]["object_fallback_requests_total"],
+            3
+        );
+
+        let text = metrics_text(&c);
+        assert!(text.contains("xledgrs_sync_active 1\n"));
+        assert!(text.contains("xledgrs_sync_queue_len 2\n"));
+        assert!(text.contains("xledgrs_sync_max_queue_len 2\n"));
+        assert!(text.contains("xledgrs_sync_completion_checks_total 1\n"));
+        assert!(text.contains("xledgrs_object_fallback_requests_total 3\n"));
+    }
+
+    #[test]
+    fn test_metadata_json_names_previous_txn_ledger_sequence() {
+        let fields = metadata_fields_json(&[crate::ledger::meta::ParsedField {
+            type_code: 2,
+            field_code: 5,
+            data: 1234u32.to_be_bytes().to_vec(),
+        }]);
+
+        assert_eq!(fields["PreviousTxnLgrSeq"], json!(1234));
+        assert!(fields.get("field_2_5").is_none());
     }
 
     // ── unknown method ────────────────────────────────────────────────────────

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Persist node metadata and connect NuDB-backed objects.
 //! Persistent storage for relational node data.
 //!
 //! rippled uses NuDB for content-addressed SHAMap nodes and SQLite for ledger
@@ -186,10 +185,14 @@ impl Storage {
         }
     }
 
-    /// Clear all sync-handoff metadata before starting a fresh sync.
+    /// Clear completed-sync handoff metadata before starting a fresh sync.
+    /// Partial progress counters are retained so a restarted acquisition can
+    /// resume against already persisted NuDB nodes.
     pub fn clear_sync_handoff(&self) -> Result<()> {
-        let conn = self.write_conn();
-        conn.execute("DELETE FROM meta WHERE key IN ('sync_complete', 'sync_ledger', 'sync_ledger_hash', 'sync_account_hash', 'sync_ledger_header')", [])?;
+        let mut conn = self.write_conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM meta WHERE key IN ('sync_complete', 'sync_ledger', 'sync_ledger_hash', 'sync_account_hash', 'sync_ledger_header')", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -197,19 +200,20 @@ impl Storage {
     /// This advances after initial sync and after each durably persisted
     /// followed ledger so restart anchors from the latest on-disk state.
     pub fn persist_sync_anchor(&self, header: &LedgerHeader) -> Result<()> {
-        self.set_sync_ledger(header.sequence as u64)?;
-        self.set_sync_ledger_hash(&header.hash)?;
-        self.set_sync_account_hash(&header.account_hash)?;
-        self.set_sync_ledger_header(header)?;
-        self.set_sync_complete()?;
+        let mut conn = self.write_conn();
+        let tx = conn.transaction()?;
+        Self::save_ledger_stub_on_conn(&tx, header)?;
+        Self::persist_sync_anchor_on_conn(&tx, header)?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Save metadata (ledger_seq, header, etc.)
     pub fn save_meta(&self, seq: u32, hash: &str, header: &LedgerHeader) -> Result<()> {
-        self.save_meta_kv("ledger_seq", &seq.to_be_bytes())?;
-        self.save_meta_kv("ledger_hash", hash.as_bytes())?;
-        self.save_meta_kv("ledger_header", &bincode::serialize(header)?)?;
+        let mut conn = self.write_conn();
+        let tx = conn.transaction()?;
+        Self::save_meta_on_conn(&tx, seq, hash, header)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -227,10 +231,36 @@ impl Storage {
     /// Save a metadata value by key.
     pub fn save_meta_kv(&self, key: &str, value: &[u8]) -> Result<()> {
         let conn = self.write_conn();
+        Self::save_meta_kv_on_conn(&conn, key, value)?;
+        Ok(())
+    }
+
+    fn save_meta_kv_on_conn(conn: &Connection, key: &str, value: &[u8]) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
             rusqlite::params![key, value],
         )?;
+        Ok(())
+    }
+
+    fn save_meta_on_conn(
+        conn: &Connection,
+        seq: u32,
+        hash: &str,
+        header: &LedgerHeader,
+    ) -> Result<()> {
+        Self::save_meta_kv_on_conn(conn, "ledger_seq", &seq.to_be_bytes())?;
+        Self::save_meta_kv_on_conn(conn, "ledger_hash", hash.as_bytes())?;
+        Self::save_meta_kv_on_conn(conn, "ledger_header", &bincode::serialize(header)?)?;
+        Ok(())
+    }
+
+    fn persist_sync_anchor_on_conn(conn: &Connection, header: &LedgerHeader) -> Result<()> {
+        Self::save_meta_kv_on_conn(conn, "sync_ledger", &(header.sequence as u64).to_le_bytes())?;
+        Self::save_meta_kv_on_conn(conn, "sync_ledger_hash", &header.hash)?;
+        Self::save_meta_kv_on_conn(conn, "sync_account_hash", &header.account_hash)?;
+        Self::save_meta_kv_on_conn(conn, "sync_ledger_header", &bincode::serialize(header)?)?;
+        Self::save_meta_kv_on_conn(conn, "sync_complete", b"1")?;
         Ok(())
     }
 
@@ -328,8 +358,18 @@ impl Storage {
 
     /// Save a closed ledger and its transactions.
     pub fn save_ledger(&self, header: &LedgerHeader, tx_records: &[TxRecord]) -> Result<()> {
-        let conn = self.write_conn();
+        let mut conn = self.write_conn();
+        let tx = conn.transaction()?;
+        Self::save_ledger_on_conn(&tx, header, tx_records)?;
+        tx.commit()?;
+        Ok(())
+    }
 
+    fn save_ledger_on_conn(
+        conn: &Connection,
+        header: &LedgerHeader,
+        tx_records: &[TxRecord],
+    ) -> Result<()> {
         let tx_hashes: Vec<[u8; 32]> = tx_records.iter().map(|r| r.hash).collect();
         let tx_hashes_blob = bincode::serialize(&tx_hashes)?;
         let header_blob = bincode::serialize(header)?;
@@ -367,6 +407,45 @@ impl Storage {
             )?;
         }
 
+        Ok(())
+    }
+
+    fn save_ledger_stub_on_conn(conn: &Connection, header: &LedgerHeader) -> Result<()> {
+        let tx_hashes_blob = bincode::serialize(&Vec::<[u8; 32]>::new())?;
+        let header_blob = bincode::serialize(header)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO ledgers (seq, hash, header, tx_hashes) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                header.sequence as i64,
+                hex::encode(header.hash),
+                header_blob,
+                tx_hashes_blob,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically persist a validated ledger's history row, durable resume
+    /// metadata, and optionally the follower sync anchor.
+    pub fn save_validated_checkpoint(
+        &self,
+        header: &LedgerHeader,
+        tx_records: &[TxRecord],
+        persist_sync_anchor: bool,
+    ) -> Result<()> {
+        let mut conn = self.write_conn();
+        let tx = conn.transaction()?;
+        Self::save_ledger_on_conn(&tx, header, tx_records)?;
+        Self::save_meta_on_conn(
+            &tx,
+            header.sequence,
+            &hex::encode_upper(header.hash),
+            header,
+        )?;
+        if persist_sync_anchor {
+            Self::persist_sync_anchor_on_conn(&tx, header)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -460,10 +539,13 @@ impl Storage {
         let cutoff = cutoff as i64;
 
         // Collect tx hashes to delete
+        let protected_seq = self.get_sync_ledger().map(|seq| seq as i64);
         let pruned_hashes: Vec<[u8; 32]> = {
             let conn = self.read_conn();
-            let mut stmt = conn.prepare("SELECT tx_hashes FROM ledgers WHERE seq < ?1")?;
-            let rows = stmt.query_map(rusqlite::params![cutoff], |row| {
+            let mut stmt = conn.prepare(
+                "SELECT tx_hashes FROM ledgers WHERE seq < ?1 AND (?2 IS NULL OR seq != ?2)",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![cutoff, protected_seq], |row| {
                 let tx_hashes_blob: Option<Vec<u8>> = row.get(0)?;
                 Ok(tx_hashes_blob)
             })?;
@@ -473,26 +555,28 @@ impl Storage {
                 .collect()
         };
 
-        let conn = self.write_conn();
-        let deleted = conn.execute(
-            "DELETE FROM ledgers WHERE seq < ?1",
-            rusqlite::params![cutoff],
+        let mut conn = self.write_conn();
+        let tx = conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM ledgers WHERE seq < ?1 AND (?2 IS NULL OR seq != ?2)",
+            rusqlite::params![cutoff, protected_seq],
         )?;
 
         // Delete pruned transactions
         for hash in &pruned_hashes {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM txs WHERE hash = ?1",
                 rusqlite::params![hash.as_slice()],
             )?;
         }
 
         // Delete pruned account_tx entries
-        conn.execute(
-            "DELETE FROM account_tx WHERE ledger_seq < ?1",
-            rusqlite::params![cutoff],
+        tx.execute(
+            "DELETE FROM account_tx WHERE ledger_seq < ?1 AND (?2 IS NULL OR ledger_seq != ?2)",
+            rusqlite::params![cutoff, protected_seq],
         )?;
 
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -501,23 +585,28 @@ impl Storage {
             return Ok(0);
         }
 
+        let protected_seq = self.get_sync_ledger().map(|seq| seq as i64);
         let pruned_hashes: Vec<[u8; 32]> = if let Some(min_seq) = min_seq {
             let conn = self.read_conn();
             let mut stmt =
-                conn.prepare("SELECT tx_hashes FROM ledgers WHERE seq >= ?1 AND seq <= ?2")?;
-            let rows =
-                stmt.query_map(rusqlite::params![min_seq as i64, max_seq as i64], |row| {
+                conn.prepare("SELECT tx_hashes FROM ledgers WHERE seq >= ?1 AND seq <= ?2 AND (?3 IS NULL OR seq != ?3)")?;
+            let rows = stmt.query_map(
+                rusqlite::params![min_seq as i64, max_seq as i64, protected_seq],
+                |row| {
                     let tx_hashes_blob: Option<Vec<u8>> = row.get(0)?;
                     Ok(tx_hashes_blob)
-                })?;
+                },
+            )?;
             rows.filter_map(|r| r.ok())
                 .flatten()
                 .flat_map(|blob| bincode::deserialize::<Vec<[u8; 32]>>(&blob).unwrap_or_default())
                 .collect()
         } else {
             let conn = self.read_conn();
-            let mut stmt = conn.prepare("SELECT tx_hashes FROM ledgers WHERE seq <= ?1")?;
-            let rows = stmt.query_map(rusqlite::params![max_seq as i64], |row| {
+            let mut stmt = conn.prepare(
+                "SELECT tx_hashes FROM ledgers WHERE seq <= ?1 AND (?2 IS NULL OR seq != ?2)",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![max_seq as i64, protected_seq], |row| {
                 let tx_hashes_blob: Option<Vec<u8>> = row.get(0)?;
                 Ok(tx_hashes_blob)
             })?;
@@ -527,38 +616,40 @@ impl Storage {
                 .collect()
         };
 
-        let conn = self.write_conn();
+        let mut conn = self.write_conn();
+        let tx = conn.transaction()?;
         let deleted = if let Some(min_seq) = min_seq {
-            conn.execute(
-                "DELETE FROM ledgers WHERE seq >= ?1 AND seq <= ?2",
-                rusqlite::params![min_seq as i64, max_seq as i64],
+            tx.execute(
+                "DELETE FROM ledgers WHERE seq >= ?1 AND seq <= ?2 AND (?3 IS NULL OR seq != ?3)",
+                rusqlite::params![min_seq as i64, max_seq as i64, protected_seq],
             )?
         } else {
-            conn.execute(
-                "DELETE FROM ledgers WHERE seq <= ?1",
-                rusqlite::params![max_seq as i64],
+            tx.execute(
+                "DELETE FROM ledgers WHERE seq <= ?1 AND (?2 IS NULL OR seq != ?2)",
+                rusqlite::params![max_seq as i64, protected_seq],
             )?
         };
 
         for hash in &pruned_hashes {
-            conn.execute(
+            tx.execute(
                 "DELETE FROM txs WHERE hash = ?1",
                 rusqlite::params![hash.as_slice()],
             )?;
         }
 
         if let Some(min_seq) = min_seq {
-            conn.execute(
-                "DELETE FROM account_tx WHERE ledger_seq >= ?1 AND ledger_seq <= ?2",
-                rusqlite::params![min_seq as i64, max_seq as i64],
+            tx.execute(
+                "DELETE FROM account_tx WHERE ledger_seq >= ?1 AND ledger_seq <= ?2 AND (?3 IS NULL OR ledger_seq != ?3)",
+                rusqlite::params![min_seq as i64, max_seq as i64, protected_seq],
             )?;
         } else {
-            conn.execute(
-                "DELETE FROM account_tx WHERE ledger_seq <= ?1",
-                rusqlite::params![max_seq as i64],
+            tx.execute(
+                "DELETE FROM account_tx WHERE ledger_seq <= ?1 AND (?2 IS NULL OR ledger_seq != ?2)",
+                rusqlite::params![max_seq as i64, protected_seq],
             )?;
         }
 
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -705,6 +796,75 @@ mod tests {
         assert!(storage.is_sync_complete());
         storage.clear_sync_complete().unwrap();
         assert!(!storage.is_sync_complete());
+    }
+
+    #[test]
+    fn clear_sync_handoff_removes_completed_anchor_but_keeps_partial_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let header = header(123);
+
+        storage.persist_sync_anchor(&header).unwrap();
+        storage.save_leaf_count(42).unwrap();
+        assert!(storage.is_sync_complete());
+        assert_eq!(storage.get_sync_ledger(), Some(123));
+        assert!(storage.get_sync_ledger_hash().is_some());
+        assert!(storage.get_sync_account_hash().is_some());
+        assert!(storage.get_sync_ledger_header().is_some());
+        assert_eq!(storage.get_leaf_count(), Some(42));
+
+        storage.clear_sync_handoff().unwrap();
+
+        assert!(!storage.is_sync_complete());
+        assert_eq!(storage.get_sync_ledger(), None);
+        assert_eq!(storage.get_sync_ledger_hash(), None);
+        assert_eq!(storage.get_sync_account_hash(), None);
+        assert!(storage.get_sync_ledger_header().is_none());
+        assert_eq!(storage.get_leaf_count(), Some(42));
+    }
+
+    #[test]
+    fn validated_checkpoint_persists_history_meta_and_anchor_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let h = header(88);
+        let tx = tx_rec(0x88, 88);
+
+        storage
+            .save_validated_checkpoint(&h, std::slice::from_ref(&tx), true)
+            .unwrap();
+
+        let (seq, hash, loaded) = storage.load_meta().unwrap();
+        assert_eq!(seq, 88);
+        assert_eq!(hash, hex::encode_upper(h.hash));
+        assert_eq!(loaded.sequence, 88);
+        assert!(storage.is_sync_complete());
+        assert_eq!(storage.get_sync_ledger(), Some(88));
+        assert_eq!(storage.get_sync_ledger_hash(), Some(h.hash));
+        assert_eq!(storage.get_sync_account_hash(), Some(h.account_hash));
+        assert_eq!(storage.get_sync_ledger_header().unwrap().sequence, 88);
+        assert!(storage.has_full_ledger_range(88, 88));
+        assert!(storage.lookup_tx(&tx.hash).is_some());
+    }
+
+    #[test]
+    fn history_prune_preserves_durable_sync_anchor_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        for seq in 10..=12 {
+            storage
+                .save_ledger(&header(seq), std::slice::from_ref(&tx_rec(seq as u8, seq)))
+                .unwrap();
+        }
+        storage.persist_sync_anchor(&header(11)).unwrap();
+
+        let deleted = storage.prune_history_window(Some(10), 12).unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(!storage.has_full_ledger_range(10, 10));
+        assert!(storage.has_full_ledger_range(11, 11));
+        assert!(!storage.has_full_ledger_range(12, 12));
     }
 
     #[test]

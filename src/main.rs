@@ -1,8 +1,3 @@
-//! Command-line entrypoint for the `xledgrs` daemon.
-//!
-//! This parses CLI/config input, handles daemon process-control flags, wires
-//! optional gRPC, and starts the live XRPL node runtime.
-
 use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
@@ -11,7 +6,7 @@ mod grpc;
 mod process_control;
 
 use xrpl::config::{ConfigFile, HistoryRetention};
-use xrpl::node::{Node, NodeConfig};
+use xrpl::node::{Node, NodeConfig, SyncTuningConfig};
 
 fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -45,6 +40,10 @@ struct Args {
     /// Maximum number of peer connections
     #[arg(long, default_value_t = 21)]
     max_peers: usize,
+
+    /// Maximum expensive peer-route work items processed concurrently
+    #[arg(long)]
+    route_worker_count: Option<usize>,
 
     /// Bootstrap peer addresses (comma-separated)
     #[arg(long, default_value = "")]
@@ -508,6 +507,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         args.max_peers
     };
+    let route_worker_count = args
+        .route_worker_count
+        .or_else(|| {
+            file_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.runtime.route_worker_count)
+        })
+        .unwrap_or(1)
+        .clamp(1, 16);
     let data_dir = configured_data_dir.clone();
     let network_id = if args.network_id == 0 {
         file_cfg
@@ -542,12 +550,17 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|cfg| cfg.runtime.enable_consensus_close_loop)
             .unwrap_or(false)
     };
+    let sync_tuning = file_cfg
+        .as_ref()
+        .map(|cfg| SyncTuningConfig::from_runtime(&cfg.runtime.sync))
+        .unwrap_or_default();
 
     let config = NodeConfig {
         peer_addr,
         rpc_addr,
         ws_addr,
         max_peers,
+        route_worker_count,
         bootstrap,
         use_tls: true,
         data_dir,
@@ -571,12 +584,20 @@ async fn main() -> anyhow::Result<()> {
         online_delete,
         standalone,
         enable_consensus_close_loop,
+        allow_node_key_consensus: file_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.runtime.allow_node_key_consensus)
+            .unwrap_or(false),
         post_sync_checkpoint_script: file_cfg
             .as_ref()
             .and_then(|cfg| cfg.runtime.post_sync_checkpoint_script.clone()),
+        sync_tuning,
         validation_seed: file_cfg
             .as_ref()
             .and_then(|cfg| cfg.validation_seed.clone()),
+        validation_secret_key: file_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.validation_secret_key.clone()),
         validator_token: file_cfg
             .as_ref()
             .and_then(|cfg| cfg.validator_token.clone()),
@@ -597,6 +618,7 @@ async fn main() -> anyhow::Result<()> {
         rpc_addr  = %config.rpc_addr,
         grpc_addr = ?grpc_addr,
         max_peers = config.max_peers,
+        route_worker_count = config.route_worker_count(),
         "xLedgRSv2Beta starting"
     );
 
@@ -756,6 +778,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let _pid_guard = process_control::install_pid_guard_if_needed(control_request, &control_files)?;
+    let shutdown_grace_ms = config.sync_tuning.shutdown_grace_ms;
     let node = Arc::new(Node::new(config));
     let storage = node.storage().cloned();
     node.clone().start().await?;
@@ -767,9 +790,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for SIGINT (ctrl-c) or SIGTERM (kill)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let rpc_shutdown = node.shutdown_flag();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
+        _ = async {
+            while !rpc_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        } => {}
     }
 
     // Graceful shutdown — signal all background tasks to exit
@@ -778,8 +807,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(grpc_runtime) = grpc_runtime {
         grpc_runtime.shutdown().await;
     }
-    // Brief wait for background tasks to notice the flag and exit
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let joined = node
+        .join_background_tasks(std::time::Duration::from_millis(shutdown_grace_ms))
+        .await;
+    info!(
+        completed = joined.completed,
+        aborted = joined.aborted,
+        failed = joined.failed,
+        "background task shutdown joined"
+    );
 
     // Save sync inner nodes so tree walk can resume on restart
     {
@@ -799,12 +835,22 @@ async fn main() -> anyhow::Result<()> {
     {
         let state = node.state_ref().read().await;
         if let Some(ref store) = storage {
-            let _ = store.save_meta(
-                state.ctx.ledger_seq,
-                &state.ctx.ledger_hash,
-                &state.ctx.ledger_header,
-            );
-            info!("shutdown: saved ledger {} header", state.ctx.ledger_seq);
+            let flush_result = state
+                .ctx
+                .ledger_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .flush_nudb();
+            if let Err(e) = flush_result {
+                tracing::error!("shutdown: failed to flush NuDB before metadata checkpoint: {e}");
+            } else {
+                let _ = store.save_meta(
+                    state.ctx.ledger_seq,
+                    &state.ctx.ledger_hash,
+                    &state.ctx.ledger_header,
+                );
+                info!("shutdown: saved ledger {} header", state.ctx.ledger_seq);
+            }
         }
     }
 

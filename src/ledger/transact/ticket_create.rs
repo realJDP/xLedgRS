@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Ticket Create legacy transactor for XRPL transaction apply.
 use super::{check_reserve, owner_dir, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::SLE;
@@ -35,7 +34,7 @@ impl TxHandler for TicketCreateHandler {
 
         // Create ticket SLEs
         for i in 0..count {
-            let ticket_seq = sequence + 1 + i;
+            let ticket_seq = sequence + i;
             let ticket_keylet = keylet::ticket(&tx.account, ticket_seq);
             let owner_node = owner_dir::dir_add(view, &tx.account, ticket_keylet.key.0);
 
@@ -72,6 +71,7 @@ impl TxHandler for TicketCreateHandler {
         // Update TicketCount on account
         let tc = sender.get_field_u32(2, 40).unwrap_or(0);
         sender.set_field_u32(2, 40, tc + count);
+        sender.set_sequence(sequence + count);
 
         view.update(Arc::new(sender));
         TER::Success

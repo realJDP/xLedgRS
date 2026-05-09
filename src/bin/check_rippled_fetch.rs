@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Check Rippled Fetch diagnostic utility for parity investigation.
 use clap::Parser;
 
 #[derive(Parser, Debug)]

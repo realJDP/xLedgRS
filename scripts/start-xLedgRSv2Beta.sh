@@ -1,5 +1,4 @@
 #!/bin/bash
-# xLedgRS purpose: Start a follower node with release defaults.
 set -euo pipefail
 
 CONFIG_FILE="${XLEDGRSV2BETA_CONFIG:-$HOME/xLedgRSv2Beta.cfg}"
@@ -60,6 +59,9 @@ if [ -n "${XLEDGRSV2BETA_RPC_SYNC:-}" ]; then
     fi
 fi
 
+MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}" \
+MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}" \
+XLEDGRSV2BETA_MALLOC_TRIM="${XLEDGRSV2BETA_MALLOC_TRIM:-1}" \
 RUST_LOG="${RUST_LOG:-info}" nohup "$HOME/xledgrs" \
     --config "$CONFIG_FILE" \
     $RPC_SYNC_ARGS \

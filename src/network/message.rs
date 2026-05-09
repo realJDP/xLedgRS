@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Message support for XRPL peer networking.
 //! RTXP message framing.
 //!
 //! Every message on the XRPL peer-to-peer wire is prefixed with a 6-byte header:

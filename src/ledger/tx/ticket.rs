@@ -1,7 +1,6 @@
-//! xLedgRS purpose: Ticket transaction engine logic for ledger replay.
 //! Ticket — IMPLEMENTED
 
-use super::ApplyResult;
+use super::{balance_before_fee, owner_reserve_requirement, ApplyResult};
 use crate::ledger::directory;
 use crate::ledger::LedgerState;
 use crate::transaction::ParsedTx;
@@ -12,17 +11,22 @@ pub(crate) fn apply_ticket_create(
     tx: &ParsedTx,
     new_sender: &mut crate::ledger::AccountRoot,
 ) -> ApplyResult {
-    // TicketCount validation (rippled: TicketCreate.cpp preflight, temINVALID_COUNT)
+    // Defensive duplicate of rippled TicketCreate::preflight. Live paths run
+    // this before fee/sequence/auth, but apply_tx can be used directly in tests.
     let count = match tx.ticket_count {
         Some(c) if c > 0 && c <= 250 => c,
-        Some(_) => return ApplyResult::ClaimedCost("temINVALID_COUNT"),
-        None => match tx.amount_drops {
-            // Fallback to amount_drops for backward compatibility
-            Some(d) if d > 0 && d <= 250 => d as u32,
-            Some(_) => return ApplyResult::ClaimedCost("temINVALID_COUNT"),
-            None => return ApplyResult::ClaimedCost("temINVALID_COUNT"),
-        },
+        _ => return ApplyResult::ClaimedCost("temINVALID_COUNT"),
     };
+
+    if new_sender.ticket_count.saturating_add(count) > 250 {
+        return ApplyResult::ClaimedCost("tecDIR_FULL");
+    }
+
+    let pre_fee_balance = balance_before_fee(new_sender.balance, tx.fee);
+    let required = owner_reserve_requirement(state, new_sender.owner_count, count);
+    if pre_fee_balance < required {
+        return ApplyResult::ClaimedCost("tecINSUFFICIENT_RESERVE");
+    }
 
     // TicketCreate reserves from the current account Sequence after the
     // transaction machinery has consumed either the Sequence or Ticket.

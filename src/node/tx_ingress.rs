@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Tx Ingress piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -7,13 +6,27 @@ impl Node {
         peer: &Peer,
         msg: &RtxpMessage,
     ) -> PeerEvent {
+        if self.bootstrap_syncing_fast() {
+            return PeerEvent::MessageReceived(MessageType::Transaction, Vec::new());
+        }
+
         let decoded_tx =
             <crate::proto::TmTransaction as ProstMessage>::decode(msg.payload.as_slice()).ok();
-        let tx_info = decoded_tx.as_ref().map(|pb| {
+        let tx_info = decoded_tx.as_ref().and_then(|pb| {
             let blob = pb.raw_transaction.clone();
+            let parsed = crate::transaction::parse_blob(&blob).ok()?;
+            if parsed.signers.is_empty() {
+                crate::transaction::auth::verify_single_signature(&parsed).ok()?;
+            } else {
+                crate::transaction::auth::verify_multisign_signatures(&parsed).ok()?;
+            }
             let hash = crate::transaction::serialize::tx_blob_hash(&blob);
-            (blob, hash)
+            Some((blob, hash))
         });
+
+        if decoded_tx.is_some() && tx_info.is_none() {
+            return PeerEvent::MessageReceived(MessageType::Transaction, msg.payload.clone());
+        }
 
         if let Some((blob, hash)) = tx_info.as_ref() {
             let ledger_seq = { self.state.read().await.ctx.ledger_seq };

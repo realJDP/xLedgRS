@@ -1,7 +1,8 @@
-//! Bootstrap target selection for state-tree sync.
-//!
-//! Chooses the ledger/hash pair used to kick off acquisition from peers while
-//! avoiding stale or unsupported ranges.
+/// If a fixed-target acquisition is this far behind the newest trusted ledger,
+/// stop hammering the stale target and acquire the current validated ledger
+/// instead. This mirrors validator-style operation: get one recent validated
+/// state, verify it, then follow forward.
+pub const STALE_FIXED_TARGET_LEDGER_GAP: u32 = 256;
 
 pub fn choose_sync_kickstart_target(
     inactive_target: Option<(u32, [u8; 32])>,
@@ -10,7 +11,21 @@ pub fn choose_sync_kickstart_target(
     reachable_seq_only_target: Option<u32>,
 ) -> (u32, Option<[u8; 32]>, &'static str) {
     if let Some((seq, hash)) = inactive_target {
-        (seq, Some(hash), "fixed-target reacquire")
+        if latest_seq.saturating_sub(seq) > STALE_FIXED_TARGET_LEDGER_GAP {
+            if let Some(hash) = latest_trusted_hash {
+                (latest_seq, Some(hash), "stale fixed-target retarget")
+            } else if let Some(seq) = reachable_seq_only_target {
+                (
+                    seq,
+                    None,
+                    "stale fixed-target retarget (seq-only; using reachable peer latest)",
+                )
+            } else {
+                (seq, Some(hash), "fixed-target reacquire")
+            }
+        } else {
+            (seq, Some(hash), "fixed-target reacquire")
+        }
     } else if let Some(hash) = latest_trusted_hash {
         (latest_seq, Some(hash), "no syncer yet")
     } else if let Some(seq) = reachable_seq_only_target {
@@ -112,9 +127,21 @@ pub fn build_root_bootstrap_requests(
     root_wire: &[u8],
     max_requests: usize,
 ) -> Vec<crate::network::message::RtxpMessage> {
-    let missing = root_missing_from_wire(root_wire);
-    if missing.is_empty() {
+    if root_missing_from_wire(root_wire).is_empty() {
         return vec![];
+    }
+
+    let mut missing = syncer.get_missing(crate::ledger::inbound::MISSING_NODES_FIND);
+    if missing.is_empty() {
+        if matches!(
+            syncer.completion_blocker(),
+            Some(crate::sync_coordinator::CompletionBlocker::EmptyTree)
+        ) {
+            missing = root_missing_from_wire(root_wire);
+        }
+        if missing.is_empty() {
+            return vec![];
+        }
     }
 
     let fanout = max_requests.max(1).min(missing.len());
@@ -137,8 +164,97 @@ pub fn build_root_bootstrap_requests(
             None,
             syncer.ledger_seq(),
         ));
+        syncer.peer.in_flight = syncer.peer.in_flight.saturating_add(1);
     }
 
-    syncer.peer.in_flight = syncer.peer.in_flight.saturating_add(reqs.len());
     reqs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_root_wire(hashes: &[[u8; 32]; 16]) -> Vec<u8> {
+        let mut wire = Vec::with_capacity(16 * 32 + 1);
+        for hash in hashes {
+            wire.extend_from_slice(hash);
+        }
+        wire.push(0x02);
+        wire
+    }
+
+    #[test]
+    fn partial_sync_metadata_never_resumes_follower_mode() {
+        assert!(!should_resume_from_sync_anchor(
+            false, true, true, true, true
+        ));
+        assert!(!should_resume_from_sync_anchor(
+            true, false, true, true, true
+        ));
+        assert!(!should_resume_from_sync_anchor(
+            true, true, false, false, true
+        ));
+        assert!(!should_resume_from_sync_anchor(
+            true, true, true, true, false
+        ));
+        assert!(should_resume_from_sync_anchor(
+            true, true, true, false, true
+        ));
+        assert!(should_resume_from_sync_anchor(
+            true, true, false, true, true
+        ));
+    }
+
+    #[test]
+    fn root_bootstrap_requests_skip_backend_satisfied_children() {
+        let backend: Arc<dyn crate::ledger::node_store::NodeStore> =
+            Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let key = [0xA0; 32];
+        let leaf_data = b"already local";
+        let leaf_hash = crate::ledger::sparse_shamap::leaf_hash(leaf_data, &key);
+        let mut stored = leaf_data.to_vec();
+        stored.extend_from_slice(&key);
+        backend
+            .store(&leaf_hash, &stored)
+            .expect("local leaf should store");
+
+        let mut root_hashes = [[0u8; 32]; 16];
+        root_hashes[0xA] = leaf_hash;
+        let root_wire = make_root_wire(&root_hashes);
+        let mut header = crate::ledger::LedgerHeader::default();
+        header.account_hash = {
+            let mut payload = Vec::with_capacity(4 + 16 * 32);
+            payload.extend_from_slice(&crate::ledger::shamap::PREFIX_INNER_NODE);
+            for hash in &root_hashes {
+                payload.extend_from_slice(hash);
+            }
+            crate::crypto::sha512_first_half(&payload)
+        };
+        let mut syncer = crate::sync_coordinator::SyncCoordinator::new(
+            10,
+            [0x11; 32],
+            header.account_hash,
+            Some(backend),
+            header,
+        );
+
+        let progress = syncer.process_response(&crate::proto::TmLedgerData {
+            ledger_hash: vec![0x11; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiAsNode as i32,
+            nodes: vec![crate::proto::TmLedgerNode {
+                nodedata: root_wire.clone(),
+                nodeid: None,
+            }],
+            request_cookie: None,
+            error: None,
+        });
+        assert_eq!(progress.inner_received, 1);
+
+        let reqs = build_root_bootstrap_requests(&mut syncer, &root_wire, 4);
+
+        assert!(reqs.is_empty());
+        assert!(syncer.is_complete());
+    }
 }
