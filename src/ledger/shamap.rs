@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Shamap support for XRPL ledger state and SHAMap logic.
 //! SHAMap — the radix-16 Merkle hash tree at the core of the XRP Ledger.
 //!
 //! Every closed ledger contains two SHAMaps:
@@ -15,7 +14,8 @@
 //! # Hash prefixes
 //! Each node type is hashed with a 4-byte prefix to domain-separate the hashes:
 //!   Inner node:        `MIN\0`  0x4D494E00
-//!   Transaction leaf:  `SND\0`  0x534E4400
+//!   Tx+metadata leaf:  `SND\0`  0x534E4400
+//!   Tx no-meta leaf:   `TXN\0`  0x54584E00
 //!   Account state leaf:`MLN\0`  0x4D4C4E00
 
 use std::sync::Arc;
@@ -29,7 +29,9 @@ use crate::ledger::shamap_id::SHAMapNodeID;
 // ── Hash prefixes ─────────────────────────────────────────────────────────────
 
 pub(crate) const PREFIX_INNER_NODE: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00]; // MIN\0
-pub(crate) const PREFIX_LEAF_TX: [u8; 4] = [0x53, 0x4E, 0x44, 0x00]; // SND\0
+pub(crate) const PREFIX_LEAF_TX_WITH_META: [u8; 4] = [0x53, 0x4E, 0x44, 0x00]; // SND\0
+pub(crate) const PREFIX_LEAF_TX: [u8; 4] = PREFIX_LEAF_TX_WITH_META;
+pub(crate) const PREFIX_LEAF_TX_NO_META: [u8; 4] = [0x54, 0x58, 0x4E, 0x00]; // TXN\0
 pub(crate) const PREFIX_LEAF_STATE: [u8; 4] = [0x4D, 0x4C, 0x4E, 0x00]; // MLN\0
 
 // ── Key ───────────────────────────────────────────────────────────────────────
@@ -66,8 +68,18 @@ impl Key {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapType {
-    Transaction,
+    /// Ledger transaction tree leaves include transaction metadata.
+    TransactionWithMetadata,
+    /// Consensus/proposal transaction tree leaves carry only the transaction.
+    TransactionNoMetadata,
     AccountState,
+}
+
+impl MapType {
+    /// Backwards-compatible spelling for the ledger transaction map. New code
+    /// should prefer `TransactionWithMetadata` or `TransactionNoMetadata`.
+    #[allow(non_upper_case_globals)]
+    pub const Transaction: Self = Self::TransactionWithMetadata;
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
@@ -212,7 +224,8 @@ impl LeafNode {
             return h;
         }
         let prefix = match map_type {
-            MapType::Transaction => &PREFIX_LEAF_TX,
+            MapType::TransactionWithMetadata => &PREFIX_LEAF_TX_WITH_META,
+            MapType::TransactionNoMetadata => &PREFIX_LEAF_TX_NO_META,
             MapType::AccountState => &PREFIX_LEAF_STATE,
         };
         let mut payload = Vec::with_capacity(4 + self.data.len() + 32);
@@ -244,7 +257,8 @@ pub struct SHAMap {
 
 const WIRE_TYPE_ACCOUNT_STATE: u8 = 0x01;
 const WIRE_TYPE_INNER: u8 = 0x02;
-const WIRE_TYPE_TRANSACTION: u8 = 0x04;
+const WIRE_TYPE_TRANSACTION_NO_METADATA: u8 = 0x03;
+const WIRE_TYPE_TRANSACTION_WITH_METADATA: u8 = 0x04;
 
 impl SHAMap {
     pub fn new(map_type: MapType) -> Self {
@@ -270,7 +284,10 @@ impl SHAMap {
         Self::new(MapType::AccountState)
     }
     pub fn new_transaction() -> Self {
-        Self::new(MapType::Transaction)
+        Self::new(MapType::TransactionWithMetadata)
+    }
+    pub fn new_transaction_no_metadata() -> Self {
+        Self::new(MapType::TransactionNoMetadata)
     }
 
     /// Number of items in the map.
@@ -305,7 +322,7 @@ impl SHAMap {
     /// Get the data stored at `key`, if present.
     /// If the leaf is a stub, fetches from the backend NodeStore.
     pub fn get(&mut self, key: &Key) -> Option<Vec<u8>> {
-        get_node_lazy(&mut self.root, key, 0, self.backend.as_ref())
+        get_node_lazy(&mut self.root, key, 0, self.map_type, self.backend.as_ref())
     }
 
     /// Get the data stored at `key` without resolving stubs (immutable access).
@@ -322,9 +339,9 @@ impl SHAMap {
 
     /// Remove `key`. Returns `true` if it was present.
     pub fn remove(&mut self, key: &Key) -> bool {
-        let removed = remove_node(&mut self.root, key, 0, self.backend.as_ref());
+        let removed = remove_node(&mut self.root, key, 0, self.map_type, self.backend.as_ref());
         if removed {
-            self.count -= 1;
+            self.count = self.count.saturating_sub(1);
         }
         removed
     }
@@ -406,7 +423,7 @@ impl SHAMap {
             self.count = 0;
             return Ok(false);
         }
-        match decode_validated_store_node(&root_hash, &stored) {
+        match decode_validated_store_node(&root_hash, &stored, self.map_type) {
             Some(StoredNode::Inner(root)) => {
                 self.root = root;
                 // The persisted root rehydrates the tree shape lazily; exact
@@ -458,20 +475,27 @@ impl SHAMap {
     /// on demand. This allows historical root snapshots to enumerate leaves without
     /// eagerly loading the whole tree into memory first.
     pub fn first_key_lazy(&mut self) -> Option<Key> {
-        leftmost_key_lazy_inner(&mut self.root, self.backend.as_ref())
+        leftmost_key_lazy_inner(&mut self.root, self.map_type, self.backend.as_ref())
     }
 
     /// Find the next key strictly greater than `key`, materializing
     /// backend-backed branches on demand.
     pub fn upper_bound_lazy(&mut self, key: &Key) -> Option<Key> {
-        upper_bound_lazy_inner(&mut self.root, key, 0, self.backend.as_ref())
+        upper_bound_lazy_inner(&mut self.root, key, 0, self.map_type, self.backend.as_ref())
     }
 
     /// Trace how a keyed lookup walks the current SHAMap/backend.
     /// Used only for diagnostics when a supposedly-present base object is missing.
     pub fn debug_trace_key_path(&mut self, key: &Key) -> Vec<String> {
         let mut lines = Vec::new();
-        debug_trace_key_path_recursive(&mut self.root, key, 0, self.backend.as_ref(), &mut lines);
+        debug_trace_key_path_recursive(
+            &mut self.root,
+            key,
+            0,
+            self.map_type,
+            self.backend.as_ref(),
+            &mut lines,
+        );
         lines
     }
 
@@ -583,24 +607,29 @@ fn leftmost_key(node: &Node) -> Option<Key> {
     }
 }
 
-fn leftmost_key_lazy_node(node: &mut Node, backend: Option<&Arc<dyn NodeStore>>) -> Option<Key> {
+fn leftmost_key_lazy_node(
+    node: &mut Node,
+    map_type: MapType,
+    backend: Option<&Arc<dyn NodeStore>>,
+) -> Option<Key> {
     match node {
         Node::Leaf(leaf) => Some(leaf.key),
         Node::Stub { key, .. } => Some(*key),
-        Node::Inner(inner) => leftmost_key_lazy_inner(inner, backend),
+        Node::Inner(inner) => leftmost_key_lazy_inner(inner, map_type, backend),
     }
 }
 
 fn leftmost_key_lazy_inner(
     node: &mut InnerNode,
+    map_type: MapType,
     backend: Option<&Arc<dyn NodeStore>>,
 ) -> Option<Key> {
     for branch in 0..16 {
         if node.children[branch].is_none() && node.child_hashes[branch] != [0u8; 32] {
-            materialize_child_from_backend(node, branch, backend);
+            materialize_child_from_backend(node, branch, map_type, backend);
         }
         if let Some(child) = node.children[branch].as_mut() {
-            if let Some(found) = leftmost_key_lazy_node(child.as_mut(), backend) {
+            if let Some(found) = leftmost_key_lazy_node(child.as_mut(), map_type, backend) {
                 return Some(found);
             }
         }
@@ -612,19 +641,22 @@ fn upper_bound_lazy_inner(
     node: &mut InnerNode,
     target: &Key,
     depth: usize,
+    map_type: MapType,
     backend: Option<&Arc<dyn NodeStore>>,
 ) -> Option<Key> {
     let nibble = target.nibble(depth);
 
     if node.children[nibble].is_none() && node.child_hashes[nibble] != [0u8; 32] {
-        materialize_child_from_backend(node, nibble, backend);
+        materialize_child_from_backend(node, nibble, map_type, backend);
     }
     if let Some(child) = node.children[nibble].as_mut() {
         match child.as_mut() {
             Node::Leaf(leaf) if leaf.key > *target => return Some(leaf.key),
             Node::Stub { key, .. } if *key > *target => return Some(*key),
             Node::Inner(inner) => {
-                if let Some(found) = upper_bound_lazy_inner(inner, target, depth + 1, backend) {
+                if let Some(found) =
+                    upper_bound_lazy_inner(inner, target, depth + 1, map_type, backend)
+                {
                     return Some(found);
                 }
             }
@@ -634,10 +666,10 @@ fn upper_bound_lazy_inner(
 
     for branch in (nibble + 1)..16 {
         if node.children[branch].is_none() && node.child_hashes[branch] != [0u8; 32] {
-            materialize_child_from_backend(node, branch, backend);
+            materialize_child_from_backend(node, branch, map_type, backend);
         }
         if let Some(child) = node.children[branch].as_mut() {
-            if let Some(found) = leftmost_key_lazy_node(child.as_mut(), backend) {
+            if let Some(found) = leftmost_key_lazy_node(child.as_mut(), map_type, backend) {
                 return Some(found);
             }
         }
@@ -663,7 +695,8 @@ fn serialize_inner_wire(node: &mut InnerNode, map_type: MapType) -> Vec<u8> {
 fn leaf_wire_type(map_type: MapType) -> u8 {
     match map_type {
         MapType::AccountState => WIRE_TYPE_ACCOUNT_STATE,
-        MapType::Transaction => WIRE_TYPE_TRANSACTION,
+        MapType::TransactionWithMetadata => WIRE_TYPE_TRANSACTION_WITH_METADATA,
+        MapType::TransactionNoMetadata => WIRE_TYPE_TRANSACTION_NO_METADATA,
     }
 }
 
@@ -681,7 +714,7 @@ fn serialize_stub_wire(
     map_type: MapType,
     backend: Option<&Arc<dyn NodeStore>>,
 ) -> Option<Vec<u8>> {
-    let data = resolve_stub(content_hash, key, backend?.as_ref())?;
+    let data = resolve_stub(content_hash, key, map_type, backend?.as_ref())?;
     let mut wire = Vec::with_capacity(data.len() + 33);
     wire.extend_from_slice(&data);
     wire.extend_from_slice(&key.0);
@@ -701,7 +734,7 @@ fn get_wire_node_recursive(
     }
 
     let branch = current_id.select_branch(target_id);
-    materialize_child_from_backend(node, branch, backend);
+    materialize_child_from_backend(node, branch, map_type, backend);
     let child = node.children[branch].as_mut()?;
     let child_id = current_id.child_id(branch as u8);
 
@@ -758,7 +791,7 @@ fn collect_wire_subtree_from_node(
             }
             for branch in 0..16 {
                 if inner.children[branch].is_none() && inner.child_hashes[branch] != [0u8; 32] {
-                    materialize_child_from_backend(inner, branch, backend);
+                    materialize_child_from_backend(inner, branch, map_type, backend);
                 }
                 if let Some(child) = inner.children[branch].as_mut() {
                     let child_id = response_id.child_id(branch as u8);
@@ -790,7 +823,7 @@ fn collect_wire_nodes_for_query_recursive(
         if query_depth > 0 {
             for branch in 0..16 {
                 if node.children[branch].is_none() && node.child_hashes[branch] != [0u8; 32] {
-                    materialize_child_from_backend(node, branch, backend);
+                    materialize_child_from_backend(node, branch, map_type, backend);
                 }
                 if let Some(child) = node.children[branch].as_mut() {
                     let child_id = current_id.child_id(branch as u8);
@@ -809,7 +842,7 @@ fn collect_wire_nodes_for_query_recursive(
     }
 
     let branch = current_id.select_branch(target_id);
-    materialize_child_from_backend(node, branch, backend);
+    materialize_child_from_backend(node, branch, map_type, backend);
     let Some(child) = node.children[branch].as_mut() else {
         return false;
     };
@@ -877,7 +910,7 @@ fn insert_node(
     // the branch is empty. It can mean "the child exists only by hash so far".
     // Materialize that child before inserting, otherwise a new overlay leaf can
     // overwrite the unresolved backend subtree and hide synced state.
-    materialize_child_from_backend(node, nibble, backend);
+    materialize_child_from_backend(node, nibble, mt, backend);
 
     match &mut node.children[nibble] {
         // Empty slot — just place a new leaf here
@@ -961,6 +994,7 @@ fn remove_node(
     node: &mut InnerNode,
     key: &Key,
     depth: usize,
+    map_type: MapType,
     backend: Option<&Arc<dyn NodeStore>>,
 ) -> bool {
     let nibble = key.nibble(depth);
@@ -969,7 +1003,7 @@ fn remove_node(
     // "known by hash, not yet materialized". Deletions must resolve that
     // child before deciding the key is absent, otherwise snapshot overlays
     // hide deleted leaves in lookups but leave them in the hashed tree.
-    materialize_child_from_backend(node, nibble, backend);
+    materialize_child_from_backend(node, nibble, map_type, backend);
 
     let found = match &mut node.children[nibble] {
         None => false,
@@ -977,7 +1011,7 @@ fn remove_node(
             Node::Leaf(leaf) => leaf.key == *key,
             Node::Stub { key: sk, .. } => *sk == *key,
             Node::Inner(inner) => {
-                let removed = remove_node(inner, key, depth + 1, backend);
+                let removed = remove_node(inner, key, depth + 1, map_type, backend);
                 if removed {
                     node.invalidate();
                     // Collapse: if inner node now has exactly one remaining branch,
@@ -1002,7 +1036,9 @@ fn remove_node(
                                 let idx = remaining[0];
                                 if let Some(child) = &mut node.children[nibble] {
                                     if let Node::Inner(inner_mut) = child.as_mut() {
-                                        materialize_child_from_backend(inner_mut, idx, backend);
+                                        materialize_child_from_backend(
+                                            inner_mut, idx, map_type, backend,
+                                        );
                                     }
                                 }
                                 let can_collapse_to_child =
@@ -1047,6 +1083,7 @@ fn remove_node(
 fn materialize_child_from_backend(
     node: &mut InnerNode,
     nibble: usize,
+    map_type: MapType,
     backend: Option<&Arc<dyn NodeStore>>,
 ) {
     if node.children[nibble].is_some() || node.child_hashes[nibble] == [0u8; 32] {
@@ -1057,7 +1094,7 @@ fn materialize_child_from_backend(
     };
     let child_hash = node.child_hashes[nibble];
     match be.fetch(&child_hash) {
-        Ok(Some(stored)) => match decode_validated_store_node(&child_hash, &stored) {
+        Ok(Some(stored)) => match decode_validated_store_node(&child_hash, &stored, map_type) {
             Some(StoredNode::Inner(inner)) => {
                 node.children[nibble] = Some(Box::new(Node::Inner(inner)));
             }
@@ -1079,7 +1116,12 @@ fn materialize_child_from_backend(
 
 /// Resolve a stub leaf by fetching its data from the backend NodeStore.
 /// Returns the deserialized leaf data (SLE bytes), or None if not found.
-fn resolve_stub(content_hash: &[u8; 32], key: &Key, backend: &dyn NodeStore) -> Option<Vec<u8>> {
+fn resolve_stub(
+    content_hash: &[u8; 32],
+    key: &Key,
+    map_type: MapType,
+    backend: &dyn NodeStore,
+) -> Option<Vec<u8>> {
     let node_bytes = match backend.fetch(content_hash) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return None,
@@ -1092,26 +1134,26 @@ fn resolve_stub(content_hash: &[u8; 32], key: &Key, backend: &dyn NodeStore) -> 
             return None;
         }
     };
-    // Leaf node in the store is: SLE data + 32-byte entry key
-    if node_bytes.len() < 32 {
-        tracing::warn!(
-            "shamap stub {} loaded malformed leaf bytes: len={}",
-            hex::encode_upper(&content_hash[..8]),
-            node_bytes.len(),
-        );
-        return None;
+    match decode_validated_store_node(content_hash, &node_bytes, map_type) {
+        Some(StoredNode::Leaf(leaf)) if leaf.key == *key => Some(leaf.data),
+        Some(StoredNode::Leaf(leaf)) => {
+            tracing::warn!(
+                "shamap stub {} key mismatch: requested={} stored={}",
+                hex::encode_upper(&content_hash[..8]),
+                hex::encode_upper(&key.0[..8]),
+                hex::encode_upper(&leaf.key.0[..8]),
+            );
+            None
+        }
+        Some(StoredNode::Inner(_)) => {
+            tracing::warn!(
+                "shamap stub {} resolved to an inner node",
+                hex::encode_upper(&content_hash[..8]),
+            );
+            None
+        }
+        None => None,
     }
-    let stored_key = &node_bytes[node_bytes.len() - 32..];
-    if stored_key != &key.0 {
-        tracing::warn!(
-            "shamap stub {} key mismatch: requested={} stored={}",
-            hex::encode_upper(&content_hash[..8]),
-            hex::encode_upper(&key.0[..8]),
-            hex::encode_upper(&stored_key[..8]),
-        );
-        return None;
-    }
-    Some(node_bytes[..node_bytes.len() - 32].to_vec())
 }
 
 /// Get node data, resolving stubs on demand from the backend.
@@ -1119,6 +1161,7 @@ fn get_node_lazy(
     node: &mut InnerNode,
     key: &Key,
     depth: usize,
+    map_type: MapType,
     backend: Option<&Arc<dyn NodeStore>>,
 ) -> Option<Vec<u8>> {
     let nibble = key.nibble(depth);
@@ -1141,12 +1184,12 @@ fn get_node_lazy(
                     return None;
                 }
             };
-            match decode_validated_store_node(&child_hash, &stored)? {
+            match decode_validated_store_node(&child_hash, &stored, map_type)? {
                 StoredNode::Inner(inner) => {
                     node.children[nibble] = Some(Box::new(Node::Inner(inner)));
                     if let Some(child) = &mut node.children[nibble] {
                         if let Node::Inner(inner) = child.as_mut() {
-                            return get_node_lazy(inner, key, depth + 1, Some(backend));
+                            return get_node_lazy(inner, key, depth + 1, map_type, Some(backend));
                         }
                     }
                     None
@@ -1171,7 +1214,7 @@ fn get_node_lazy(
                     None
                 }
             }
-            Node::Inner(inner) => get_node_lazy(inner, key, depth + 1, backend),
+            Node::Inner(inner) => get_node_lazy(inner, key, depth + 1, map_type, backend),
             Node::Stub {
                 key: stub_key,
                 content_hash,
@@ -1181,7 +1224,7 @@ fn get_node_lazy(
                 }
                 // Resolve the stub
                 let backend = backend?;
-                let data = resolve_stub(content_hash, key, backend.as_ref())?;
+                let data = resolve_stub(content_hash, key, map_type, backend.as_ref())?;
                 // Promote stub to full leaf (not dirty — loaded from backend)
                 let ch = *content_hash;
                 *child = Box::new(Node::Leaf(LeafNode {
@@ -1200,6 +1243,7 @@ fn debug_trace_key_path_recursive(
     node: &mut InnerNode,
     key: &Key,
     depth: usize,
+    map_type: MapType,
     backend: Option<&Arc<dyn NodeStore>>,
     lines: &mut Vec<String>,
 ) {
@@ -1222,7 +1266,7 @@ fn debug_trace_key_path_recursive(
         Some(child) => match child.as_mut() {
             Node::Inner(inner) => {
                 lines.push("child=inner".to_string());
-                debug_trace_key_path_recursive(inner, key, depth + 1, backend, lines);
+                debug_trace_key_path_recursive(inner, key, depth + 1, map_type, backend, lines);
             }
             Node::Leaf(leaf) => {
                 lines.push(format!(
@@ -1266,7 +1310,7 @@ fn debug_trace_key_path_recursive(
             match be.fetch(&child_hash) {
                 Ok(Some(stored)) => {
                     lines.push(format!("child=none backend_found {}bytes", stored.len()));
-                    match decode_validated_store_node(&child_hash, &stored) {
+                    match decode_validated_store_node(&child_hash, &stored, map_type) {
                         Some(StoredNode::Inner(inner)) => {
                             node.children[nibble] = Some(Box::new(Node::Inner(inner)));
                             if let Some(child) = &mut node.children[nibble] {
@@ -1275,6 +1319,7 @@ fn debug_trace_key_path_recursive(
                                         inner,
                                         key,
                                         depth + 1,
+                                        map_type,
                                         Some(be),
                                         lines,
                                     );
@@ -1386,7 +1431,11 @@ enum StoredNode {
     Leaf(LeafNode),
 }
 
-fn decode_validated_store_node(expected_hash: &[u8; 32], data: &[u8]) -> Option<StoredNode> {
+fn decode_validated_store_node(
+    expected_hash: &[u8; 32],
+    data: &[u8],
+    map_type: MapType,
+) -> Option<StoredNode> {
     let mut inner_hash = None;
     if data.len() == 16 * 32 {
         let mut inner = deserialize_inner_from_store(data)?;
@@ -1415,46 +1464,31 @@ fn decode_validated_store_node(expected_hash: &[u8; 32], data: &[u8]) -> Option<
     let key = Key(stored_key);
     let leaf_data = data[..data.len() - 32].to_vec();
 
-    let mut state_leaf = LeafNode {
-        key,
-        data: leaf_data.clone(),
-        cached_hash: None,
-        dirty: false,
-    };
-    let state_hash = state_leaf.hash(MapType::AccountState);
-    if state_hash == *expected_hash {
-        state_leaf.cached_hash = Some(state_hash);
-        state_leaf.dirty = false;
-        return Some(StoredNode::Leaf(state_leaf));
-    }
-
-    let mut tx_leaf = LeafNode {
+    let mut leaf = LeafNode {
         key,
         data: leaf_data,
         cached_hash: None,
         dirty: false,
     };
-    let tx_hash = tx_leaf.hash(MapType::Transaction);
-    if tx_hash == *expected_hash {
-        tx_leaf.cached_hash = Some(tx_hash);
-        tx_leaf.dirty = false;
-        return Some(StoredNode::Leaf(tx_leaf));
+    let leaf_hash = leaf.hash(map_type);
+    if leaf_hash == *expected_hash {
+        leaf.cached_hash = Some(leaf_hash);
+        leaf.dirty = false;
+        return Some(StoredNode::Leaf(leaf));
     }
 
     if let Some(inner_hash) = inner_hash {
         tracing::warn!(
-            "shamap backend 512-byte object hash mismatch: expected={} inner={} state={} tx={}",
+            "shamap backend 512-byte object hash mismatch: expected={} inner={} leaf={}",
             hex::encode_upper(&expected_hash[..8]),
             hex::encode_upper(&inner_hash[..8]),
-            hex::encode_upper(&state_hash[..8]),
-            hex::encode_upper(&tx_hash[..8]),
+            hex::encode_upper(&leaf_hash[..8]),
         );
     } else {
         tracing::warn!(
-            "shamap backend leaf hash mismatch: expected={} state={} tx={}",
+            "shamap backend leaf hash mismatch: expected={} leaf={}",
             hex::encode_upper(&expected_hash[..8]),
-            hex::encode_upper(&state_hash[..8]),
-            hex::encode_upper(&tx_hash[..8]),
+            hex::encode_upper(&leaf_hash[..8]),
         );
     }
     None
@@ -1927,6 +1961,39 @@ mod tests {
             restarted.root_hash(),
             expected.root_hash(),
             "removing from a restarted backend-backed SHAMap must update the hashed tree",
+        );
+    }
+
+    #[test]
+    fn test_remove_from_lazy_root_with_unknown_count_does_not_underflow() {
+        use crate::ledger::node_store::MemNodeStore;
+
+        let backend = Arc::new(MemNodeStore::new());
+        let k1 = key(0x31);
+        let k2 = key(0x32);
+
+        let mut seeded = SHAMap::with_backend(MapType::AccountState, backend.clone());
+        seeded.insert(k1, b"one".to_vec());
+        seeded.insert(k2, b"two".to_vec());
+        let root_hash = seeded.root_hash();
+        seeded.flush_dirty().unwrap();
+
+        let mut restarted = SHAMap::with_backend(MapType::AccountState, backend.clone());
+        assert!(restarted.load_root_from_hash(root_hash).unwrap());
+        assert_eq!(
+            restarted.len(),
+            0,
+            "lazy reload does not recover an exact item count"
+        );
+        assert!(restarted.remove(&k1));
+
+        let mut expected = SHAMap::with_backend(MapType::AccountState, backend);
+        expected.insert(k2, b"two".to_vec());
+        assert_eq!(restarted.root_hash(), expected.root_hash());
+        assert_eq!(
+            restarted.len(),
+            0,
+            "unknown lazy count must saturate instead of underflowing"
         );
     }
 
@@ -2588,7 +2655,61 @@ mod tests {
         let leaf_wire = map
             .get_wire_node_by_id(&SHAMapNodeID::from_key(&tx_key.0))
             .unwrap();
-        assert_eq!(leaf_wire.last().copied(), Some(WIRE_TYPE_TRANSACTION));
+        assert_eq!(
+            leaf_wire.last().copied(),
+            Some(WIRE_TYPE_TRANSACTION_WITH_METADATA)
+        );
+    }
+
+    #[test]
+    fn test_transaction_no_metadata_has_distinct_hash_and_wire_type() {
+        let tx_key = key(0xCD);
+        let tx_bytes = b"serialized-tx".to_vec();
+
+        let mut with_meta = SHAMap::new_transaction();
+        with_meta.insert(tx_key, tx_bytes.clone());
+
+        let mut no_meta = SHAMap::new_transaction_no_metadata();
+        no_meta.insert(tx_key, tx_bytes);
+
+        assert_ne!(
+            with_meta.root_hash(),
+            no_meta.root_hash(),
+            "metadata and no-metadata transaction leaves must hash in separate domains",
+        );
+
+        let leaf_wire = no_meta
+            .get_wire_node_by_id(&SHAMapNodeID::from_key(&tx_key.0))
+            .unwrap();
+        assert_eq!(
+            leaf_wire.last().copied(),
+            Some(WIRE_TYPE_TRANSACTION_NO_METADATA)
+        );
+    }
+
+    #[test]
+    fn test_backend_decode_rejects_transaction_leaf_in_state_map() {
+        let backend: std::sync::Arc<dyn crate::ledger::node_store::NodeStore> =
+            std::sync::Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let key = key(0xCE);
+        let data = b"serialized-tx-with-meta".to_vec();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&PREFIX_LEAF_TX_WITH_META);
+        payload.extend_from_slice(&data);
+        payload.extend_from_slice(&key.0);
+        let tx_hash = sha512_first_half(&payload);
+
+        let mut store_data = data;
+        store_data.extend_from_slice(&key.0);
+        backend.store(&tx_hash, &store_data).unwrap();
+
+        let mut state_map = SHAMap::with_backend(MapType::AccountState, backend);
+        state_map.insert_stub(key, tx_hash);
+        assert_eq!(
+            state_map.get(&key),
+            None,
+            "state maps must not silently materialize transaction leaves",
+        );
     }
 
     #[test]

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Serialize support for transaction parsing and submission.
 //! XRPL canonical binary serialization (STObject format).
 //!
 //! Used to produce the byte sequence that gets hashed for transaction signing.
@@ -12,7 +11,7 @@
 //!   193–12480:    2 bytes = 193 + ((len - 193) >> 8), (len - 193) & 0xFF
 //!   12481–918744: 3 bytes = 241 + ((len - 12481) >> 16), ...
 
-use crate::transaction::amount::Amount;
+use crate::transaction::amount::{Amount, Issue};
 use crate::transaction::field::FieldDef;
 
 /// Hash prefix for single-signed transactions.
@@ -80,11 +79,15 @@ pub enum FieldValue {
     UInt16(u16),
     UInt32(u32),
     UInt64(u64),
+    Number(i64),
     Hash128([u8; 16]),
     Hash160([u8; 20]),
+    UInt192([u8; 24]),
     Hash256([u8; 32]),
     Amount(Amount),
+    Issue(Issue),
     Blob(Vec<u8>),
+    Raw(Vec<u8>),
     AccountID([u8; 20]),
 }
 
@@ -96,14 +99,18 @@ impl FieldValue {
             FieldValue::UInt16(v) => buf.extend_from_slice(&v.to_be_bytes()),
             FieldValue::UInt32(v) => buf.extend_from_slice(&v.to_be_bytes()),
             FieldValue::UInt64(v) => buf.extend_from_slice(&v.to_be_bytes()),
+            FieldValue::Number(v) => buf.extend_from_slice(&v.to_be_bytes()),
             FieldValue::Hash128(v) => buf.extend_from_slice(v),
             FieldValue::Hash160(v) => buf.extend_from_slice(v),
+            FieldValue::UInt192(v) => buf.extend_from_slice(v),
             FieldValue::Hash256(v) => buf.extend_from_slice(v),
             FieldValue::Amount(a) => buf.extend_from_slice(&a.to_bytes()),
+            FieldValue::Issue(issue) => buf.extend_from_slice(&issue.to_bytes()),
             FieldValue::Blob(v) => {
                 encode_length(v.len(), buf);
                 buf.extend_from_slice(v);
             }
+            FieldValue::Raw(v) => buf.extend_from_slice(v),
             FieldValue::AccountID(v) => {
                 encode_length(20, buf);
                 buf.extend_from_slice(v);
@@ -206,6 +213,22 @@ mod tests {
         let mut buf = Vec::new();
         f.encode_id(&mut buf);
         assert_eq!(buf, vec![0x24]);
+    }
+
+    #[test]
+    fn accountset_tick_size_uses_uint8_extended_field_id() {
+        let mut buf = Vec::new();
+        field::TICK_SIZE.encode_id(&mut buf);
+
+        assert_eq!(buf, vec![0x00, 16, 16]);
+    }
+
+    #[test]
+    fn ledger_state_fix_type_uses_uint16_extended_field_id() {
+        let mut buf = Vec::new();
+        field::LEDGER_FIX_TYPE.encode_id(&mut buf);
+
+        assert_eq!(buf, vec![0x10, 21]);
     }
 
     #[test]

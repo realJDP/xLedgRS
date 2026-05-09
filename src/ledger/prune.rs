@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Prune support for XRPL ledger state and SHAMap logic.
 //! NuDB pruning — compact the NodeStore to only live objects.
 //!
 //! Walk the state tree from its root hash, copying all reachable nodes
@@ -10,9 +9,12 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::ledger::node_store::{NodeStore, NuDBNodeStore};
+use crate::ledger::node_store::{
+    decode_node_object_kind, NodeObjectKind, NodeObjectType, NodeStore, NuDBNodeStore,
+};
 
 /// Result of a compaction.
+#[derive(Debug)]
 pub struct CompactResult {
     pub inner_nodes: u64,
     pub leaf_nodes: u64,
@@ -22,6 +24,7 @@ pub struct CompactResult {
 fn walk_reachable<F>(
     store: &Arc<dyn NodeStore>,
     root_hash: [u8; 32],
+    object_type: NodeObjectType,
     mut visitor: F,
 ) -> std::io::Result<CompactResult>
 where
@@ -47,18 +50,40 @@ where
             }
         };
 
-        if data.len() == 16 * 32 {
-            inner_count += 1;
-            for i in 0..16 {
-                let offset = i * 32;
-                let mut child_hash = [0u8; 32];
-                child_hash.copy_from_slice(&data[offset..offset + 32]);
-                if child_hash != [0u8; 32] {
-                    stack.push(child_hash);
+        match decode_node_object_kind(object_type, &hash, &data) {
+            Some(NodeObjectKind::Inner) => {
+                inner_count += 1;
+                for i in 0..16 {
+                    let offset = i * 32;
+                    let mut child_hash = [0u8; 32];
+                    child_hash.copy_from_slice(&data[offset..offset + 32]);
+                    if child_hash != [0u8; 32] {
+                        stack.push(child_hash);
+                    }
                 }
             }
-        } else {
-            leaf_count += 1;
+            Some(NodeObjectKind::Leaf) => {
+                leaf_count += 1;
+            }
+            Some(NodeObjectKind::Ledger) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "reachable SHAMap node {} decoded as a ledger object",
+                        hex::encode_upper(hash)
+                    ),
+                ));
+            }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "reachable {:?} node {} failed typed/hash validation",
+                        object_type,
+                        hex::encode_upper(hash)
+                    ),
+                ));
+            }
         }
 
         visitor(hash, data)?;
@@ -89,10 +114,20 @@ pub fn compact_nodestore(
     root_hash: [u8; 32],
     new_path: &Path,
 ) -> std::io::Result<CompactResult> {
+    compact_nodestore_typed(source, root_hash, NodeObjectType::AccountNode, new_path)
+}
+
+/// Walk a typed SHAMap tree from `root_hash`, copying all reachable nodes.
+pub fn compact_nodestore_typed(
+    source: &Arc<dyn NodeStore>,
+    root_hash: [u8; 32],
+    object_type: NodeObjectType,
+    new_path: &Path,
+) -> std::io::Result<CompactResult> {
     let target = Arc::new(NuDBNodeStore::open(new_path)?);
     let mut batch: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(1000);
 
-    let result = walk_reachable(source, root_hash, |hash, data| {
+    let result = walk_reachable(source, root_hash, object_type, |hash, data| {
         batch.push((hash, data));
         if batch.len() >= 1000 {
             target.store_batch(&batch)?;
@@ -114,9 +149,11 @@ pub fn compact_nodestore(
     Ok(result)
 }
 
-/// Walk the in-memory SHAMap and collect all leaf content hashes.
-/// Returns hashes of all leaf nodes reachable from the root.
-/// These are the ONLY objects that should be in NuDB.
+/// Walk the in-memory SHAMap and collect known content hashes.
+///
+/// This is retained for diagnostics. Compaction must walk and validate the
+/// persisted tree from the root so hash-only inner branches cannot lose their
+/// descendants.
 pub fn collect_live_leaf_hashes(state_map: &crate::ledger::shamap::SHAMap) -> Vec<[u8; 32]> {
     let mut hashes = Vec::new();
     collect_from_inner(&state_map.root, &mut hashes);
@@ -149,56 +186,19 @@ fn collect_from_inner(node: &crate::ledger::shamap::InnerNode, hashes: &mut Vec<
     }
 }
 
-/// Compact using the in-memory SHAMap: collect live leaf hashes,
-/// create new NuDB with only those leaves.
+/// Compact using the in-memory SHAMap root hash.
+///
+/// The actual copy walks the persisted NodeStore from that root and validates
+/// each reachable node. This intentionally fails if dirty in-memory nodes have
+/// not been flushed yet, rather than producing an incomplete compacted DB.
 pub fn compact_from_shamap(
     source: &Arc<dyn NodeStore>,
     state_map: &crate::ledger::shamap::SHAMap,
     new_path: &Path,
 ) -> std::io::Result<CompactResult> {
-    let live_hashes = collect_live_leaf_hashes(state_map);
-    info!("prune: found {} live nodes in SHAMap", live_hashes.len());
-
-    let target = Arc::new(NuDBNodeStore::open(new_path)?);
-    let mut copied = 0u64;
-    let mut missing = 0u64;
-    let mut batch: Vec<([u8; 32], Vec<u8>)> = Vec::with_capacity(1000);
-
-    for hash in &live_hashes {
-        match source.fetch(hash)? {
-            Some(data) => {
-                batch.push((*hash, data));
-                copied += 1;
-                if batch.len() >= 1000 {
-                    target.store_batch(&batch)?;
-                    batch.clear();
-                }
-                if copied % 500_000 == 0 {
-                    info!("prune: copied {}/{} nodes", copied, live_hashes.len());
-                }
-            }
-            None => {
-                missing += 1;
-            }
-        }
-    }
-
-    if !batch.is_empty() {
-        target.store_batch(&batch)?;
-    }
-
-    info!(
-        "prune: complete — {} copied, {} missing out of {} live",
-        copied,
-        missing,
-        live_hashes.len()
-    );
-
-    Ok(CompactResult {
-        inner_nodes: 0,
-        leaf_nodes: copied,
-        total: copied,
-    })
+    let mut snapshot = state_map.clone();
+    let root_hash = snapshot.root_hash();
+    compact_nodestore(source, root_hash, new_path)
 }
 
 /// Verify that every node reachable from `root_hash` exists in `store`.
@@ -207,7 +207,12 @@ pub fn verify_nodestore(
     store: &Arc<dyn NodeStore>,
     root_hash: [u8; 32],
 ) -> std::io::Result<CompactResult> {
-    let result = walk_reachable(store, root_hash, |_hash, _data| Ok(()))?;
+    let result = walk_reachable(
+        store,
+        root_hash,
+        NodeObjectType::AccountNode,
+        |_hash, _data| Ok(()),
+    )?;
     info!(
         "prune: verified {} reachable nodes ({} inner, {} leaf)",
         result.total, result.inner_nodes, result.leaf_nodes
@@ -379,18 +384,68 @@ mod tests {
     #[test]
     fn test_verify_nodestore_detects_all_reachable_nodes() {
         let source = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
-        let leaf_hash = [0x33; 32];
-        source.store(&leaf_hash, b"leaf").unwrap();
-
-        let mut root_data = vec![0u8; 16 * 32];
-        root_data[0..32].copy_from_slice(&leaf_hash);
-        let root_hash = [0x44; 32];
+        let (leaf_hash, leaf_data) = valid_leaf(b"leaf", 0x33);
+        source.store(&leaf_hash, &leaf_data).unwrap();
+        let (root_hash, root_data) = valid_inner(&[leaf_hash]);
         source.store(&root_hash, &root_data).unwrap();
 
         let result = verify_nodestore(&source, root_hash).unwrap();
         assert_eq!(result.inner_nodes, 1);
         assert_eq!(result.leaf_nodes, 1);
         assert_eq!(result.total, 2);
+    }
+
+    #[test]
+    fn test_compact_exact_512_byte_leaf_is_not_classified_as_inner() {
+        let source = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
+        let (hash, data) = valid_leaf(&vec![0xAA; 480], 0x66);
+        assert_eq!(data.len(), 16 * 32);
+        source.store(&hash, &data).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let result = compact_nodestore(&source, hash, &tmp.path().join("out")).unwrap();
+        assert_eq!(result.inner_nodes, 0);
+        assert_eq!(result.leaf_nodes, 1);
+        assert_eq!(result.total, 1);
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_typed_transaction_leaf() {
+        let source = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
+        let key = [0x77; 32];
+        let tx = b"tx-no-meta";
+        let mut payload = Vec::with_capacity(4 + tx.len() + key.len());
+        payload.extend_from_slice(b"TXN\0");
+        payload.extend_from_slice(tx);
+        payload.extend_from_slice(&key);
+        let hash = crate::crypto::sha512_first_half(&payload);
+
+        let mut data = tx.to_vec();
+        data.extend_from_slice(&key);
+        source.store(&hash, &data).unwrap();
+
+        let err = verify_nodestore(&source, hash).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_compact_from_shamap_walks_reachable_descendants() {
+        let backend = Arc::new(MemNodeStore::new()) as Arc<dyn NodeStore>;
+        let mut map = crate::ledger::shamap::SHAMap::with_backend(
+            crate::ledger::shamap::MapType::AccountState,
+            backend.clone(),
+        );
+        map.insert(crate::ledger::shamap::Key([0x10; 32]), b"alpha".to_vec());
+        map.insert(crate::ledger::shamap::Key([0x11; 32]), b"beta".to_vec());
+        map.root_hash();
+        map.flush_dirty().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let result = compact_from_shamap(&backend, &map, &tmp.path().join("out")).unwrap();
+        assert!(
+            result.total > result.leaf_nodes,
+            "compaction from a SHAMap must preserve reachable inner nodes too",
+        );
     }
 
     #[test]

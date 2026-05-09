@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Types support for JSON-RPC and WebSocket APIs.
 //! JSON-RPC envelope types for requests, responses, and errors.
 
 use serde::{Deserialize, Serialize};
@@ -70,12 +69,16 @@ impl RpcResponse {
     }
 
     pub fn err(error: RpcError, id: Value) -> Self {
+        Self::err_with_request(error, id, Value::Null)
+    }
+
+    pub fn err_with_request(error: RpcError, id: Value, request: Value) -> Self {
         let mut result = serde_json::json!({
             "status":        "error",
             "error":         error.code,
             "error_code":    error.error_code,
             "error_message": error.message,
-            "request":       Value::Null,
+            "request":       request,
         });
         if let (Value::Object(map), Some(extra)) = (&mut result, error.extra) {
             map.extend(extra);
@@ -106,13 +109,19 @@ impl RpcError {
             "wrongNetwork" => 4,
             "unknownCmd" => 32,
             "invalidParams" => 31,
+            "invalidTransaction" => 30,
             "forbidden" => 403,
             "actNotFound" => 19,
+            "entryNotFound" => 98,
             "txnNotFound" => 29,
             "actMalformed" => 35,
+            "notSupported" => 80,
             "internal" => 73,
             "excessiveLgrRange" => 78,
             "invalidLgrRange" => 79,
+            "noEvents" => 150,
+            "noPathRequest" => 151,
+            "badMarket" => 150,
             _ => 0,
         }
     }
@@ -135,6 +144,30 @@ impl RpcError {
         }
     }
 
+    pub fn invalid_transaction(message: &str, exception: Option<&str>) -> Self {
+        let extra = exception.map(|text| {
+            Map::from_iter([(
+                "error_exception".to_string(),
+                Value::String(text.to_string()),
+            )])
+        });
+        Self {
+            code: "invalidTransaction",
+            error_code: Self::numeric_code("invalidTransaction"),
+            message: message.to_string(),
+            extra,
+        }
+    }
+
+    pub fn not_supported(detail: &str) -> Self {
+        Self {
+            code: "notSupported",
+            error_code: Self::numeric_code("notSupported"),
+            message: detail.to_string(),
+            extra: None,
+        }
+    }
+
     pub fn forbidden(detail: &str) -> Self {
         Self {
             code: "forbidden",
@@ -153,11 +186,50 @@ impl RpcError {
         }
     }
 
+    pub fn entry_not_found(index: String) -> Self {
+        Self {
+            code: "entryNotFound",
+            error_code: Self::numeric_code("entryNotFound"),
+            message: "Entry not found.".to_string(),
+            extra: Some(Map::from_iter([(
+                "index".to_string(),
+                Value::String(index),
+            )])),
+        }
+    }
+
     pub fn internal(detail: &str) -> Self {
         Self {
             code: "internal",
             error_code: Self::numeric_code("internal"),
             message: format!("Internal error: {detail}"),
+            extra: None,
+        }
+    }
+
+    pub fn no_events() -> Self {
+        Self {
+            code: "noEvents",
+            error_code: Self::numeric_code("noEvents"),
+            message: "Current transport does not support this method.".to_string(),
+            extra: None,
+        }
+    }
+
+    pub fn no_path_request() -> Self {
+        Self {
+            code: "noPathRequest",
+            error_code: Self::numeric_code("noPathRequest"),
+            message: "No pathfinding request in progress.".to_string(),
+            extra: None,
+        }
+    }
+
+    pub fn bad_market() -> Self {
+        Self {
+            code: "badMarket",
+            error_code: Self::numeric_code("badMarket"),
+            message: "Invalid field 'taker_pays' or 'taker_gets', bad market.".to_string(),
             extra: None,
         }
     }

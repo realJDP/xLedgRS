@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Fetch and verify UNL validator publisher lists.
 //! Validator list fetch and verification for publisher-hosted UNL data.
 //!
 //! Implements the rippled ValidatorSite + ValidatorList pattern:
@@ -168,7 +167,8 @@ impl PublisherState {
 
 impl ValidatorListManager {
     pub fn new(static_validators: Vec<Vec<u8>>, threshold: u32) -> Self {
-        let effective_unl = sort_dedup_unl(static_validators.clone());
+        let static_validators = normalize_unl_keys(static_validators);
+        let effective_unl = static_validators.clone();
         Self {
             threshold: threshold.max(1),
             static_validators,
@@ -265,7 +265,10 @@ impl ValidatorListManager {
             publisher_lists,
             effective_unl: effective_unl.clone(),
             threshold: self.threshold,
-            validation_quorum: ((effective_unl.len().max(1) as u32) * 80 / 100) + 1,
+            validation_quorum: crate::consensus::validation_quorum_count(
+                effective_unl.len(),
+                Some(sort_dedup_unl(self.static_validators.clone()).len()),
+            ) as u32,
         }
     }
 
@@ -293,10 +296,13 @@ impl ValidatorListManager {
                 continue;
             }
             if let Ok(key) = hex::decode(&validator) {
+                if !is_valid_validator_public_key(&key) {
+                    continue;
+                }
                 effective.push(key);
             }
         }
-        sort_dedup_unl(effective)
+        normalize_unl_keys(effective)
     }
 
     fn effective_unl_at(&self, now: u64) -> Vec<Vec<u8>> {
@@ -379,6 +385,49 @@ fn sort_dedup_unl(mut unl: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     unl.sort();
     unl.dedup();
     unl
+}
+
+fn normalize_unl_keys(unl: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    sort_dedup_unl(
+        unl.into_iter()
+            .filter(|key| is_valid_validator_public_key(key))
+            .collect(),
+    )
+}
+
+/// Validate XRPL validator public keys before they can affect UNL or quorum.
+pub fn is_valid_validator_public_key(key: &[u8]) -> bool {
+    if key.len() != 33 {
+        return false;
+    }
+    if key[0] == 0xED {
+        let Ok(bytes) = <[u8; 32]>::try_from(&key[1..33]) else {
+            return false;
+        };
+        return ed25519_dalek::VerifyingKey::from_bytes(&bytes).is_ok();
+    }
+    secp256k1::PublicKey::from_slice(key).is_ok()
+}
+
+/// Remove validators disabled by the parent ledger NegativeUNL from a trusted UNL.
+pub fn apply_negative_unl(unl: &[Vec<u8>], disabled_validators: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let disabled: HashSet<Vec<u8>> = disabled_validators
+        .iter()
+        .filter(|key| is_valid_validator_public_key(key))
+        .cloned()
+        .collect();
+    normalize_unl_keys(
+        unl.iter()
+            .filter(|key| !disabled.contains(*key))
+            .cloned()
+            .collect(),
+    )
+}
+
+pub fn disabled_validators_from_negative_unl_raw(raw: Option<&[u8]>) -> Vec<Vec<u8>> {
+    raw.map(crate::ledger::parse_negative_unl)
+        .map(|state| normalize_unl_keys(state.disabled_validators))
+        .unwrap_or_default()
 }
 
 fn current_unix_time() -> u64 {
@@ -772,7 +821,12 @@ pub fn parse_and_verify(
     let mut validators = Vec::new();
     for v in validators_arr {
         if let Some(key_hex) = v["validation_public_key"].as_str() {
-            validators.push(key_hex.to_uppercase());
+            if hex::decode(key_hex)
+                .ok()
+                .is_some_and(|key| is_valid_validator_public_key(&key))
+            {
+                validators.push(key_hex.to_uppercase());
+            }
         }
     }
 
@@ -878,7 +932,12 @@ pub fn verify_peer_validator_list(
     let mut validators = Vec::new();
     for v in validators_arr {
         if let Some(key_hex) = v["validation_public_key"].as_str() {
-            validators.push(key_hex.to_uppercase());
+            if hex::decode(key_hex)
+                .ok()
+                .is_some_and(|key| is_valid_validator_public_key(&key))
+            {
+                validators.push(key_hex.to_uppercase());
+            }
         }
     }
 
@@ -895,10 +954,12 @@ pub fn verify_peer_validator_list(
 
 /// Convert hex-encoded validator public keys to raw bytes for the UNL.
 pub fn hex_keys_to_unl(hex_keys: &[String]) -> Vec<Vec<u8>> {
-    hex_keys
-        .iter()
-        .filter_map(|h| hex::decode(h).ok())
-        .collect()
+    normalize_unl_keys(
+        hex_keys
+            .iter()
+            .filter_map(|h| hex::decode(h).ok())
+            .collect(),
+    )
 }
 
 pub fn initial_site_statuses(
@@ -951,6 +1012,24 @@ pub fn install_validator_list_status(
         *unl.write().unwrap_or_else(|e| e.into_inner()) = update.effective_unl.clone();
     }
     status
+}
+
+pub fn refresh_shared_unl(
+    manager: &Arc<std::sync::Mutex<ValidatorListManager>>,
+    unl: &Arc<std::sync::RwLock<Vec<Vec<u8>>>>,
+) -> bool {
+    let now = current_unix_time();
+    let effective = {
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        manager.refresh_effective_unl(now);
+        manager.current_unl()
+    };
+    let mut shared = unl.write().unwrap_or_else(|e| e.into_inner());
+    if *shared == effective {
+        return false;
+    }
+    *shared = effective;
+    true
 }
 
 /// Run the validator list fetch loop.
@@ -1053,6 +1132,10 @@ pub async fn run_validator_list_fetch(
             entry.next_refresh_time = Some(queried_at.saturating_add(site_refresh_secs));
         }
 
+        if refresh_shared_unl(&manager, &unl) {
+            tracing::info!("validator list normalized shared UNL after time-based transition");
+        }
+
         let ticks = (refresh_secs / 5).max(1);
         for _ in 0..ticks {
             if shutdown.load(Ordering::Relaxed) {
@@ -1077,10 +1160,19 @@ mod tests {
         out
     }
 
-    fn signed_list_response(tamper_manifest: bool) -> (String, Vec<String>) {
+    fn secp_validator_bytes() -> Vec<u8> {
+        crate::crypto::keys::Secp256k1KeyPair::generate().public_key_bytes()
+    }
+
+    fn secp_validator_hex() -> String {
+        hex::encode_upper(secp_validator_bytes())
+    }
+
+    fn signed_list_response(tamper_manifest: bool) -> (String, Vec<String>, String) {
         let master = crate::crypto::keys::Secp256k1KeyPair::generate();
         let signing = crate::crypto::keys::Secp256k1KeyPair::generate();
         let manifest = crate::consensus::manifest::Manifest::new_signed(1, &master, &signing);
+        let validator = secp_validator_hex();
         let mut manifest_bytes = manifest.to_bytes();
         if tamper_manifest {
             let last = manifest_bytes.len() - 1;
@@ -1090,7 +1182,7 @@ mod tests {
         let blob_json = serde_json::json!({
             "sequence": 7,
             "validators": [
-                { "validation_public_key": "ED0123456789ABCDEF" }
+                { "validation_public_key": validator.clone() }
             ]
         });
         let blob_bytes = serde_json::to_vec(&blob_json).expect("blob json should serialize");
@@ -1102,23 +1194,27 @@ mod tests {
         })
         .to_string();
 
-        (response, vec![hex::encode_upper(master.public_key_bytes())])
+        (
+            response,
+            vec![hex::encode_upper(master.public_key_bytes())],
+            validator,
+        )
     }
 
     #[test]
     fn test_parse_and_verify_accepts_verified_manifest() {
-        let (response, publisher_keys) = signed_list_response(false);
+        let (response, publisher_keys, validator) = signed_list_response(false);
         let list =
             parse_and_verify(&response, &publisher_keys).expect("validator list should verify");
         assert_eq!(list.sequence, 7);
-        assert_eq!(list.validators, vec!["ED0123456789ABCDEF".to_string()]);
+        assert_eq!(list.validators, vec![validator]);
         assert!(!list.publisher_key.is_empty());
         assert_eq!(list.refresh_interval, None);
     }
 
     #[test]
     fn test_parse_and_verify_rejects_tampered_manifest_even_if_master_key_matches() {
-        let (response, publisher_keys) = signed_list_response(true);
+        let (response, publisher_keys, _) = signed_list_response(true);
         let err = parse_and_verify(&response, &publisher_keys).unwrap_err();
         assert!(
             err.to_string().contains("manifest"),
@@ -1241,13 +1337,16 @@ mod tests {
 
     #[test]
     fn test_validator_list_manager_applies_threshold_per_validator() {
-        let static_validator = vec![vec![0xAA; 33]];
+        let static_validator = vec![secp_validator_bytes()];
+        let first_only = secp_validator_hex();
+        let shared = secp_validator_hex();
+        let second_only = secp_validator_hex();
         let mut manager = ValidatorListManager::new(static_validator.clone(), 2);
         let now = 1_000u64;
 
         let first = ValidatorList {
             sequence: 1,
-            validators: vec!["11".repeat(33), "22".repeat(33)],
+            validators: vec![first_only, shared.clone()],
             publisher_key: "AA".repeat(33),
             manifest: None,
             effective: None,
@@ -1259,7 +1358,7 @@ mod tests {
 
         let second = ValidatorList {
             sequence: 1,
-            validators: vec!["22".repeat(33), "33".repeat(33)],
+            validators: vec![shared.clone(), second_only],
             publisher_key: "BB".repeat(33),
             manifest: None,
             effective: None,
@@ -1270,18 +1369,65 @@ mod tests {
             .apply(second, now)
             .expect("second list should store");
         assert_eq!(update.effective_unl.len(), 2);
-        assert!(update.effective_unl.contains(&vec![0xAA; 33]));
-        assert!(update.effective_unl.contains(&vec![0x22; 33]));
+        assert!(update.effective_unl.contains(&static_validator[0]));
+        assert!(update.effective_unl.contains(&hex::decode(shared).unwrap()));
+    }
+
+    #[test]
+    fn test_validation_quorum_uses_rippled_style_thresholds() {
+        let validators = (0..10).map(|_| secp_validator_bytes()).collect::<Vec<_>>();
+        let manager = ValidatorListManager::new(validators, 1);
+        let snapshot = manager.snapshot(1_000);
+
+        assert_eq!(snapshot.effective_unl.len(), 10);
+        assert_eq!(
+            snapshot.validation_quorum, 8,
+            "10 validators should require ceil(10 * 80%), not floor(80%) + 1"
+        );
+        assert_eq!(crate::consensus::validation_quorum_count(10, None), 8);
+    }
+
+    #[test]
+    fn test_invalid_validator_keys_do_not_affect_unl_or_quorum() {
+        let valid = secp_validator_bytes();
+        let invalid = vec![0x11; 33];
+        let manager = ValidatorListManager::new(vec![valid.clone(), invalid], 1);
+        let snapshot = manager.snapshot(1_000);
+
+        assert_eq!(snapshot.effective_unl, vec![valid]);
+        assert_eq!(snapshot.validation_quorum, 1);
+    }
+
+    #[test]
+    fn test_negative_unl_removes_disabled_validators_from_effective_unl() {
+        let first = secp_validator_bytes();
+        let second = secp_validator_bytes();
+        let third = secp_validator_bytes();
+        let original = vec![first.clone(), second.clone(), third.clone()];
+
+        let effective = apply_negative_unl(&original, &[second.clone(), vec![0x11; 33]]);
+
+        assert_eq!(effective.len(), 2);
+        assert!(effective.contains(&first));
+        assert!(!effective.contains(&second));
+        assert!(effective.contains(&third));
+        assert_eq!(
+            crate::consensus::validation_quorum_count(effective.len(), Some(original.len())),
+            2
+        );
     }
 
     #[test]
     fn test_validator_list_manager_rejects_stale_or_expired_lists() {
         let mut manager = ValidatorListManager::new(Vec::new(), 1);
         let publisher = "AA".repeat(33);
+        let current_validator = secp_validator_hex();
+        let stale_validator = secp_validator_hex();
+        let expired_validator = secp_validator_hex();
 
         let current = ValidatorList {
             sequence: 5,
-            validators: vec!["11".repeat(33)],
+            validators: vec![current_validator],
             publisher_key: publisher.clone(),
             manifest: None,
             effective: None,
@@ -1292,7 +1438,7 @@ mod tests {
 
         let stale = ValidatorList {
             sequence: 4,
-            validators: vec!["22".repeat(33)],
+            validators: vec![stale_validator],
             publisher_key: publisher.clone(),
             manifest: None,
             effective: None,
@@ -1303,7 +1449,7 @@ mod tests {
 
         let expired = ValidatorList {
             sequence: 6,
-            validators: vec!["33".repeat(33)],
+            validators: vec![expired_validator],
             publisher_key: "BB".repeat(33),
             manifest: None,
             effective: None,
@@ -1316,11 +1462,13 @@ mod tests {
     #[test]
     fn test_future_effective_list_does_not_replace_current_until_effective() {
         let publisher = "AA".repeat(33);
+        let current_validator = secp_validator_hex();
+        let future_validator = secp_validator_hex();
         let mut manager = ValidatorListManager::new(Vec::new(), 1);
 
         let current = ValidatorList {
             sequence: 5,
-            validators: vec!["11".repeat(33)],
+            validators: vec![current_validator],
             publisher_key: publisher.clone(),
             manifest: None,
             effective: None,
@@ -1333,7 +1481,7 @@ mod tests {
 
         let future = ValidatorList {
             sequence: 6,
-            validators: vec!["22".repeat(33)],
+            validators: vec![future_validator],
             publisher_key: publisher.clone(),
             manifest: None,
             effective: Some(200),

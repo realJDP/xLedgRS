@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Directory support for XRPL ledger state and SHAMap logic.
 //! DirectoryNode — ownership tracking in the XRP Ledger state tree.
 //!
 //! Every account has an "owner directory" that lists all objects it owns
@@ -35,6 +34,12 @@ const DIR_NODE_SPACE: [u8; 2] = [0x00, 0x64];
 /// Namespace for book directory root keys: 'B' = 0x42.
 #[allow(dead_code)]
 const BOOK_DIR_SPACE: [u8; 2] = [0x00, 0x42];
+/// Namespace for NFT buy offer directories: 'h' = 0x68.
+const NFT_BUY_OFFERS_SPACE: [u8; 2] = [0x00, 0x68];
+/// Namespace for NFT sell offer directories: 'i' = 0x69.
+const NFT_SELL_OFFERS_SPACE: [u8; 2] = [0x00, 0x69];
+const LSF_NFTOKEN_BUY_OFFERS: u32 = 0x0000_0001;
+const LSF_NFTOKEN_SELL_OFFERS: u32 = 0x0000_0002;
 
 // ── Key computation ──────────────────────────────────────────────────────────
 
@@ -49,12 +54,15 @@ pub fn owner_dir_key(account_id: &[u8; 20]) -> Key {
 
 /// Compute the quality-0 root key for a book directory.
 pub fn book_dir_root_key(book: &BookKey) -> Key {
-    let mut data = [0u8; 82]; // 2 + 20 + 20 + 20 + 20
-    data[..2].copy_from_slice(&BOOK_DIR_SPACE);
-    data[2..22].copy_from_slice(&book.pays_currency);
-    data[22..42].copy_from_slice(&book.gets_currency);
-    data[42..62].copy_from_slice(&book.pays_issuer);
-    data[62..82].copy_from_slice(&book.gets_issuer);
+    let mut data = Vec::with_capacity(114);
+    data.extend_from_slice(&BOOK_DIR_SPACE);
+    data.extend_from_slice(&book.pays_currency);
+    data.extend_from_slice(&book.gets_currency);
+    data.extend_from_slice(&book.pays_issuer);
+    data.extend_from_slice(&book.gets_issuer);
+    if let Some(domain_id) = book.domain_id {
+        data.extend_from_slice(&domain_id);
+    }
     let mut root = sha512_first_half(&data);
     root[24..32].copy_from_slice(&0u64.to_be_bytes());
     Key(root)
@@ -167,6 +175,28 @@ pub fn page_key(root_key: &[u8; 32], page: u64) -> Key {
     Key(sha512_first_half(&data))
 }
 
+pub fn nft_buy_offers_dir_key(nftoken_id: &[u8; 32]) -> Key {
+    let mut data = [0u8; 34];
+    data[..2].copy_from_slice(&NFT_BUY_OFFERS_SPACE);
+    data[2..].copy_from_slice(nftoken_id);
+    Key(sha512_first_half(&data))
+}
+
+pub fn nft_sell_offers_dir_key(nftoken_id: &[u8; 32]) -> Key {
+    let mut data = [0u8; 34];
+    data[..2].copy_from_slice(&NFT_SELL_OFFERS_SPACE);
+    data[2..].copy_from_slice(nftoken_id);
+    Key(sha512_first_half(&data))
+}
+
+pub fn nft_offer_dir_key(nftoken_id: &[u8; 32], sell: bool) -> Key {
+    if sell {
+        nft_sell_offers_dir_key(nftoken_id)
+    } else {
+        nft_buy_offers_dir_key(nftoken_id)
+    }
+}
+
 // ── DirectoryNode ────────────────────────────────────────────────────────────
 
 /// A directory node SLE from the XRP Ledger state tree.
@@ -217,11 +247,20 @@ pub struct DirectoryNode {
 
 impl DirectoryNode {
     fn encoded_indexes(&self) -> Vec<[u8; 32]> {
-        let mut indexes = self.indexes.clone();
-        if self.owner.is_some() {
-            indexes.sort();
+        self.indexes.clone()
+    }
+
+    fn flags(&self) -> u32 {
+        let Some(nftoken_id) = self.nftoken_id else {
+            return 0;
+        };
+        if self.root_index == nft_buy_offers_dir_key(&nftoken_id).0 {
+            LSF_NFTOKEN_BUY_OFFERS
+        } else if self.root_index == nft_sell_offers_dir_key(&nftoken_id).0 {
+            LSF_NFTOKEN_SELL_OFFERS
+        } else {
+            0
         }
-        indexes
     }
 
     pub fn to_sle_binary(&self) -> Vec<u8> {
@@ -236,8 +275,9 @@ impl DirectoryNode {
             raw.clone(),
         );
 
-        // Flags — directories always have flags=0
-        sle.set_flags(0);
+        // Flags — owner/book directories use 0; NFT offer directories use
+        // lsfNFTokenBuyOffers / lsfNFTokenSellOffers.
+        sle.set_flags(self.flags());
 
         // PreviousTxnID / PreviousTxnLgrSeq (optional)
         if let Some(ref txn_id) = self.previous_txn_id {
@@ -379,7 +419,7 @@ impl DirectoryNode {
             taker_gets_currency: Some(book.gets_currency),
             taker_gets_issuer: Some(book.gets_issuer),
             nftoken_id: None,
-            domain_id: None,
+            domain_id: book.domain_id,
             previous_txn_id: None,
             previous_txn_lgr_seq: None,
             has_index_next: false,
@@ -404,6 +444,54 @@ impl DirectoryNode {
             taker_gets_currency: Some(book.gets_currency),
             taker_gets_issuer: Some(book.gets_issuer),
             nftoken_id: None,
+            domain_id: book.domain_id,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        }
+    }
+
+    pub fn new_nft_offer_root(nftoken_id: &[u8; 32], sell: bool) -> Self {
+        let k = nft_offer_dir_key(nftoken_id, sell);
+        Self {
+            key: k.0,
+            root_index: k.0,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: Some(*nftoken_id),
+            domain_id: None,
+            previous_txn_id: None,
+            previous_txn_lgr_seq: None,
+            has_index_next: false,
+            has_index_previous: false,
+            raw_sle: None,
+        }
+    }
+
+    pub fn new_nft_offer_page(root_key: &[u8; 32], page: u64, nftoken_id: &[u8; 32]) -> Self {
+        let k = page_key(root_key, page);
+        Self {
+            key: k.0,
+            root_index: *root_key,
+            indexes: Vec::new(),
+            index_next: 0,
+            index_previous: 0,
+            owner: None,
+            exchange_rate: None,
+            taker_pays_currency: None,
+            taker_pays_issuer: None,
+            taker_gets_currency: None,
+            taker_gets_issuer: None,
+            nftoken_id: Some(*nftoken_id),
             domain_id: None,
             previous_txn_id: None,
             previous_txn_lgr_seq: None,
@@ -448,9 +536,9 @@ impl DirectoryNode {
         out.push(0x11);
         out.extend_from_slice(&0x0064u16.to_be_bytes());
 
-        // type=2 (UInt32), field=2: Flags = 0 (directories always have flags=0)
+        // type=2 (UInt32), field=2: Flags
         out.push(0x22);
-        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&self.flags().to_be_bytes());
 
         // type=2 (UInt32), field=5: PreviousTxnLgrSeq (optional)
         if let Some(seq) = self.previous_txn_lgr_seq {
@@ -1164,6 +1252,93 @@ pub fn dir_add_book(
     (root_key, new_page_num)
 }
 
+pub fn dir_add_nft_offer(
+    state: &mut LedgerState,
+    nftoken_id: &[u8; 32],
+    sell: bool,
+    entry_key: [u8; 32],
+) -> (Key, u64) {
+    let root_key = nft_offer_dir_key(nftoken_id, sell);
+
+    if load_directory_fresh(state, &root_key).is_none() {
+        let mut root = DirectoryNode::new_nft_offer_root(nftoken_id, sell);
+        root.indexes.push(entry_key);
+        state.insert_directory(root);
+        return (root_key, 0);
+    }
+
+    let root = load_directory_fresh(state, &root_key).unwrap();
+    let last_page_num = root.index_previous;
+    let last_key = page_key(&root_key.0, last_page_num);
+    let last = match load_directory_fresh(state, &last_key) {
+        Some(d) => d,
+        None => {
+            let mut updated = root;
+            updated.indexes.push(entry_key);
+            updated.raw_sle = None;
+            state.insert_directory(updated);
+            return (root_key, 0);
+        }
+    };
+
+    if last.indexes.len() < DIR_NODE_MAX_ENTRIES {
+        let mut updated = last;
+        updated.indexes.push(entry_key);
+        updated.raw_sle = None;
+        state.insert_directory(updated);
+        return (root_key, last_page_num);
+    }
+
+    let new_page_num = if last_page_num == 0 {
+        if root.index_next == 0 {
+            1
+        } else {
+            let mut highest = root.index_next;
+            loop {
+                let pk = page_key(&root_key.0, highest);
+                if let Some(p) = load_directory_fresh(state, &pk) {
+                    if p.index_next == 0 {
+                        break;
+                    }
+                    highest = p.index_next;
+                } else {
+                    break;
+                }
+            }
+            highest + 1
+        }
+    } else {
+        last_page_num + 1
+    };
+
+    let mut new_page = DirectoryNode::new_nft_offer_page(&root_key.0, new_page_num, nftoken_id);
+    new_page.indexes.push(entry_key);
+    if new_page_num != 1 {
+        new_page.index_previous = last_page_num;
+    }
+
+    if last_page_num == 0 {
+        let mut root_updated = root;
+        root_updated.index_next = new_page_num;
+        root_updated.index_previous = new_page_num;
+        root_updated.raw_sle = None;
+        state.insert_directory(root_updated);
+    } else {
+        let mut old_last = last;
+        old_last.index_next = new_page_num;
+        old_last.raw_sle = None;
+        state.insert_directory(old_last);
+
+        let mut root_updated = root;
+        root_updated.index_previous = new_page_num;
+        root_updated.raw_sle = None;
+        state.insert_directory(root_updated);
+    }
+
+    state.insert_directory(new_page);
+    (root_key, new_page_num)
+}
+
 /// Remove an entry from an account's owner directory.
 ///
 /// Searches all pages for the entry. If found, removes it.
@@ -1176,6 +1351,17 @@ pub fn dir_add_book(
 pub fn dir_remove(state: &mut LedgerState, owner: &[u8; 20], entry_key: &[u8; 32]) -> bool {
     let root_key = owner_dir_key(owner);
     dir_remove_root(state, &root_key, entry_key)
+}
+
+/// Remove an entry from an account owner directory using the SLE's stored page.
+pub fn dir_remove_owner_page(
+    state: &mut LedgerState,
+    owner: &[u8; 20],
+    page_num: u64,
+    entry_key: &[u8; 32],
+) -> bool {
+    let root_key = owner_dir_key(owner);
+    dir_remove_root_page(state, &root_key, page_num, entry_key)
 }
 
 /// Remove an entry from a directory when the root key is already known.
@@ -1799,5 +1985,16 @@ mod tests {
         assert_eq!(page2.index_next, 0);
         assert_eq!(page2.indexes, vec![entry(65)]);
         assert_eq!(owner_dir_entry_count(&state, &owner), 34);
+    }
+
+    #[test]
+    fn owner_directory_encoding_preserves_append_order() {
+        let owner = acct(1);
+        let mut dir = DirectoryNode::new_owner_root(&owner);
+        dir.indexes = vec![entry(9), entry(1), entry(5)];
+
+        let decoded = DirectoryNode::decode(&dir.encode(), dir.key).expect("directory decodes");
+
+        assert_eq!(decoded.indexes, dir.indexes);
     }
 }

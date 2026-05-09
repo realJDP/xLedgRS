@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Load Manager piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -18,8 +17,14 @@ impl Node {
                 let now = std::time::Instant::now();
                 state.services.load_manager.heartbeat(now);
                 state.refresh_runtime_health(now);
+                state.services.load_manager.refresh_runtime_resource_health(
+                    crate::network::load::runtime_resource_snapshot(
+                        self.config.data_dir.as_deref(),
+                    ),
+                );
                 let _ = state.services.load_manager.run_cycle(now);
                 let after = state.services.load_manager.snapshot();
+                state.ctx.load_snapshot = after.clone();
                 let fee_changed = before.local_fee != after.local_fee
                     || before.queue_fee != after.queue_fee
                     || before.remote_fee != after.remote_fee

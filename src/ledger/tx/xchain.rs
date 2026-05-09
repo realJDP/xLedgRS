@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Xchain transaction engine logic for ledger replay.
 //! XChain bridge types — types 41-48.
 //!
 //! XChainBridge amendment is NOT active on mainnet (March 2026), so these
@@ -11,7 +10,8 @@
 //!   Type 43 (XChainClaim): may delete ClaimID SLE, dir_remove, owner_count--
 //!   Types 42, 44, 45, 46: modify existing SLEs, no directory changes
 //!
-//! All SLE content handled by metadata/diff sync.
+//! Trusted validated replay applies authoritative metadata for these txs.
+//! Local/validator apply must not report metadata-only success.
 //!
 //! (rippled: XChainBridge.cpp)
 
@@ -23,5 +23,5 @@ use super::{bridge_metadata_only_tx, ApplyResult, TxContext};
 /// owner_count) are handled by metadata application for ModifiedNode/
 /// CreatedNode/DeletedNode entries.
 pub(crate) fn apply_xchain(ctx: &TxContext) -> ApplyResult {
-    bridge_metadata_only_tx(ctx, 41, "XChain", "temUNKNOWN")
+    bridge_metadata_only_tx(ctx, 41, "XChain", "tecINCOMPLETE")
 }

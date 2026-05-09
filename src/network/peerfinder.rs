@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peerfinder support for XRPL peer networking.
 //! Peerfinder-style bootcache/livecache and slot-manager support.
 //!
 //! xLedgRSv2Beta keeps durable peer discovery state together with manager-owned
@@ -58,6 +57,15 @@ pub struct PeerfinderEntry {
 impl PeerfinderEntry {
     fn last_active_unix(&self) -> u64 {
         self.last_connected_unix.unwrap_or(self.last_seen_unix)
+    }
+
+    fn source_is_transient(&self) -> bool {
+        self.source == "inbound_slot"
+            || self.source == "outbound_slot"
+            || self.source == "connected"
+            || self.source.ends_with("_failed")
+            || self.source == "socket_closed"
+            || self.source == "redirected"
     }
 }
 
@@ -442,7 +450,7 @@ impl Peerfinder {
             failure_count: 0,
             next_attempt_unix: 0,
         });
-        if !entry.fixed {
+        if !entry.fixed && entry.source_is_transient() {
             entry.source = source;
         }
         entry.last_seen_unix = entry.last_seen_unix.max(now_unix);
@@ -480,9 +488,6 @@ impl Peerfinder {
         now_unix: u64,
     ) {
         self.note_failure(address, reason, now_unix);
-        if let Some(entry) = self.entries.get_mut(&address) {
-            entry.next_attempt_unix = now_unix;
-        }
         if let Some(runtime) = self.runtime.get_mut(&address) {
             runtime.slot_open = false;
             runtime.connected = false;
@@ -534,7 +539,7 @@ impl Peerfinder {
                 failure_count: 0,
                 next_attempt_unix: 0,
             });
-            if !entry.fixed {
+            if !entry.fixed && entry.source_is_transient() {
                 entry.source = reason;
             }
             entry.last_seen_unix = entry.last_seen_unix.max(now_unix);
@@ -798,8 +803,21 @@ mod tests {
         assert_eq!(initial[0], other);
         assert!(!initial.contains(&addr));
         peerfinder.note_disconnected(addr, "socket_closed", 160);
-        let ordered = peerfinder.ordered_addrs_at(160);
+        assert!(!peerfinder.ordered_addrs_at(160).contains(&addr));
+        let ordered = peerfinder.ordered_addrs_at(180);
         assert!(ordered.contains(&addr));
+    }
+
+    #[test]
+    fn failure_and_rediscovery_preserve_original_metadata_source() {
+        let addr: SocketAddr = "203.0.113.25:51235".parse().unwrap();
+        let mut peerfinder = Peerfinder::default();
+        peerfinder.note_discovered(addr, "peer_endpoints:198.51.100.1:51235", 100);
+        peerfinder.note_failure(addr, "dial_failed", 101);
+        peerfinder.note_discovered(addr, "peer_endpoints:198.51.100.2:51235", 102);
+        let entries = peerfinder.persisted_entries();
+        assert_eq!(entries[0].source, "peer_endpoints:198.51.100.1:51235");
+        assert_eq!(entries[0].failure_count, 1);
     }
 
     #[test]

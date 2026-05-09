@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Cluster support for XRPL peer networking.
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

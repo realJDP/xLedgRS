@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Validation support for XRPL consensus and validation.
 //! Validator validations — signed attestations that a ledger hash is final.
 //!
 //! After consensus on a transaction set, each validator applies the transactions
@@ -111,6 +110,20 @@ fn read_field_header(data: &[u8]) -> Option<((u8, u8), usize)> {
         consumed += 1;
     }
     Some(((type_code, field_code), consumed))
+}
+
+fn skip_fixed(data: &[u8], pos: &mut usize, len: usize) -> Option<()> {
+    if (*pos).checked_add(len)? > data.len() {
+        return None;
+    }
+    *pos += len;
+    Some(())
+}
+
+fn skip_vl(data: &[u8], pos: &mut usize) -> Option<()> {
+    let (vl_len, vl_consumed) = read_vl_length(&data[*pos..])?;
+    *pos = (*pos).checked_add(vl_consumed)?;
+    skip_fixed(data, pos, vl_len)
 }
 
 impl Validation {
@@ -238,6 +251,31 @@ impl Validation {
             full,
             kp.public_key_bytes(),
         );
+        v.signature = kp.sign(&v.signing_bytes());
+        v
+    }
+
+    /// Create a signed validation with an explicit ledger close time.
+    ///
+    /// `sign_time` is when this validator signed the validation, while
+    /// `close_time` is the ledger's own close time. rippled serializes both
+    /// fields when the close time is known, and they should not be conflated.
+    pub fn new_signed_with_close_time(
+        ledger_seq: u32,
+        ledger_hash: [u8; 32],
+        sign_time: u32,
+        close_time: u32,
+        full: bool,
+        kp: &crate::crypto::keys::Secp256k1KeyPair,
+    ) -> Self {
+        let mut v = Self::new_unsigned(
+            ledger_seq,
+            ledger_hash,
+            sign_time,
+            full,
+            kp.public_key_bytes(),
+        );
+        v.close_time = Some(close_time);
         v.signature = kp.sign(&v.signing_bytes());
         v
     }
@@ -383,12 +421,7 @@ impl Validation {
                 }
                 // AccountID (type=8) — VL-prefixed
                 8 => {
-                    let (vl_len, vl_consumed) = read_vl_length(&data[pos..])?;
-                    pos += vl_consumed;
-                    if pos + vl_len > data.len() {
-                        return None;
-                    }
-                    pos += vl_len;
+                    skip_vl(data, &mut pos)?;
                 }
                 // STObject end marker (type=14, field=1) or STArray end (type=15, field=1)
                 14 | 15 => {
@@ -398,6 +431,12 @@ impl Validation {
                     // Nested object or array: skipping requires a full parser.
                     return None;
                 }
+                // UInt8 (type=16) — safe fixed-width skip for unknown fields.
+                16 => skip_fixed(data, &mut pos, 1)?,
+                // Hash160 (type=17) — safe fixed-width skip for unknown fields.
+                17 => skip_fixed(data, &mut pos, 20)?,
+                // Vector256 (type=19) — VL-prefixed and safe to skip.
+                19 => skip_vl(data, &mut pos)?,
                 // Unknown type: size cannot be determined safely, so stop parsing.
                 _ => return None,
             }
@@ -487,6 +526,20 @@ mod tests {
     }
 
     #[test]
+    fn signed_with_close_time_separates_signing_and_ledger_close_times() {
+        let kp = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let v = Validation::new_signed_with_close_time(9, [0x42; 32], 1200, 1100, true, &kp);
+        assert_eq!(v.sign_time, 1200);
+        assert_eq!(v.close_time, Some(1100));
+        assert!(v.verify_signature());
+
+        let parsed = Validation::from_bytes(&v.to_bytes()).expect("validation must parse");
+        assert_eq!(parsed.sign_time, 1200);
+        assert_eq!(parsed.close_time, Some(1100));
+        assert!(parsed.verify_signature());
+    }
+
+    #[test]
     fn test_from_bytes_minimal() {
         let v = Validation::new_unsigned(1, [0u8; 32], 0, false, vec![0x02; 33]);
         let bytes = v.to_bytes();
@@ -496,5 +549,21 @@ mod tests {
         assert_eq!(parsed.ledger_hash, v.ledger_hash);
         assert_eq!(parsed.close_time, None);
         assert_eq!(parsed.cookie, None);
+    }
+
+    #[test]
+    fn test_signed_with_close_time_distinguishes_signing_time() {
+        let kp = crate::crypto::keys::Secp256k1KeyPair::generate();
+        let validation =
+            Validation::new_signed_with_close_time(9, [0xAA; 32], 1_000, 900, true, &kp);
+
+        assert_eq!(validation.sign_time, 1_000);
+        assert_eq!(validation.close_time, Some(900));
+        assert!(validation.verify_signature());
+
+        let parsed = Validation::from_bytes(&validation.to_bytes()).expect("parse validation");
+        assert_eq!(parsed.sign_time, 1_000);
+        assert_eq!(parsed.close_time, Some(900));
+        assert!(parsed.verify_signature());
     }
 }

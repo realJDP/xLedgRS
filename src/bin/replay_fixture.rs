@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Replay Fixture diagnostic utility for parity investigation.
 //! Offline replay harness for engine-divergence debugging.
 //!
 //! Loads a forensic bundle produced by the follower's capture path and runs
@@ -101,6 +100,12 @@ struct Args {
     /// keys instead of relying only on the bundle reference.
     #[arg(long)]
     reference_jsonl: Option<PathBuf>,
+
+    /// Fail if the captured ledger would use any validated replay bridge.
+    /// This mode is for production-parity proof fixtures where local engine
+    /// execution must stand on its own instead of being masked by metadata.
+    #[arg(long, alias = "no-authoritative-bridges", default_value_t = false)]
+    forbid_authoritative_bridges: bool,
 }
 
 struct ReplayStep {
@@ -109,13 +114,6 @@ struct ReplayStep {
     tx_index: u32,
     nodes: Vec<xrpl::ledger::meta::AffectedNode>,
     meta_summary: xrpl::ledger::meta::MetadataSummary,
-}
-
-struct TxTouchRecord {
-    tx_index: u32,
-    tx_type: String,
-    ter: String,
-    touched_keys: Vec<Key>,
 }
 
 fn offer_create_metadata_looks_like_amm_crossing(
@@ -160,6 +158,59 @@ fn payment_metadata_looks_like_amm_self_swap(
         ) => currency != send_max_currency || issuer != send_max_issuer,
         _ => false,
     }
+}
+
+#[derive(Debug, Default)]
+struct BridgeScan {
+    offer_create_amm: usize,
+    payment_amm_self_swap: usize,
+}
+
+impl BridgeScan {
+    fn total(&self) -> usize {
+        self.offer_create_amm + self.payment_amm_self_swap
+    }
+}
+
+fn scan_authoritative_replay_bridges(steps: &[ReplayStep]) -> anyhow::Result<BridgeScan> {
+    let mut scan = BridgeScan::default();
+    for step in steps {
+        let parsed = parse_blob(&step.blob).map_err(|e| {
+            anyhow::anyhow!(
+                "parse_blob failed while scanning bridge usage for tx {} at index {}: {:?}",
+                hex::encode_upper(&step.tx_id[..4]),
+                step.tx_index,
+                e,
+            )
+        })?;
+        if parsed.tx_type == 7 && offer_create_metadata_looks_like_amm_crossing(&step.nodes) {
+            scan.offer_create_amm += 1;
+        }
+        if step.meta_summary.result == Some(xrpl::ledger::ter::TES_SUCCESS)
+            && payment_metadata_looks_like_amm_self_swap(&parsed, &step.nodes)
+        {
+            scan.payment_amm_self_swap += 1;
+        }
+    }
+    Ok(scan)
+}
+
+fn ensure_no_authoritative_replay_bridges(steps: &[ReplayStep]) -> anyhow::Result<()> {
+    let scan = scan_authoritative_replay_bridges(steps)?;
+    if scan.total() == 0 {
+        info!(
+            "no-bridge replay gate: scanned {} transactions; no authoritative replay bridge candidates",
+            steps.len(),
+        );
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "no-bridge replay gate failed: {} transaction(s) require authoritative replay bridges (offer_create_amm={}, payment_amm_self_swap={})",
+        scan.total(),
+        scan.offer_create_amm,
+        scan.payment_amm_self_swap,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -689,95 +740,6 @@ fn log_object_snapshot(label: &str, key: Key, raw: Option<&[u8]>) {
     }
 }
 
-fn log_first_three_way_object_mismatch(
-    records: &[TxTouchRecord],
-    local_state: &LedgerState,
-    authoritative_state: &LedgerState,
-    rippled_reference: &std::collections::HashMap<[u8; 32], Vec<u8>>,
-) {
-    let report = |tx_index: Option<u32>, tx_type: Option<&str>, ter: Option<&str>, key: Key| {
-        let local = local_state.get_raw_owned(&key);
-        let authoritative = authoritative_state.get_raw_owned(&key);
-        let reference = rippled_reference.get(&key.0).cloned();
-        if local == authoritative && local.as_ref() == reference.as_ref() {
-            return false;
-        }
-
-        let class_name = object_class_name(
-            key,
-            local
-                .as_deref()
-                .or(authoritative.as_deref())
-                .or(reference.as_deref()),
-        );
-        let pair_tag = match (
-            local.as_ref() == authoritative.as_ref(),
-            local.as_ref() == reference.as_ref(),
-            authoritative.as_ref() == reference.as_ref(),
-        ) {
-            (true, true, true) => "all_equal",
-            (false, false, false) => "local!=auth!=ref",
-            (false, true, false) => "local!=auth",
-            (false, false, true) => "local!=ref",
-            (true, false, false) => "auth!=ref",
-            (true, true, false) => "auth!=ref",
-            (true, false, true) => "local!=ref",
-            (false, true, true) => "local!=auth",
-        };
-
-        error!(
-            "FIRST OBJECT MISMATCH: tx_index={} tx_type={} ter={} key={} class={} pair={}",
-            tx_index
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "<unknown>".into()),
-            tx_type.unwrap_or("<unknown>"),
-            ter.unwrap_or("<unknown>"),
-            hex::encode_upper(key.0),
-            class_name,
-            pair_tag,
-        );
-        log_object_snapshot("local", key, local.as_deref());
-        log_object_snapshot("authoritative", key, authoritative.as_deref());
-        log_object_snapshot("rippled", key, reference.as_deref());
-        true
-    };
-
-    for record in records {
-        for key in &record.touched_keys {
-            if report(
-                Some(record.tx_index),
-                Some(&record.tx_type),
-                Some(&record.ter),
-                *key,
-            ) {
-                return;
-            }
-        }
-    }
-
-    let mut all_keys = std::collections::BTreeSet::<Key>::new();
-    all_keys.extend(
-        local_state
-            .iter_raw_entries()
-            .into_iter()
-            .map(|(key, _)| key),
-    );
-    all_keys.extend(
-        authoritative_state
-            .iter_raw_entries()
-            .into_iter()
-            .map(|(key, _)| key),
-    );
-    all_keys.extend(rippled_reference.keys().copied().map(Key));
-    for key in all_keys {
-        if report(None, None, None, key) {
-            return;
-        }
-    }
-
-    warn!("no 3-way object mismatch found after hash mismatch");
-}
-
 fn log_first_full_state_mismatch(
     result: &ReplayResult,
     local_state: &LedgerState,
@@ -882,8 +844,12 @@ fn scan_for_first_divergent_tx(
     prestate: &std::collections::HashMap<[u8; 32], Vec<u8>>,
     tx_blobs: &[(Vec<u8>, Vec<u8>)],
     _rippled_reference: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+    forbid_authoritative_bridges: bool,
 ) -> anyhow::Result<bool> {
     let steps = build_replay_steps(tx_blobs)?;
+    if forbid_authoritative_bridges {
+        ensure_no_authoritative_replay_bridges(&steps)?;
+    }
     let mut local_state = seed_state_from_prestate(prestate);
     let mut authoritative_state = seed_state_from_prestate(prestate);
     let mut masked_engine_divergences = 0usize;
@@ -906,14 +872,18 @@ fn scan_for_first_divergent_tx(
                 parsed.tx_type,
             );
         }
+        let use_offer_create_amm_bridge =
+            parsed.tx_type == 7 && offer_create_metadata_looks_like_amm_crossing(&step.nodes);
+        let use_payment_amm_self_swap_bridge = step.meta_summary.result
+            == Some(xrpl::ledger::ter::TES_SUCCESS)
+            && payment_metadata_looks_like_amm_self_swap(&parsed, &step.nodes);
         let replay_ctx = TxContext {
             validated_result: step.meta_summary.result,
             validated_delivered_amount: step.meta_summary.delivered_amount.clone(),
-            validated_offer_create_amm_bridge: parsed.tx_type == 7
-                && offer_create_metadata_looks_like_amm_crossing(&step.nodes),
-            validated_payment_amm_self_swap_bridge: step.meta_summary.result
-                == Some(xrpl::ledger::ter::TES_SUCCESS)
-                && payment_metadata_looks_like_amm_self_swap(&parsed, &step.nodes),
+            validated_offer_create_amm_bridge: use_offer_create_amm_bridge
+                && !forbid_authoritative_bridges,
+            validated_payment_amm_self_swap_bridge: use_payment_amm_self_swap_bridge
+                && !forbid_authoritative_bridges,
             ..TxContext::from_parent(anchor_header, validated_header.close_time)
         };
         let local_result = run_tx(
@@ -1279,6 +1249,17 @@ async fn main() -> anyhow::Result<()> {
     let metadata_affected_keys = collect_metadata_affected_keys(&tx_blobs);
     let has_authoritative_overrides =
         !created_overrides.is_empty() || !modified_overrides.is_empty();
+    if args.forbid_authoritative_bridges {
+        let steps = build_replay_steps(&tx_blobs)?;
+        ensure_no_authoritative_replay_bridges(&steps)?;
+        if has_authoritative_overrides {
+            anyhow::bail!(
+                "no-bridge replay gate failed: bundle contains authoritative overrides (created={} modified={})",
+                created_overrides.len(),
+                modified_overrides.len(),
+            );
+        }
+    }
     if args.live_reference {
         enrich_rippled_reference_from_live(
             &mut rippled_reference,
@@ -1909,6 +1890,7 @@ async fn main() -> anyhow::Result<()> {
         &prestate,
         &tx_blobs,
         &comparison_reference,
+        args.forbid_authoritative_bridges,
     )? {
         return Ok(());
     }

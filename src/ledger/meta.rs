@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Meta support for XRPL ledger state and SHAMap logic.
 //! Binary transaction metadata parser.
 //!
 //! Parses XRPL binary metadata blobs to extract `AffectedNodes` entries with
@@ -339,21 +338,31 @@ pub fn build_sle(
             add_default_vector256(&mut fields, 19, 1);
         }
         0x0072 => {
-            // RippleState: LowNode, HighNode
-            add_default_u64(&mut fields, 3, 7, 0); // sfLowNode
-            add_default_u64(&mut fields, 3, 8, 0); // sfHighNode
+            // RippleState: node indexes are optional in rippled and must not
+            // be synthesized when metadata omits them.
         }
         0x0043 => {
-            // Check: OwnerNode
+            // Check: OwnerNode, DestinationNode
             add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+            add_default_u64(&mut fields, 3, 9, 0); // sfDestinationNode
+        }
+        0x0049 => {
+            // DID: OwnerNode
+            add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+        }
+        0x0053 => {
+            // SignerList: OwnerNode and default SignerListID.
+            add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+            add_default_u32(&mut fields, 2, 38, 0); // sfSignerListID
         }
         0x0075 => {
             // Escrow: OwnerNode
             add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
         }
         0x0078 => {
-            // PayChannel: OwnerNode
+            // PayChannel: OwnerNode, DestinationNode
             add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+            add_default_u64(&mut fields, 3, 9, 0); // sfDestinationNode
         }
         0x0070 => {
             // DepositPreauth: OwnerNode
@@ -367,6 +376,36 @@ pub fn build_sle(
             // NFTokenOffer: OwnerNode, NFTokenOfferNode
             add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
             add_default_u64(&mut fields, 3, 12, 0); // sfNFTokenOfferNode
+        }
+        0x0079 => {
+            // AMM: TradingFee defaults to zero; OwnerNode is required.
+            add_default_u16(&mut fields, 1, 5, 0); // sfTradingFee
+            add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+        }
+        0x007e => {
+            // MPTokenIssuance required/default fields.
+            add_default_u16(&mut fields, 1, 4, 0); // sfTransferFee
+            add_default_u8(&mut fields, 16, 5, 0); // sfAssetScale
+            add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+            add_default_u64(&mut fields, 3, 25, 0); // sfOutstandingAmount
+            add_default_u32(&mut fields, 2, 53, 0); // sfMutableFlags
+        }
+        0x007f => {
+            // MPToken required/default fields.
+            add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+            add_default_u64(&mut fields, 3, 26, 0); // sfMPTAmount
+        }
+        0x0080 => {
+            // Oracle: OwnerNode
+            add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
+        }
+        0x0081 => {
+            // Credential: IssuerNode
+            add_default_u64(&mut fields, 3, 27, 0); // sfIssuerNode
+        }
+        0x0083 => {
+            // Delegate: OwnerNode
+            add_default_u64(&mut fields, 3, 4, 0); // sfOwnerNode
         }
         _ => {}
     }
@@ -396,6 +435,20 @@ pub fn build_sle(
     serialize_fields(&mut fields)
 }
 
+/// Add a default UInt16 field if not already present.
+fn add_default_u16(fields: &mut Vec<ParsedField>, tc: u16, fc: u16, val: u16) {
+    if !fields
+        .iter()
+        .any(|f| f.type_code == tc && f.field_code == fc)
+    {
+        fields.push(ParsedField {
+            type_code: tc,
+            field_code: fc,
+            data: val.to_be_bytes().to_vec(),
+        });
+    }
+}
+
 /// Add a default UInt32 field if not already present.
 fn add_default_u32(fields: &mut Vec<ParsedField>, tc: u16, fc: u16, val: u32) {
     if !fields
@@ -406,6 +459,20 @@ fn add_default_u32(fields: &mut Vec<ParsedField>, tc: u16, fc: u16, val: u32) {
             type_code: tc,
             field_code: fc,
             data: val.to_be_bytes().to_vec(),
+        });
+    }
+}
+
+/// Add a default UInt8 field if not already present.
+fn add_default_u8(fields: &mut Vec<ParsedField>, tc: u16, fc: u16, val: u8) {
+    if !fields
+        .iter()
+        .any(|f| f.type_code == tc && f.field_code == fc)
+    {
+        fields.push(ParsedField {
+            type_code: tc,
+            field_code: fc,
+            data: vec![val],
         });
     }
 }
@@ -867,7 +934,12 @@ fn write_stobject_field(buf: &mut Vec<u8>, field_code: u16, fields: &[ParsedFiel
     buf.push(0xE1);
 }
 
-pub fn encode_metadata(result_code: i32, tx_index: u32, nodes: &[AffectedNode]) -> Vec<u8> {
+pub fn encode_metadata(
+    result_code: i32,
+    tx_index: u32,
+    nodes: &[AffectedNode],
+    delivered_amount: Option<&crate::transaction::amount::Amount>,
+) -> Vec<u8> {
     // rippled sorts AffectedNodes by LedgerIndex before serializing (TxMeta.cpp:207-209)
     let mut sorted_nodes: Vec<&AffectedNode> = nodes.iter().collect();
     sorted_nodes.sort_by_key(|n| n.ledger_index);
@@ -879,6 +951,11 @@ pub fn encode_metadata(result_code: i32, tx_index: u32, nodes: &[AffectedNode]) 
 
     write_field_header(&mut out, 2, 28);
     out.extend_from_slice(&tx_index.to_be_bytes());
+
+    if let Some(amount) = delivered_amount {
+        write_field_header(&mut out, 6, 18);
+        out.extend_from_slice(&amount.to_bytes());
+    }
 
     write_field_header(&mut out, 15, 8);
     for node in &sorted_nodes {
@@ -892,13 +969,15 @@ pub fn encode_metadata(result_code: i32, tx_index: u32, nodes: &[AffectedNode]) 
         write_field_header(&mut out, 1, 1);
         out.extend_from_slice(&node.entry_type.to_be_bytes());
 
-        if let Some(seq) = node.prev_txn_lgrseq {
-            write_field_header(&mut out, 2, 5);
-            out.extend_from_slice(&seq.to_be_bytes());
-        }
-        if let Some(prev_txn_id) = node.prev_txn_id {
-            write_field_header(&mut out, 5, 5);
-            out.extend_from_slice(&prev_txn_id);
+        if node.action == Action::Modified {
+            if let Some(seq) = node.prev_txn_lgrseq {
+                write_field_header(&mut out, 2, 5);
+                out.extend_from_slice(&seq.to_be_bytes());
+            }
+            if let Some(prev_txn_id) = node.prev_txn_id {
+                write_field_header(&mut out, 5, 5);
+                out.extend_from_slice(&prev_txn_id);
+            }
         }
 
         write_field_header(&mut out, 5, 6);
@@ -908,19 +987,27 @@ pub fn encode_metadata(result_code: i32, tx_index: u32, nodes: &[AffectedNode]) 
         match node.action {
             Action::Created => {
                 let filtered = crate::ledger::sfield_meta::filter_for_created(&node.fields);
-                write_stobject_field(&mut out, 8, &filtered);
+                if !filtered.is_empty() {
+                    write_stobject_field(&mut out, 8, &filtered);
+                }
             }
             Action::Deleted => {
                 let filtered = crate::ledger::sfield_meta::filter_for_deleted_final(&node.fields);
-                write_stobject_field(&mut out, 7, &filtered);
+                if !filtered.is_empty() {
+                    write_stobject_field(&mut out, 7, &filtered);
+                }
             }
             Action::Modified => {
                 let prev_filtered =
                     crate::ledger::sfield_meta::filter_for_modified_previous(&node.previous_fields);
                 let final_filtered =
                     crate::ledger::sfield_meta::filter_for_modified_final(&node.fields);
-                write_stobject_field(&mut out, 6, &prev_filtered);
-                write_stobject_field(&mut out, 7, &final_filtered);
+                if !prev_filtered.is_empty() {
+                    write_stobject_field(&mut out, 6, &prev_filtered);
+                }
+                if !final_filtered.is_empty() {
+                    write_stobject_field(&mut out, 7, &final_filtered);
+                }
             }
         }
 
@@ -1042,9 +1129,15 @@ fn read_field_data(data: &[u8], pos: usize, tc: u16) -> (Vec<u8>, usize) {
         9 => read_fixed(data, pos, 8), // NUMBER (64-bit on wire, same as UInt64)
         16 => read_fixed(data, pos, 1), // UInt8
         17 => read_fixed(data, pos, 20), // Hash160
-        18 => read_fixed(data, pos, 32), // Hash384 / UInt384 — rare but 32 bytes on wire
-        20 => read_fixed(data, pos, 32), // UINT256 (for ISSUE type — 32 bytes)
+        18 => {
+            // PathSet: variable, terminated by 0x00.
+            let end = skip_field_raw(data, pos, 18);
+            (data[pos..end].to_vec(), end.saturating_sub(pos))
+        }
+        20 => read_fixed(data, pos, 12), // UInt96
         21 => read_fixed(data, pos, 24), // UINT192
+        22 => read_fixed(data, pos, 48), // UINT384
+        23 => read_fixed(data, pos, 64), // UINT512
         24 => {
             // ISSUE — variable length: 20 bytes (XRP), 40 bytes (IOU), 44 bytes (MPT).
             // First 20 bytes: currency-or-issuer. If all zeros → XRP (20 bytes).
@@ -1231,14 +1324,15 @@ pub(crate) fn skip_field_raw(data: &[u8], pos: usize, tc: u16) -> usize {
         22 => (pos + 48).min(data.len()), // UINT384
         23 => (pos + 64).min(data.len()), // UINT512
         24 => {
-            // ISSUE: 20 bytes (XRP) or 20+20=40 bytes (IOU currency+issuer)
-            // First byte determines: if currency starts with 0x00, it's 20 bytes total
+            // ISSUE: 20 bytes (XRP), 40 bytes (IOU), or 44 bytes (MPT).
             if pos + 20 > data.len() {
                 return data.len();
             }
-            let all_zero = data[pos..pos + 20].iter().all(|&b| b == 0);
-            if all_zero {
+            let first_20 = &data[pos..pos + 20];
+            if first_20 == [0u8; 20] {
                 (pos + 20).min(data.len())
+            } else if pos + 40 <= data.len() && data[pos + 20..pos + 40] == [0u8; 20] {
+                (pos + 44).min(data.len())
             } else {
                 (pos + 40).min(data.len())
             }
@@ -1346,5 +1440,35 @@ mod tests {
         assert!(field_data_is_default(&[]));
         assert!(field_data_is_default(&[0, 0, 0]));
         assert!(!field_data_is_default(&[0, 1, 0]));
+    }
+
+    #[test]
+    fn deleted_metadata_does_not_fabricate_previous_txn_fields() {
+        let node = AffectedNode {
+            action: Action::Deleted,
+            entry_type: 0x0054,
+            ledger_index: [1u8; 32],
+            fields: vec![ParsedField {
+                type_code: 2,
+                field_code: 4,
+                data: 7u32.to_be_bytes().to_vec(),
+            }],
+            previous_fields: Vec::new(),
+            prev_txn_id: Some([2u8; 32]),
+            prev_txn_lgrseq: Some(3),
+        };
+
+        let encoded = encode_metadata(0, 0, &[node], None);
+        let parsed = parse_metadata(&encoded);
+
+        assert_eq!(parsed.len(), 1);
+        assert!(!parsed[0]
+            .fields
+            .iter()
+            .any(|field| (field.type_code, field.field_code) == (5, 5)));
+        assert!(!parsed[0]
+            .fields
+            .iter()
+            .any(|field| (field.type_code, field.field_code) == (2, 5)));
     }
 }

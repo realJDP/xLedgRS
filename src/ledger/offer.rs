@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Offer support for XRPL ledger state and SHAMap logic.
 //! Offer — a standing order on the XRPL decentralized exchange.
 //!
 //! An offer says: "I will give `taker_gets` in exchange for `taker_pays`."
@@ -19,6 +18,7 @@ use crate::transaction::amount::{Amount, IouValue};
 
 pub const LSF_PASSIVE: u32 = 0x00010000;
 pub const LSF_SELL: u32 = 0x00020000;
+pub const LSF_HYBRID: u32 = 0x00040000;
 
 /// Namespace prefix for Offer objects.
 const OFFER_SPACE: [u8; 2] = [0x00, 0x6F];
@@ -810,6 +810,8 @@ pub struct BookKey {
     pub pays_issuer: [u8; 20],
     pub gets_currency: [u8; 20],
     pub gets_issuer: [u8; 20],
+    #[serde(default)]
+    pub domain_id: Option<[u8; 32]>,
 }
 
 impl BookKey {
@@ -821,7 +823,18 @@ impl BookKey {
             pays_issuer: pi,
             gets_currency: gc,
             gets_issuer: gi,
+            domain_id: None,
         }
+    }
+
+    pub fn from_amounts_with_domain(
+        pays: &Amount,
+        gets: &Amount,
+        domain_id: Option<[u8; 32]>,
+    ) -> Self {
+        let mut key = Self::from_amounts(pays, gets);
+        key.domain_id = domain_id;
+        key
     }
 
     /// The opposite book (swap pays/gets).
@@ -831,6 +844,7 @@ impl BookKey {
             pays_issuer: self.gets_issuer,
             gets_currency: self.pays_currency,
             gets_issuer: self.pays_issuer,
+            domain_id: self.domain_id,
         }
     }
 }
@@ -851,21 +865,17 @@ fn currency_issuer(a: &Amount) -> ([u8; 20], [u8; 20]) {
 /// Uses i128 cross-multiplication (via rate_gte) instead of f64 division.
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct QualityKey {
-    pays: Amount,
-    gets: Amount,
+    quality: u64,
     seq: u32,
+    account: [u8; 20],
 }
 
 impl Ord for QualityKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let self_gte = rate_gte(&self.pays, &self.gets, &other.pays, &other.gets);
-        let other_gte = rate_gte(&other.pays, &other.gets, &self.pays, &self.gets);
-        match (self_gte, other_gte) {
-            (true, true) => self.seq.cmp(&other.seq), // equal quality — older first
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => self.seq.cmp(&other.seq), // shouldn't happen, tiebreak
-        }
+        self.quality
+            .cmp(&other.quality)
+            .then_with(|| self.seq.cmp(&other.seq))
+            .then_with(|| self.account.cmp(&other.account))
     }
 }
 
@@ -887,20 +897,12 @@ impl OrderBook {
     }
 
     pub fn insert(&mut self, offer: &Offer) {
-        let qk = QualityKey {
-            pays: offer.taker_pays.clone(),
-            gets: offer.taker_gets.clone(),
-            seq: offer.sequence,
-        };
+        let qk = quality_key(offer);
         self.offers.insert(qk, offer.key());
     }
 
     pub fn remove(&mut self, offer: &Offer) {
-        let qk = QualityKey {
-            pays: offer.taker_pays.clone(),
-            gets: offer.taker_gets.clone(),
-            seq: offer.sequence,
-        };
+        let qk = quality_key(offer);
         self.offers.remove(&qk);
     }
 
@@ -914,6 +916,24 @@ impl OrderBook {
     }
     pub fn is_empty(&self) -> bool {
         self.offers.is_empty()
+    }
+}
+
+fn quality_key(offer: &Offer) -> QualityKey {
+    QualityKey {
+        quality: stored_book_quality(offer),
+        seq: offer.sequence,
+        account: offer.account,
+    }
+}
+
+fn stored_book_quality(offer: &Offer) -> u64 {
+    if offer.book_directory != [0u8; 32] {
+        let mut quality = [0u8; 8];
+        quality.copy_from_slice(&offer.book_directory[24..32]);
+        u64::from_be_bytes(quality)
+    } else {
+        crate::ledger::directory::offer_quality(&offer.taker_gets, &offer.taker_pays)
     }
 }
 
@@ -1075,6 +1095,72 @@ mod tests {
         let keys: Vec<_> = book.iter_by_quality().collect();
         assert_eq!(keys[0], &cheap.key());
         assert_eq!(keys[1], &expensive.key());
+    }
+
+    #[test]
+    fn test_order_book_uses_stored_book_directory_quality() {
+        let mut book = OrderBook::new();
+        let book_key = BookKey::from_amounts(&xrp(1_000_000), &usd(10.0, 2));
+        let cheap_stored_quality =
+            crate::ledger::directory::offer_quality(&usd(100.0, 2), &xrp(1_000_000));
+        let expensive_stored_quality =
+            crate::ledger::directory::offer_quality(&usd(10.0, 2), &xrp(1_000_000));
+
+        let mut recomputed_cheap_but_stored_expensive = Offer {
+            account: acct(1),
+            sequence: 1,
+            taker_pays: xrp(1_000_000),
+            taker_gets: usd(100.0, 2),
+            flags: 0,
+            book_directory: crate::ledger::directory::book_dir_quality_key(
+                &book_key,
+                expensive_stored_quality,
+            )
+            .0,
+            book_node: 0,
+            owner_node: 0,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+        let mut recomputed_expensive_but_stored_cheap = Offer {
+            account: acct(2),
+            sequence: 2,
+            taker_pays: xrp(1_000_000),
+            taker_gets: usd(10.0, 2),
+            flags: 0,
+            book_directory: crate::ledger::directory::book_dir_quality_key(
+                &book_key,
+                cheap_stored_quality,
+            )
+            .0,
+            book_node: 0,
+            owner_node: 0,
+            expiration: None,
+            domain_id: None,
+            additional_books: Vec::new(),
+            previous_txn_id: [0u8; 32],
+            previous_txn_lgr_seq: 0,
+            raw_sle: None,
+        };
+
+        book.insert(&recomputed_cheap_but_stored_expensive);
+        book.insert(&recomputed_expensive_but_stored_cheap);
+
+        let keys: Vec<_> = book.iter_by_quality().collect();
+        assert_eq!(keys[0], &recomputed_expensive_but_stored_cheap.key());
+        assert_eq!(keys[1], &recomputed_cheap_but_stored_expensive.key());
+
+        // Mutating the live amounts after a partial fill must not change the
+        // removal key; rippled keeps sfBookDirectory quality fixed.
+        recomputed_expensive_but_stored_cheap.taker_gets = usd(1.0, 2);
+        recomputed_cheap_but_stored_expensive.taker_gets = usd(1_000.0, 2);
+        book.remove(&recomputed_expensive_but_stored_cheap);
+        book.remove(&recomputed_cheap_but_stored_expensive);
+        assert!(book.is_empty());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Escrow legacy transactor for XRPL transaction apply.
 use super::{check_reserve, owner_dir, TecCode, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::{LedgerEntryType, SLE};

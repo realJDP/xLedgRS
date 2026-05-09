@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Apply View Impl support for XRPL ledger state and SHAMap logic.
 //! ApplyViewImpl — per-transaction view wrapping an OpenView.
 //!
 //! Buffers mutations in ApplyStateTable, which tracks before/after state

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Mod support for XRPL consensus and validation.
 //! XRP Ledger Consensus Protocol (XRPLCP).
 //!
 //! XRPL uses a Federated Byzantine Agreement variant where each validator
@@ -19,12 +18,18 @@
 
 pub mod dispute;
 pub mod manifest;
+pub mod preferred_ledger;
 pub mod proposal;
 pub mod round;
+pub mod tx_sets;
 pub mod validation;
 
 pub use dispute::DisputedTx;
 pub use manifest::{Manifest, ManifestCache, ManifestError, REVOKE_SEQ};
+pub use preferred_ledger::{
+    validation_quorum_count, PreferredLedgerTracker, ValidatedLedgerDecision,
+};
 pub use proposal::Proposal;
-pub use round::{ConsensusMode, ConsensusPhase, ConsensusRound, RoundResult};
+pub use round::{ConsensusMode, ConsensusPhase, ConsensusRound, RoundResult, RoundTrustSnapshot};
+pub use tx_sets::{CandidateTx, ConsensusTxSet, ConsensusTxSets, TxSetDiff, TxSetImportError};
 pub use validation::Validation;

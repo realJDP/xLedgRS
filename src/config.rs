@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Parse xLedgRSv2Beta and rippled-style config files.
 //! Node configuration parsing.
 //!
 //! Supports two formats:
@@ -43,6 +42,7 @@ pub struct RuntimeConfig {
     pub grpc_addr: Option<SocketAddr>,
     pub rpc_sync: Option<String>,
     pub max_peers: Option<usize>,
+    pub route_worker_count: Option<usize>,
     pub bootstrap_peers: Vec<String>,
     pub fixed_peers: Vec<String>,
     pub data_dir: Option<PathBuf>,
@@ -52,7 +52,37 @@ pub struct RuntimeConfig {
     pub online_delete: Option<u32>,
     pub standalone: Option<bool>,
     pub enable_consensus_close_loop: Option<bool>,
+    pub allow_node_key_consensus: Option<bool>,
     pub post_sync_checkpoint_script: Option<PathBuf>,
+    pub sync: RuntimeSyncTuning,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeSyncTuning {
+    pub sync_parse_workers: Option<usize>,
+    pub sync_data_pipeline_capacity: Option<usize>,
+    pub sync_request_generation_capacity: Option<usize>,
+    pub sync_persistence_capacity: Option<usize>,
+    pub sync_data_queue_max: Option<usize>,
+    pub sync_data_queue_per_ledger: Option<usize>,
+    pub sync_data_queue_per_peer: Option<usize>,
+    pub sync_data_queue_bytes: Option<usize>,
+    pub sync_data_batch_size: Option<usize>,
+    pub peer_route_queue: Option<usize>,
+    pub sync_reply_followup_peers: Option<usize>,
+    pub sync_timeout_followup_peers: Option<usize>,
+    pub sync_timeout_retries: Option<u32>,
+    pub sync_idle_pump_after_ms: Option<u64>,
+    pub sync_completion_check_interval_ms: Option<u64>,
+    pub peer_idle_timeout_ms: Option<u64>,
+    pub slow_route_ms: Option<u64>,
+    pub slow_manifest_route_ms: Option<u64>,
+    pub severe_route_ms: Option<u64>,
+    pub object_fallback_after_timeouts: Option<u32>,
+    pub object_fallback_batch_size: Option<usize>,
+    pub object_fallback_empty_peer_cooldown_ms: Option<u64>,
+    pub shutdown_grace_ms: Option<u64>,
+    pub peer_route_drain_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +144,8 @@ struct TomlConfigFile {
     amendments: TomlAmendmentConfig,
     #[serde(default)]
     node: TomlNodeConfig,
+    #[serde(default)]
+    sync: TomlSyncTuning,
     /// `validation_seed = "sEdV19BLfe..."` in TOML.
     validation_seed: Option<String>,
     /// `validation_secret_key = "...."` in TOML.
@@ -141,6 +173,7 @@ struct TomlNodeConfig {
     grpc_addr: Option<String>,
     rpc_sync: Option<String>,
     max_peers: Option<usize>,
+    route_worker_count: Option<usize>,
     #[serde(default)]
     bootstrap_peers: Vec<String>,
     #[serde(default)]
@@ -152,7 +185,67 @@ struct TomlNodeConfig {
     online_delete: Option<u32>,
     standalone: Option<bool>,
     enable_consensus_close_loop: Option<bool>,
+    allow_node_key_consensus: Option<bool>,
     post_sync_checkpoint_script: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TomlSyncTuning {
+    sync_parse_workers: Option<usize>,
+    sync_data_pipeline_capacity: Option<usize>,
+    sync_request_generation_capacity: Option<usize>,
+    sync_persistence_capacity: Option<usize>,
+    sync_data_queue_max: Option<usize>,
+    sync_data_queue_per_ledger: Option<usize>,
+    sync_data_queue_per_peer: Option<usize>,
+    sync_data_queue_bytes: Option<usize>,
+    sync_data_batch_size: Option<usize>,
+    peer_route_queue: Option<usize>,
+    sync_reply_followup_peers: Option<usize>,
+    sync_timeout_followup_peers: Option<usize>,
+    sync_timeout_retries: Option<u32>,
+    sync_idle_pump_after_ms: Option<u64>,
+    sync_completion_check_interval_ms: Option<u64>,
+    peer_idle_timeout_ms: Option<u64>,
+    slow_route_ms: Option<u64>,
+    slow_manifest_route_ms: Option<u64>,
+    severe_route_ms: Option<u64>,
+    object_fallback_after_timeouts: Option<u32>,
+    object_fallback_batch_size: Option<usize>,
+    object_fallback_empty_peer_cooldown_ms: Option<u64>,
+    shutdown_grace_ms: Option<u64>,
+    peer_route_drain_timeout_ms: Option<u64>,
+}
+
+impl From<TomlSyncTuning> for RuntimeSyncTuning {
+    fn from(value: TomlSyncTuning) -> Self {
+        Self {
+            sync_parse_workers: value.sync_parse_workers,
+            sync_data_pipeline_capacity: value.sync_data_pipeline_capacity,
+            sync_request_generation_capacity: value.sync_request_generation_capacity,
+            sync_persistence_capacity: value.sync_persistence_capacity,
+            sync_data_queue_max: value.sync_data_queue_max,
+            sync_data_queue_per_ledger: value.sync_data_queue_per_ledger,
+            sync_data_queue_per_peer: value.sync_data_queue_per_peer,
+            sync_data_queue_bytes: value.sync_data_queue_bytes,
+            sync_data_batch_size: value.sync_data_batch_size,
+            peer_route_queue: value.peer_route_queue,
+            sync_reply_followup_peers: value.sync_reply_followup_peers,
+            sync_timeout_followup_peers: value.sync_timeout_followup_peers,
+            sync_timeout_retries: value.sync_timeout_retries,
+            sync_idle_pump_after_ms: value.sync_idle_pump_after_ms,
+            sync_completion_check_interval_ms: value.sync_completion_check_interval_ms,
+            peer_idle_timeout_ms: value.peer_idle_timeout_ms,
+            slow_route_ms: value.slow_route_ms,
+            slow_manifest_route_ms: value.slow_manifest_route_ms,
+            severe_route_ms: value.severe_route_ms,
+            object_fallback_after_timeouts: value.object_fallback_after_timeouts,
+            object_fallback_batch_size: value.object_fallback_batch_size,
+            object_fallback_empty_peer_cooldown_ms: value.object_fallback_empty_peer_cooldown_ms,
+            shutdown_grace_ms: value.shutdown_grace_ms,
+            peer_route_drain_timeout_ms: value.peer_route_drain_timeout_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -201,6 +294,7 @@ impl ConfigFile {
             grpc_addr: toml_cfg.node.grpc_addr.and_then(|s| s.parse().ok()),
             rpc_sync: toml_cfg.node.rpc_sync,
             max_peers: toml_cfg.node.max_peers,
+            route_worker_count: toml_cfg.node.route_worker_count,
             bootstrap_peers: toml_cfg.node.bootstrap_peers,
             fixed_peers: toml_cfg.node.fixed_peers,
             data_dir: toml_cfg.node.data_dir.map(|p| resolve_path(path, &p)),
@@ -218,10 +312,12 @@ impl ConfigFile {
             online_delete: toml_cfg.node.online_delete,
             standalone: toml_cfg.node.standalone,
             enable_consensus_close_loop: toml_cfg.node.enable_consensus_close_loop,
+            allow_node_key_consensus: toml_cfg.node.allow_node_key_consensus,
             post_sync_checkpoint_script: toml_cfg
                 .node
                 .post_sync_checkpoint_script
                 .map(|p| resolve_path(path, &p)),
+            sync: toml_cfg.sync.into(),
         };
 
         Self {
@@ -304,14 +400,23 @@ impl ConfigFile {
         }
         if let Some(section) = sections.get("xledgrsv2beta") {
             runtime.rpc_sync = section.values.get("rpc_sync").cloned();
+            runtime.route_worker_count = section
+                .values
+                .get("route_worker_count")
+                .and_then(|v| v.parse().ok());
             runtime.standalone = section.values.get("standalone").and_then(|v| parse_bool(v));
             runtime.enable_consensus_close_loop = section
                 .values
                 .get("enable_consensus_close_loop")
                 .and_then(|v| parse_bool(v));
+            runtime.allow_node_key_consensus = section
+                .values
+                .get("allow_node_key_consensus")
+                .and_then(|v| parse_bool(v));
             if let Some(p) = section.values.get("post_sync_checkpoint_script") {
                 runtime.post_sync_checkpoint_script = Some(resolve_path(path, p));
             }
+            apply_sync_tuning_values(&mut runtime.sync, &section.values);
         }
 
         let mut validators = Vec::new();
@@ -474,6 +579,49 @@ fn parse_network_id(value: &str) -> Option<u32> {
     }
 }
 
+fn parse_usize_value(values: &HashMap<String, String>, key: &str) -> Option<usize> {
+    values.get(key).and_then(|v| v.parse().ok())
+}
+
+fn parse_u32_value(values: &HashMap<String, String>, key: &str) -> Option<u32> {
+    values.get(key).and_then(|v| v.parse().ok())
+}
+
+fn parse_u64_value(values: &HashMap<String, String>, key: &str) -> Option<u64> {
+    values.get(key).and_then(|v| v.parse().ok())
+}
+
+fn apply_sync_tuning_values(tuning: &mut RuntimeSyncTuning, values: &HashMap<String, String>) {
+    tuning.sync_parse_workers = parse_usize_value(values, "sync_parse_workers");
+    tuning.sync_data_pipeline_capacity = parse_usize_value(values, "sync_data_pipeline_capacity");
+    tuning.sync_request_generation_capacity =
+        parse_usize_value(values, "sync_request_generation_capacity");
+    tuning.sync_persistence_capacity = parse_usize_value(values, "sync_persistence_capacity");
+    tuning.sync_data_queue_max = parse_usize_value(values, "sync_data_queue_max");
+    tuning.sync_data_queue_per_ledger = parse_usize_value(values, "sync_data_queue_per_ledger");
+    tuning.sync_data_queue_per_peer = parse_usize_value(values, "sync_data_queue_per_peer");
+    tuning.sync_data_queue_bytes = parse_usize_value(values, "sync_data_queue_bytes");
+    tuning.sync_data_batch_size = parse_usize_value(values, "sync_data_batch_size");
+    tuning.peer_route_queue = parse_usize_value(values, "peer_route_queue");
+    tuning.sync_reply_followup_peers = parse_usize_value(values, "sync_reply_followup_peers");
+    tuning.sync_timeout_followup_peers = parse_usize_value(values, "sync_timeout_followup_peers");
+    tuning.sync_timeout_retries = parse_u32_value(values, "sync_timeout_retries");
+    tuning.sync_idle_pump_after_ms = parse_u64_value(values, "sync_idle_pump_after_ms");
+    tuning.sync_completion_check_interval_ms =
+        parse_u64_value(values, "sync_completion_check_interval_ms");
+    tuning.peer_idle_timeout_ms = parse_u64_value(values, "peer_idle_timeout_ms");
+    tuning.slow_route_ms = parse_u64_value(values, "slow_route_ms");
+    tuning.slow_manifest_route_ms = parse_u64_value(values, "slow_manifest_route_ms");
+    tuning.severe_route_ms = parse_u64_value(values, "severe_route_ms");
+    tuning.object_fallback_after_timeouts =
+        parse_u32_value(values, "object_fallback_after_timeouts");
+    tuning.object_fallback_batch_size = parse_usize_value(values, "object_fallback_batch_size");
+    tuning.object_fallback_empty_peer_cooldown_ms =
+        parse_u64_value(values, "object_fallback_empty_peer_cooldown_ms");
+    tuning.shutdown_grace_ms = parse_u64_value(values, "shutdown_grace_ms");
+    tuning.peer_route_drain_timeout_ms = parse_u64_value(values, "peer_route_drain_timeout_ms");
+}
+
 fn parse_history_retention(value: &str) -> Option<HistoryRetention> {
     match value.trim().to_ascii_lowercase().as_str() {
         "none" => Some(HistoryRetention::None),
@@ -593,8 +741,17 @@ enabled = ["FlowCross", "DeletableAccounts"]
 peer_addr = "0.0.0.0:51235"
 ws_addr = "127.0.0.1:6006"
 max_peers = 42
+route_worker_count = 4
 bootstrap_peers = ["r.ripple.com:51235"]
 ledger_history = "full"
+
+[sync]
+sync_parse_workers = 8
+sync_data_queue_max = 512
+peer_route_queue = 1024
+sync_timeout_retries = 9
+peer_idle_timeout_ms = 45000
+object_fallback_after_timeouts = 2
 "#;
         let cfg = ConfigFile::load(write_temp(toml, "toml").as_path()).unwrap();
         assert_eq!(cfg.validators.len(), 1);
@@ -605,6 +762,13 @@ ledger_history = "full"
             vec!["r.ripple.com:51235".to_string()]
         );
         assert_eq!(cfg.runtime.ledger_history, Some(HistoryRetention::Full));
+        assert_eq!(cfg.runtime.route_worker_count, Some(4));
+        assert_eq!(cfg.runtime.sync.sync_parse_workers, Some(8));
+        assert_eq!(cfg.runtime.sync.sync_data_queue_max, Some(512));
+        assert_eq!(cfg.runtime.sync.peer_route_queue, Some(1024));
+        assert_eq!(cfg.runtime.sync.sync_timeout_retries, Some(9));
+        assert_eq!(cfg.runtime.sync.peer_idle_timeout_ms, Some(45_000));
+        assert_eq!(cfg.runtime.sync.object_fallback_after_timeouts, Some(2));
     }
 
     #[test]
@@ -664,6 +828,11 @@ online_delete=2048
 
 [xLedgRSv2Beta]
 enable_consensus_close_loop=1
+allow_node_key_consensus=1
+route_worker_count=3
+sync_data_batch_size=32
+slow_route_ms=250
+shutdown_grace_ms=750
 "#;
         let path = write_temp(cfg_text, "cfg");
         let cfg = ConfigFile::load(&path).unwrap();
@@ -680,6 +849,11 @@ enable_consensus_close_loop=1
         assert_eq!(cfg.runtime.online_delete, Some(2048));
         assert_eq!(cfg.runtime.fixed_peers, vec!["127.0.0.1 51235".to_string()]);
         assert_eq!(cfg.runtime.enable_consensus_close_loop, Some(true));
+        assert_eq!(cfg.runtime.allow_node_key_consensus, Some(true));
+        assert_eq!(cfg.runtime.route_worker_count, Some(3));
+        assert_eq!(cfg.runtime.sync.sync_data_batch_size, Some(32));
+        assert_eq!(cfg.runtime.sync.slow_route_ms, Some(250));
+        assert_eq!(cfg.runtime.sync.shutdown_grace_ms, Some(750));
         assert!(cfg.runtime.data_dir.unwrap().ends_with("db/nudb"));
     }
 

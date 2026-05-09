@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Close V2 support for XRPL ledger state and SHAMap logic.
 //! close_v2 — experimental ledger close using the view stack.
 //!
 //! Flow:
@@ -383,7 +382,7 @@ fn build_metadata(
             .map(|r| r.code())
             .unwrap_or(0),
     };
-    encode_metadata(result_code, tx_index, &meta_nodes)
+    encode_metadata(result_code, tx_index, &meta_nodes, None)
 }
 
 /// Update the skip list SLE, matching rippled's Ledger::updateSkipList().

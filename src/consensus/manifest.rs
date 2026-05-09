@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Manifest support for XRPL consensus and validation.
 //! Validator manifests — master-key → ephemeral-signing-key delegation.
 //!
 //! A validator's long-lived master key is kept offline ("cold").  To sign
@@ -522,6 +521,10 @@ impl ManifestCache {
         self.by_signing_key
             .get(signing)
             .map(|manifest| manifest.to_bytes())
+    }
+
+    pub fn active_manifests(&self) -> Vec<Manifest> {
+        self.by_signing_key.values().cloned().collect()
     }
 
     pub fn sequence_for_master(&self, master_pubkey: &[u8]) -> Option<u32> {

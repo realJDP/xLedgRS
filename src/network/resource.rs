@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Resource support for XRPL peer networking.
 //! Resource/load tracking for peer addresses and long-lived consumers.
 //!
 //! xLedgRSv2Beta keeps a rippled-shaped manager that owns decaying penalties,

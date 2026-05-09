@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Diff Sync support for XRPL ledger state and SHAMap logic.
 //! SHAMap differential sync — follow new validated ledgers by downloading
 //! only the changed nodes from peers.
 //!

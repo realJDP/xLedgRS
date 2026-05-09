@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Ripple Calc legacy transactor for XRPL transaction apply.
 //! RippleCalc — IOU/cross-currency payment flow engine.
 //!
 //! Matches rippled's RippleCalc (RippleCalc.cpp, StrandFlow.h).

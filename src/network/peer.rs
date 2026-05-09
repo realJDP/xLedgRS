@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peer support for XRPL peer networking.
 //! Peer connection state machine.
 //!
 //! Tracks the lifecycle of a single peer connection without doing any I/O.
@@ -154,6 +153,7 @@ pub enum PeerAction {
 // ── Peer ──────────────────────────────────────────────────────────────────────
 
 /// Connection state for a single peer.
+#[derive(Clone)]
 pub struct Peer {
     pub id: PeerId,
     pub addr: SocketAddr,

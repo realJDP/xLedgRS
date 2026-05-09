@@ -1,9 +1,3 @@
-//! Public crate surface for xLedgRSv2Beta.
-//!
-//! The binary, tests, replay tools, and diagnostics all import through this
-//! module map so they exercise the same ledger, transaction, sync, and network
-//! code paths.
-
 pub mod config;
 pub mod consensus;
 pub mod crypto;

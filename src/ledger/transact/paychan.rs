@@ -1,10 +1,12 @@
-//! xLedgRS purpose: Paychan legacy transactor for XRPL transaction apply.
 use super::{check_reserve, owner_dir, TecCode, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::{LedgerEntryType, SLE};
 use crate::ledger::views::ApplyView;
 use crate::transaction::ParsedTx;
 use std::sync::Arc;
+
+const TF_RENEW: u32 = 0x0001_0000;
+const TF_CLOSE: u32 = 0x0002_0000;
 
 pub struct PayChanCreateHandler;
 
@@ -121,6 +123,19 @@ impl TxHandler for PayChanFundHandler {
             Some(s) => s,
             None => return TER::ClaimedCost(TecCode::NoEntry),
         };
+        let src_id = chan_sle.account_id().unwrap_or([0u8; 20]);
+        let dst_id = chan_sle.get_field_account(8, 3).unwrap_or([0u8; 20]);
+        let expiration = chan_sle.get_field_u32(2, 10).unwrap_or(0);
+        let cancel_after = chan_sle.get_field_u32(2, 36).unwrap_or(0);
+        let close_time = view.info().close_time as u32;
+        if (cancel_after != 0 && close_time >= cancel_after)
+            || (expiration != 0 && close_time >= expiration)
+        {
+            return close_channel(view, &chan_keylet, &chan_sle);
+        }
+        if src_id != tx.account {
+            return TER::ClaimedCost(TecCode::Generic("tecNO_PERMISSION"));
+        }
 
         // Debit sender
         let sender_keylet = keylet::account(&tx.account);
@@ -129,9 +144,19 @@ impl TxHandler for PayChanFundHandler {
             None => return TER::LocalFail("terNO_ACCOUNT"),
         };
         let balance = sender_sle.balance_xrp().unwrap_or(0);
-        if balance < add_drops {
+        let reserve = view.fees().reserve_base
+            + (sender_sle.owner_count() as u64).saturating_mul(view.fees().reserve_inc);
+        if balance < reserve {
+            return TER::ClaimedCost(TecCode::InsufficientReserve);
+        }
+        if balance < reserve.saturating_add(add_drops) {
             return TER::ClaimedCost(TecCode::Unfunded);
         }
+
+        if view.read(&keylet::account(&dst_id)).is_none() {
+            return TER::ClaimedCost(TecCode::NoDst);
+        }
+
         let mut sender = (*sender_sle).clone();
         sender.set_balance_xrp(balance - add_drops);
         view.update(Arc::new(sender));
@@ -143,6 +168,14 @@ impl TxHandler for PayChanFundHandler {
 
         // Update expiration if provided
         if let Some(exp) = tx.expiration {
+            let settle_delay = chan.get_field_u32(2, 39).unwrap_or(0);
+            let mut min_expiration = close_time.saturating_add(settle_delay);
+            if expiration != 0 && expiration < min_expiration {
+                min_expiration = expiration;
+            }
+            if exp < min_expiration {
+                return TER::Malformed("temBAD_EXPIRATION");
+            }
             chan.set_field_u32(2, 10, exp);
         }
 
@@ -173,14 +206,34 @@ impl TxHandler for PayChanClaimHandler {
         let chan_amount = chan.get_field_xrp_drops(6, 1).unwrap_or(0);
         let chan_balance = chan.get_field_xrp_drops(6, 2).unwrap_or(0);
         let settle_delay = chan.get_field_u32(2, 39).unwrap_or(0);
-        let _chan_expiration = chan.get_field_u32(2, 10).unwrap_or(0);
+        let chan_expiration = chan.get_field_u32(2, 10).unwrap_or(0);
+        let cancel_after = chan.get_field_u32(2, 36).unwrap_or(0);
         let dest_id = chan.get_field_account(8, 3).unwrap_or([0u8; 20]);
         let creator_id = chan.account_id().unwrap_or([0u8; 20]);
+        let close_time = view.info().close_time as u32;
+
+        if tx.flags & TF_RENEW != 0 && tx.flags & TF_CLOSE != 0 {
+            return TER::Malformed("temMALFORMED");
+        }
+        if (cancel_after != 0 && close_time >= cancel_after)
+            || (chan_expiration != 0 && close_time >= chan_expiration)
+        {
+            return close_channel(view, &chan_keylet, &chan);
+        }
+        if tx.account != creator_id && tx.account != dest_id {
+            return TER::ClaimedCost(TecCode::Generic("tecNO_PERMISSION"));
+        }
 
         // If claim amount provided, advance balance and credit destination
-        if let Some(claimed_drops) = tx.amount_drops {
+        if let Some(claimed_drops) = crate::transaction::parse::parsed_paychan_balance_drops(tx) {
             if claimed_drops > chan_amount {
-                return TER::ClaimedCost(TecCode::Generic("tecINSUFFICIENT_FUNDS"));
+                return TER::ClaimedCost(TecCode::Generic("tecUNFUNDED_PAYMENT"));
+            }
+            if claimed_drops <= chan_balance {
+                return TER::ClaimedCost(TecCode::Generic("tecUNFUNDED_PAYMENT"));
+            }
+            if dest_id == tx.account && tx.paychan_sig.is_none() {
+                return TER::Malformed("temBAD_SIGNATURE");
             }
 
             let delta = claimed_drops.saturating_sub(chan_balance);
@@ -196,44 +249,51 @@ impl TxHandler for PayChanClaimHandler {
                     view.update(Arc::new(dest));
                 }
             }
+        } else if tx.paychan_sig.is_some() {
+            return TER::Malformed("temMALFORMED");
         }
 
-        // Check for close flag (tfClose = 0x00010000)
-        if tx.flags & 0x00010000 != 0 {
-            let close_time = view.info().close_time as u32;
-            chan.set_field_u32(2, 10, close_time.saturating_add(settle_delay));
-        }
-
-        // Check if channel can be deleted
-        let updated_balance = chan.get_field_xrp_drops(6, 2).unwrap_or(0);
-        let updated_expiration = chan.get_field_u32(2, 10).unwrap_or(0);
-        let close_time = view.info().close_time as u32;
-        let can_delete = (updated_expiration > 0 && close_time >= updated_expiration)
-            || updated_balance >= chan_amount;
-
-        if can_delete {
-            owner_dir::dir_remove(view, &creator_id, &chan_keylet.key.0);
-            if dest_id != creator_id {
-                owner_dir::dir_remove(view, &dest_id, &chan_keylet.key.0);
+        if tx.flags & TF_RENEW != 0 {
+            if creator_id != tx.account {
+                return TER::ClaimedCost(TecCode::Generic("tecNO_PERMISSION"));
             }
-
-            // Refund unclaimed to creator
-            let refund = chan_amount.saturating_sub(updated_balance);
-            if refund > 0 {
-                let creator_keylet = keylet::account(&creator_id);
-                if let Some(creator_sle) = view.peek(&creator_keylet) {
-                    let mut creator = (*creator_sle).clone();
-                    let bal = creator.balance_xrp().unwrap_or(0);
-                    creator.set_balance_xrp(bal + refund);
-                    creator.set_owner_count(creator.owner_count().saturating_sub(1));
-                    view.update(Arc::new(creator));
-                }
-            }
-            view.erase(&chan_keylet.key);
-        } else {
-            view.update(Arc::new(chan));
+            chan.remove_field(2, 10);
         }
 
+        if tx.flags & TF_CLOSE != 0 {
+            if dest_id == tx.account || chan.get_field_xrp_drops(6, 2).unwrap_or(0) >= chan_amount {
+                return close_channel(view, &chan_keylet, &chan);
+            }
+            let settle_expiration = close_time.saturating_add(settle_delay);
+            if chan_expiration == 0 || chan_expiration > settle_expiration {
+                chan.set_field_u32(2, 10, settle_expiration);
+            }
+        }
+
+        view.update(Arc::new(chan));
         TER::Success
     }
+}
+
+fn close_channel(view: &mut dyn ApplyView, chan_keylet: &keylet::Keylet, chan: &SLE) -> TER {
+    let chan_amount = chan.get_field_xrp_drops(6, 1).unwrap_or(0);
+    let chan_balance = chan.get_field_xrp_drops(6, 2).unwrap_or(0);
+    let dest_id = chan.get_field_account(8, 3).unwrap_or([0u8; 20]);
+    let creator_id = chan.account_id().unwrap_or([0u8; 20]);
+
+    owner_dir::dir_remove(view, &creator_id, &chan_keylet.key.0);
+    if dest_id != creator_id {
+        owner_dir::dir_remove(view, &dest_id, &chan_keylet.key.0);
+    }
+
+    let creator_keylet = keylet::account(&creator_id);
+    if let Some(creator_sle) = view.peek(&creator_keylet) {
+        let mut creator = (*creator_sle).clone();
+        let bal = creator.balance_xrp().unwrap_or(0);
+        creator.set_balance_xrp(bal.saturating_add(chan_amount.saturating_sub(chan_balance)));
+        creator.set_owner_count(creator.owner_count().saturating_sub(1));
+        view.update(Arc::new(creator));
+    }
+    view.erase(&chan_keylet.key);
+    TER::Success
 }

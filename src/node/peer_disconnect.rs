@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peer Disconnect piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -30,6 +29,9 @@ impl Node {
         s.peer_ping_sent.remove(&id);
         s.sync_peer_cooldown.remove(&id);
         s.peer_sync_useful.remove(&id);
+        s.peer_sync_useful_total.remove(&id);
+        s.peer_sync_duplicates.remove(&id);
+        s.peer_sync_duplicates_total.remove(&id);
         s.peer_sync_last_useful.remove(&id);
         s.implausible_validation_state.remove(&id);
         s.peer_direction.remove(&id);
@@ -41,7 +43,12 @@ impl Node {
         } else {
             s.services.peerfinder.note_closed(addr, now_unix);
         }
-        s.refresh_runtime_health(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        if !peer_reserved && !addr.ip().is_loopback() {
+            s.peer_cooldowns
+                .insert(addr, now + std::time::Duration::from_secs(130));
+        }
+        s.refresh_runtime_health(now);
         peer_reserved
     }
 }

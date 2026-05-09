@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Sync Lifecycle piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -8,7 +7,6 @@ impl Node {
             let state_ref = self.state.clone();
             let follower = Arc::new(crate::ledger::follow::FollowerState::new());
             let follower2 = follower.clone();
-            let diff_rx = self.sync_runtime.diff_sync_receiver();
             let (rpc_host, rpc_port) = if let Some(ref ep) = self.config.rpc_sync {
                 parse_host_port(ep)
             } else {
@@ -17,7 +15,7 @@ impl Node {
             let il = self.inbound_ledgers.clone();
             tokio::spawn(async move {
                 crate::ledger::follow::run_follower(
-                    rpc_host, rpc_port, storage, follower2, state_ref, diff_rx, il,
+                    rpc_host, rpc_port, storage, follower2, state_ref, il,
                 )
                 .await;
             });
@@ -54,6 +52,7 @@ impl Node {
                     crate::ledger::inbound::InboundReason::History,
                 );
                 let _ = guard.got_header(&sync_header.hash, sync_header.clone());
+                let _ = guard.got_state_tree(&sync_header.hash, sync_header.account_hash);
                 rx
             };
 
@@ -99,11 +98,11 @@ impl Node {
                     let sent_tx = if sync_header.transaction_hash == [0u8; 32] {
                         0
                     } else {
-                            state.send_to_peers_with_ledger(
-                                &tx_req,
-                                sync_header.sequence,
-                                ANCHOR_REQUEST_PEERS,
-                            )
+                        state.send_to_peers_with_ledger(
+                            &tx_req,
+                            sync_header.sequence,
+                            ANCHOR_REQUEST_PEERS,
+                        )
                     };
                     (sent_base, sent_tx, missing_tx_nodes.len())
                 };
@@ -149,14 +148,14 @@ impl Node {
                     .inbound_ledgers
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let result = guard.take(&sync_header.hash);
+                let result = guard.take_full(&sync_header.hash);
                 guard.sweep(std::time::Duration::from_secs(60));
                 result
             };
 
             let Some((header, tx_blobs, acquired_tx_root)) = result else {
                 warn!(
-                    "sync anchor acquisition incomplete for seq={} hash={}",
+                    "sync anchor acquisition incomplete for seq={} hash={} — waiting for full state+tx acquisition",
                     sync_header.sequence,
                     hex::encode_upper(&sync_header.hash[..8]),
                 );
@@ -174,7 +173,7 @@ impl Node {
                 return false;
             }
 
-            let tx_root = acquired_tx_root.unwrap_or_else(|| compute_acquired_tx_root(&tx_blobs));
+            let tx_root = acquired_tx_root;
             if tx_root != sync_header.transaction_hash {
                 warn!(
                     "sync anchor tx hash mismatch: seq={} expected={} got={} txs={}",
@@ -203,6 +202,85 @@ impl Node {
         }
 
         result
+    }
+
+    pub(super) async fn seed_sync_anchor_tx_acquisition(
+        &self,
+        peer_id: PeerId,
+        sync_header: &crate::ledger::LedgerHeader,
+        ld: &crate::proto::TmLedgerData,
+    ) {
+        const ANCHOR_PREFETCH_PEERS: usize = 6;
+
+        if sync_header.transaction_hash == [0u8; 32] {
+            return;
+        }
+
+        let missing_tx_nodes = {
+            let mut guard = self
+                .inbound_ledgers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = guard.acquire(
+                sync_header.hash,
+                sync_header.sequence,
+                crate::ledger::inbound::InboundReason::History,
+            );
+            let _ = guard.got_header(&sync_header.hash, sync_header.clone());
+            if ld.nodes.len() > 2 {
+                let _ = guard.got_tx_data(&sync_header.hash, &ld.nodes[2..]);
+            }
+            guard.missing_tx_node_ids(&sync_header.hash, 64)
+        };
+
+        let use_root_tx_request = missing_tx_nodes.is_empty()
+            || missing_tx_nodes
+                == vec![crate::ledger::shamap_id::SHAMapNodeID::root()
+                    .to_wire()
+                    .to_vec()];
+        let tx_req = if use_root_tx_request {
+            crate::network::relay::encode_get_ledger_txs_for_hash(
+                &sync_header.hash,
+                crate::sync::next_cookie(),
+            )
+        } else {
+            crate::network::relay::encode_get_ledger_txs_for_hash_nodes(
+                &sync_header.hash,
+                &missing_tx_nodes,
+                crate::sync::next_cookie(),
+            )
+        };
+
+        let target_peers = {
+            let state = self.state.read().await;
+            let mut peers = vec![peer_id];
+            for pid in self.select_sync_peers(&state, sync_header.sequence, ANCHOR_PREFETCH_PEERS) {
+                if pid != peer_id && !peers.contains(&pid) {
+                    peers.push(pid);
+                }
+            }
+            peers
+        };
+
+        let mut sent = 0usize;
+        for pid in target_peers.iter().copied().take(ANCHOR_PREFETCH_PEERS) {
+            sent += self
+                .sync_send_request(&tx_req, sync_header.sequence, Some(pid))
+                .await;
+        }
+        if sent == 0 {
+            sent += self
+                .sync_send_request(&tx_req, sync_header.sequence, None)
+                .await;
+        }
+        info!(
+            "sync anchor tx prefetch: seq={} hash={} peers={} sent={} missing_tx_nodes={}",
+            sync_header.sequence,
+            hex::encode_upper(&sync_header.hash[..8]),
+            target_peers.len(),
+            sent,
+            missing_tx_nodes.len(),
+        );
     }
 
     pub async fn trigger_resync(&self) {

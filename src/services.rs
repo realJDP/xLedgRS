@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Bundle shared runtime services used by node subsystems.
 //! Shared runtime services for the node's live service graph.
 //!
 //! This groups runtime services into one bundle so they can be wired,
@@ -149,6 +148,7 @@ impl RuntimeServices {
         peer_count: usize,
         reservation_count: usize,
         now: std::time::Instant,
+        data_dir: Option<&std::path::Path>,
     ) {
         let now_unix = unix_now();
         self.peerfinder.once_per_second(now_unix);
@@ -217,6 +217,9 @@ impl RuntimeServices {
             cluster_snapshot.connected,
             cluster_snapshot.max_reported_load_factor,
         );
+        self.load_manager.refresh_runtime_resource_health(
+            crate::network::load::runtime_resource_snapshot(data_dir),
+        );
     }
 }
 
@@ -257,7 +260,7 @@ mod tests {
         services
             .peerfinder
             .note_redirect(from, to, now_unix.saturating_add(20));
-        services.refresh_health(1, 0, std::time::Instant::now());
+        services.refresh_health(1, 0, std::time::Instant::now(), None);
 
         let snapshot = services.load_manager.snapshot();
         assert!(snapshot.remote_fee > crate::network::load::LOAD_BASE);
@@ -272,7 +275,7 @@ mod tests {
             .open_ledger
             .note_queue_state(7, [0xAB; 32], &metrics);
 
-        services.refresh_health(1, 0, std::time::Instant::now());
+        services.refresh_health(1, 0, std::time::Instant::now(), None);
 
         let snapshot = services.job_queue.snapshot();
         assert_eq!(snapshot.queued_transactions, 7);

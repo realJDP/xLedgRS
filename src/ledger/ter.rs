@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Ter support for XRPL ledger state and SHAMap logic.
 //! Transaction Engine Result — mirrors rippled's TER code space.
 //!
 //! A single `i32` with predicate helpers, matching rippled's
@@ -25,7 +24,8 @@ impl ApplyFlags {
     pub const BATCH: ApplyFlags = ApplyFlags(0x800);
     /// Dry-run: compute result but don't apply.
     pub const DRY_RUN: ApplyFlags = ApplyFlags(0x1000);
-    /// Validated replay path: apply authoritative transactions without local invariant gating.
+    /// Trusted validated replay path; lifecycle code strips replay metadata
+    /// from any path that still requires local authorization.
     pub const VALIDATED_REPLAY: ApplyFlags = ApplyFlags(0x2000);
 
     #[inline]
@@ -227,6 +227,7 @@ pub const TEM_ARRAY_EMPTY: TxResult = TxResult(-253);
 pub const TEM_ARRAY_TOO_LARGE: TxResult = TxResult(-252);
 pub const TEM_BAD_TRANSFER_FEE: TxResult = TxResult(-251);
 pub const TEM_INVALID_INNER_BATCH: TxResult = TxResult(-250);
+pub const TEM_BAD_MPT: TxResult = TxResult(-249);
 
 // ── TEF codes (failure) ──────────────────────────────────────────────────────
 
@@ -270,6 +271,7 @@ pub const TER_PRE_TICKET: TxResult = TxResult(-88);
 pub const TER_NO_AMM: TxResult = TxResult(-87);
 pub const TER_ADDRESS_COLLISION: TxResult = TxResult(-86);
 pub const TER_NO_DELEGATE_PERMISSION: TxResult = TxResult(-85);
+pub const TER_LOCKED: TxResult = TxResult(-84);
 
 // ── TES codes (success) ──────────────────────────────────────────────────────
 
@@ -462,6 +464,7 @@ fn code_to_token(code: i32) -> &'static str {
         -252 => "temARRAY_TOO_LARGE",
         -251 => "temBAD_TRANSFER_FEE",
         -250 => "temINVALID_INNER_BATCH",
+        -249 => "temBAD_MPT",
 
         // tef
         -199 => "tefFAILURE",
@@ -503,6 +506,7 @@ fn code_to_token(code: i32) -> &'static str {
         -87 => "terNO_AMM",
         -86 => "terADDRESS_COLLISION",
         -85 => "terNO_DELEGATE_PERMISSION",
+        -84 => "terLOCKED",
 
         // tec
         100 => "tecCLAIM",
@@ -733,11 +737,13 @@ mod tests {
         assert_eq!(TER_RETRY.code(), -99);
         assert_eq!(TER_NO_ACCOUNT.code(), -96);
         assert_eq!(TER_PRE_SEQ.code(), -92);
+        assert_eq!(TER_LOCKED.code(), -84);
         assert_eq!(TEF_FAILURE.code(), -199);
         assert_eq!(TEF_PAST_SEQ.code(), -190);
         assert_eq!(TEF_INVARIANT_FAILED.code(), -182);
         assert_eq!(TEM_MALFORMED.code(), -299);
         assert_eq!(TEM_BAD_SIGNATURE.code(), -282);
+        assert_eq!(TEM_BAD_MPT.code(), -249);
         assert_eq!(TEL_LOCAL_ERROR.code(), -399);
     }
 }

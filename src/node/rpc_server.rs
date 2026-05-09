@@ -1,20 +1,31 @@
-//! xLedgRS purpose: Rpc Server piece of the live node runtime.
-use super::http_io::{parse_forwarded_for, read_rpc_request};
+use super::http_io::{parse_forwarded_for, parse_http_request_line, read_rpc_request};
 use super::*;
 
 impl Node {
     pub(super) async fn run_rpc_server(self: Arc<Self>) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.config.rpc_addr).await?;
         info!("JSON-RPC server on {}", self.config.rpc_addr);
+        let mut shutdown_check = tokio::time::interval(std::time::Duration::from_millis(200));
+        shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            let (stream, addr) = listener.accept().await?;
+            let (stream, addr) = tokio::select! {
+                accepted = listener.accept() => accepted?,
+                _ = shutdown_check.tick() => {
+                    if self.is_shutting_down() {
+                        info!("JSON-RPC server: shutdown");
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
             let node = self.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if let Err(e) = node.handle_rpc(stream, addr).await {
                     warn!("RPC error from {addr}: {e}");
                 }
             });
+            self.track_background_task("rpc_connection", handle);
         }
     }
 
@@ -55,6 +66,30 @@ impl Node {
                 "rpc_request",
                 std::time::Instant::now(),
             );
+        }
+
+        if let Some(("GET", target)) = parse_http_request_line(header) {
+            if target == "/metrics" {
+                let ctx = self.rpc_read_ctx.load();
+                if !ctx.admin_rpc_enabled {
+                    let body = "metrics endpoint requires admin RPC\n";
+                    let http = format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(http.as_bytes()).await?;
+                    return Ok(());
+                }
+                let body = crate::rpc::handlers::metrics_text(ctx.as_ref());
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(http.as_bytes()).await?;
+                return Ok(());
+            }
         }
 
         if body.is_empty() {
@@ -116,9 +151,13 @@ impl Node {
                 )
             };
             let id = req.id;
+            let request = serde_json::json!({
+                "method": req.method,
+                "params": req.params,
+            });
             match result {
                 Ok(r) => crate::rpc::RpcResponse::ok(r, id).to_json(),
-                Err(e) => crate::rpc::RpcResponse::err(e, id).to_json(),
+                Err(e) => crate::rpc::RpcResponse::err_with_request(e, id, request).to_json(),
             }
         } else if crate::rpc::needs_write(&req.method) {
             self.dispatch_write_rpc(req).await.to_json()

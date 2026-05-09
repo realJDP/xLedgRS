@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Oracle legacy transactor for XRPL transaction apply.
 use super::{legacy_path_not_supported, TxHandler, TER};
 use crate::ledger::views::ApplyView;
 use crate::transaction::ParsedTx;
@@ -6,6 +5,10 @@ use crate::transaction::ParsedTx;
 pub struct OracleSetHandler;
 
 impl TxHandler for OracleSetHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -14,6 +17,10 @@ impl TxHandler for OracleSetHandler {
 pub struct OracleDeleteHandler;
 
 impl TxHandler for OracleDeleteHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }

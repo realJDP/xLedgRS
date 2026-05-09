@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Init piece of the live node runtime.
 use super::*;
 
 #[derive(serde::Deserialize)]
@@ -8,10 +7,24 @@ struct ValidatorTokenPayload {
     validation_secret_key: String,
 }
 
+struct LoadedValidatorToken {
+    key: Secp256k1KeyPair,
+    manifests: Vec<crate::consensus::Manifest>,
+}
+
+fn network_name_for_id(network_id: u32) -> &'static str {
+    match network_id {
+        0 => "mainnet",
+        1 => "testnet",
+        _ => "custom",
+    }
+}
+
 fn load_validator_key_from_token(
     token: &str,
+    configured_secret_key: Option<&str>,
     manifest_cache: &Arc<std::sync::Mutex<crate::consensus::ManifestCache>>,
-) -> Option<Secp256k1KeyPair> {
+) -> Option<LoadedValidatorToken> {
     let raw = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, token) {
         Ok(raw) => raw,
         Err(e) => {
@@ -27,32 +40,58 @@ fn load_validator_key_from_token(
         }
     };
 
+    let secret = configured_secret_key.unwrap_or(&payload.validation_secret_key);
+    let key = match Secp256k1KeyPair::from_secret_hex(secret) {
+        Ok(kp) => kp,
+        Err(e) => {
+            error!("failed to derive validator key from validation_secret_key: {e}");
+            return None;
+        }
+    };
+    if configured_secret_key.is_some() {
+        match Secp256k1KeyPair::from_secret_hex(&payload.validation_secret_key) {
+            Ok(token_kp) if token_kp.public_key_bytes() == key.public_key_bytes() => {}
+            Ok(_) => {
+                error!(
+                    "validation_secret_key does not match validator_token validation_secret_key identity"
+                );
+                return None;
+            }
+            Err(e) => {
+                error!("validator_token validation_secret_key is invalid: {e}");
+                return None;
+            }
+        }
+    }
+
+    let mut manifests = Vec::new();
     if let Some(manifest_b64) = payload.manifest.as_deref() {
         match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, manifest_b64)
             .ok()
             .and_then(|bytes| crate::consensus::Manifest::from_bytes(&bytes).ok())
         {
             Some(manifest) if manifest.verify() => {
+                if manifest.signing_pubkey != key.public_key_bytes() {
+                    error!(
+                        "validator_token manifest signing key does not match validation_secret_key"
+                    );
+                    return None;
+                }
                 let accepted = manifest_cache
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .add_prevalidated(manifest);
+                    .add_prevalidated(manifest.clone());
                 if !accepted {
                     warn!("validator_token manifest was already present or rejected");
                 }
+                manifests.push(manifest);
             }
             Some(_) => warn!("validator_token manifest failed signature verification"),
             None => warn!("validator_token manifest could not be decoded"),
         }
     }
 
-    match Secp256k1KeyPair::from_secret_hex(&payload.validation_secret_key) {
-        Ok(kp) => Some(kp),
-        Err(e) => {
-            error!("failed to derive validator key from validator_token: {e}");
-            None
-        }
-    }
+    Some(LoadedValidatorToken { key, manifests })
 }
 
 fn load_verified_resume_header(
@@ -233,7 +272,7 @@ impl Node {
                     }
                 );
                 NodeContext {
-                    network: "mainnet",
+                    network: network_name_for_id(config.network_id),
                     network_id: config.network_id,
                     build_version: env!("CARGO_PKG_VERSION"),
                     start_time: std::time::Instant::now(),
@@ -282,8 +321,8 @@ impl Node {
                         std::sync::Arc::new(
                             crate::ledger::tree_cache::CachedNodeStore::with_max_bytes(
                                 backend,
-                                500_000,
-                                256 * 1024 * 1024,
+                                125_000,
+                                64 * 1024 * 1024,
                             ),
                         );
                     let nudb_shamap = crate::ledger::shamap::SHAMap::with_backend(
@@ -295,13 +334,13 @@ impl Node {
                         .unwrap_or_else(|e| e.into_inner())
                         .set_nudb_shamap(nudb_shamap);
                     info!(
-                        "NuDB NodeStore ready at {} (content-addressed, 256MB cache)",
+                        "NuDB NodeStore ready at {} (content-addressed, 64MB cache)",
                         nudb_dir.display()
                     );
                 }
                 Err(e) => {
-                    warn!(
-                        "failed to open NuDB NodeStore at {}: {e} — running without",
+                    panic!(
+                        "failed to open NuDB NodeStore at {}: {e}; refusing to run validator sync without durable state storage",
                         nudb_dir.display()
                     );
                 }
@@ -333,22 +372,36 @@ impl Node {
             crate::crypto::base58::encode(crate::crypto::base58::PREFIX_NODE_PUBLIC, &pubkey_bytes);
         info!("node public key: {}", node_pubkey_b58);
 
-        let validator_key = config
-            .validation_seed
-            .as_deref()
-            .and_then(|seed| match Secp256k1KeyPair::from_seed(seed) {
+        let mut local_validator_manifests = Vec::new();
+        let validator_key = if let Some(seed) = config.validation_seed.as_deref() {
+            match Secp256k1KeyPair::from_seed(seed) {
                 Ok(kp) => Some(kp),
                 Err(e) => {
                     error!("failed to derive validator key from validation_seed: {e}");
                     None
                 }
+            }
+        } else if let Some(token) = config.validator_token.as_deref() {
+            load_validator_key_from_token(
+                token,
+                config.validation_secret_key.as_deref(),
+                &manifest_cache,
+            )
+            .map(|loaded| {
+                local_validator_manifests = loaded.manifests;
+                loaded.key
             })
-            .or_else(|| {
-                config
-                    .validator_token
-                    .as_deref()
-                    .and_then(|token| load_validator_key_from_token(token, &manifest_cache))
-            });
+        } else if let Some(secret) = config.validation_secret_key.as_deref() {
+            match Secp256k1KeyPair::from_secret_hex(secret) {
+                Ok(kp) => Some(kp),
+                Err(e) => {
+                    error!("failed to derive validator key from validation_secret_key: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Some(kp) = validator_key.as_ref() {
             let vk_bytes = kp.public_key_bytes();
             let vk_b58 =
@@ -376,6 +429,7 @@ impl Node {
             None
         };
 
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         ctx.amendments = amendments;
         ctx.pubkey_node = node_pubkey_b58.clone();
         ctx.validator_key = validator_key_b58.clone();
@@ -397,7 +451,7 @@ impl Node {
         ctx.peer_reservations = Some(Arc::new(std::sync::Mutex::new(persisted_peer_reservations)));
         ctx.sync_clear_requested = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
         ctx.connect_requests = Some(Arc::new(std::sync::Mutex::new(Vec::new())));
-        ctx.shutdown_requested = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        ctx.shutdown_requested = Some(shutdown.clone());
         ctx.force_ledger_accept = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
         ctx.standalone_mode = config.standalone;
         let ledger_accept_service = (config.standalone && config.enable_consensus_close_loop)
@@ -568,25 +622,28 @@ impl Node {
         let initial_object_count = nudb_direct
             .as_ref()
             .map(|backend| backend.count() as usize)
-            .filter(|count| *count > 0)
-            .unwrap_or_else(|| Self::persisted_leaf_count(storage.as_ref()));
+            .unwrap_or(0);
         let initial_rpc_snapshot = Self::build_rpc_snapshot(
             &shared,
             initial_object_count,
-            Self::persisted_leaf_count(storage.as_ref()),
+            initial_object_count,
             &node_key,
             validator_key.as_ref(),
         );
         let initial_rpc_read_ctx =
             Self::build_rpc_read_context(&shared, initial_object_count, None);
         let state = Arc::new(RwLock::new(shared));
-        let sync_runtime = Arc::new(crate::sync_runtime::SyncRuntime::new());
+        let sync_runtime = Arc::new(crate::sync_runtime::SyncRuntime::with_tuning(
+            config.sync_tuning.clone(),
+        ));
+        let route_work_permits = Arc::new(tokio::sync::Semaphore::new(config.route_worker_count()));
 
         Self {
             config,
             state,
             node_key,
             validator_key,
+            local_validator_manifests,
             storage,
             openssl_tls,
             ws_events,
@@ -594,8 +651,9 @@ impl Node {
             unl: Arc::new(std::sync::RwLock::new(unl)),
             validator_list_state,
             validator_list_config: validator_lists,
-            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown,
             sync_runtime,
+            route_work_permits,
             msg_dedup: Arc::new(std::sync::Mutex::new((
                 std::collections::HashSet::new(),
                 std::time::Instant::now(),
@@ -605,6 +663,7 @@ impl Node {
             rpc_read_ctx: arc_swap::ArcSwap::from_pointee(initial_rpc_read_ctx),
             can_delete_target,
             inbound_ledgers,
+            background_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -613,7 +672,7 @@ impl Node {
         use crate::ledger::AccountRoot;
 
         let mut ctx = NodeContext {
-            network: "mainnet",
+            network: network_name_for_id(network_id),
             network_id,
             build_version: env!("CARGO_PKG_VERSION"),
             start_time: std::time::Instant::now(),
@@ -636,6 +695,7 @@ impl Node {
                     flags: 0,
                     regular_key: None,
                     minted_nftokens: 0,
+                    first_nftoken_sequence: 0,
                     burned_nftokens: 0,
                     transfer_rate: 0,
                     domain: Vec::new(),

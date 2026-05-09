@@ -1,4 +1,3 @@
-# xLedgRS purpose: Ignore local builds, logs, caches, and private node data.
 /target/
 /.claude/
 .DS_Store

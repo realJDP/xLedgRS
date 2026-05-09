@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Runtime Helpers piece of the live node runtime.
 use super::*;
 use prost::Message as ProstMessage;
 
@@ -19,13 +18,6 @@ impl Node {
         Some(self.lock_sync())
     }
 
-    pub(super) fn persisted_leaf_count(storage: Option<&Arc<crate::storage::Storage>>) -> usize {
-        storage
-            .and_then(|store| store.get_leaf_count())
-            .map(|count| count as usize)
-            .unwrap_or(0)
-    }
-
     pub(super) fn follower_healthy_for_status(state: &SharedState) -> bool {
         if !state.sync_done || state.ctx.standalone_mode {
             return true;
@@ -40,12 +32,9 @@ impl Node {
 
     pub(super) fn rpc_object_count(&self) -> usize {
         if let Some(ref backend) = self.nudb_backend {
-            let count = backend.count() as usize;
-            if count > 0 {
-                return count;
-            }
+            return backend.count() as usize;
         }
-        Self::persisted_leaf_count(self.storage.as_ref())
+        0
     }
 
     pub fn state_ref(&self) -> &Arc<tokio::sync::RwLock<SharedState>> {
@@ -55,6 +44,63 @@ impl Node {
     pub fn signal_shutdown(&self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn shutdown_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.shutdown.clone()
+    }
+
+    pub(super) fn track_background_task(
+        &self,
+        name: &'static str,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let mut tasks = self
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tasks.retain(|task| !task.handle.is_finished());
+        tasks.push(BackgroundTask { name, handle });
+    }
+
+    pub async fn join_background_tasks(
+        &self,
+        timeout: std::time::Duration,
+    ) -> BackgroundTaskJoinSummary {
+        let mut tasks = {
+            let mut guard = self
+                .background_tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut summary = BackgroundTaskJoinSummary::default();
+
+        for task in &mut tasks {
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, &mut task.handle).await {
+                Ok(Ok(())) => {
+                    summary.completed = summary.completed.saturating_add(1);
+                }
+                Ok(Err(err)) => {
+                    summary.failed = summary.failed.saturating_add(1);
+                    tracing::warn!("background task {} ended with error: {}", task.name, err);
+                }
+                Err(_) => {
+                    summary.aborted = summary.aborted.saturating_add(1);
+                    tracing::warn!(
+                        "background task {} did not stop within shutdown grace; aborting",
+                        task.name
+                    );
+                    task.handle.abort();
+                    let _ = (&mut task.handle).await;
+                }
+            }
+        }
+
+        summary
     }
 
     pub(super) fn is_shutting_down(&self) -> bool {
@@ -70,7 +116,9 @@ impl Node {
         if !state.sync_done {
             return Some("state sync still in progress");
         }
-        if self.config.standalone {
+        if self.config.standalone
+            && (self.validator_key.is_some() || self.config.allow_node_key_consensus)
+        {
             return None;
         }
         if self.validator_key.is_none() {
@@ -99,18 +147,37 @@ impl Node {
             Some(fs) if fs.hash_matches.load(std::sync::atomic::Ordering::Relaxed) == 0 => {
                 Some("waiting for first post-sync follower hash match")
             }
-            Some(_) => None,
+            Some(fs) => {
+                const FOLLOWER_CATCHUP_TOLERANCE_LEDGERS: u32 = 4;
+                let follower_seq = fs
+                    .current_seq
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .max(state.ctx.ledger_seq);
+                let observed_tip = state
+                    .peer_ledger_range
+                    .values()
+                    .map(|(_, last)| *last)
+                    .max()
+                    .or_else(|| state.validated_hashes.keys().copied().max());
+                if observed_tip.is_some_and(|tip| {
+                    follower_seq.saturating_add(FOLLOWER_CATCHUP_TOLERANCE_LEDGERS) < tip
+                }) {
+                    Some("ledger follower is catching up to network tip")
+                } else {
+                    None
+                }
+            }
         }
     }
 
     pub async fn update_rpc_snapshot(&self) {
         let fetch_info_sync = self.snapshot_sync_fetch();
+        let object_count = self.rpc_object_count();
         let leaf_count = fetch_info_sync
             .as_ref()
             .map(|sync| sync.state_nodes())
-            .unwrap_or_else(|| Self::persisted_leaf_count(self.storage.as_ref()));
+            .unwrap_or(object_count as usize);
         let state = self.state.read().await;
-        let object_count = self.rpc_object_count();
         let fetch_info = fetch_info_sync.map(|sync| Self::build_fetch_info_snapshot(&state, sync));
         let snap = Self::build_rpc_snapshot(
             &state,
@@ -119,7 +186,8 @@ impl Node {
             &self.node_key,
             self.validator_key.as_ref(),
         );
-        let ctx = Self::build_rpc_read_context(&state, object_count, fetch_info);
+        let mut ctx = Self::build_rpc_read_context(&state, object_count, fetch_info);
+        ctx.sync_metrics = Some(self.sync_runtime.metrics_snapshot());
         self.rpc_snapshot.store(Arc::new(snap));
         self.rpc_read_ctx.store(Arc::new(ctx));
     }
@@ -136,6 +204,8 @@ impl Node {
         let mut state = self.state.write().await;
         state.ctx.peer_count = state.peer_count();
         state.ctx.follower_state = state.follower_state.clone();
+        state.refresh_runtime_health(std::time::Instant::now());
+        state.ctx.load_snapshot = state.services.load_manager.snapshot();
         let reply = crate::rpc::dispatch(req, &mut state.ctx);
         let (queued_transactions, candidate_set_hash, metrics, pool_snapshot) = {
             let pool = state.ctx.tx_pool.read().unwrap_or_else(|e| e.into_inner());
@@ -203,11 +273,26 @@ impl Node {
             _ => crate::crypto::sha256(payload),
         };
         let mut guard = self.msg_dedup.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.1.elapsed().as_secs() >= 300 {
+        if guard.1.elapsed().as_secs() >= 300 || guard.0.len() >= 65_536 {
             guard.0.clear();
             guard.1 = std::time::Instant::now();
         }
         guard.0.insert(hash)
+    }
+
+    pub(super) fn bootstrap_syncing_fast(&self) -> bool {
+        if self.sync_runtime.bootstrap_active() {
+            return true;
+        }
+        if let Ok(state) = self.state.try_read() {
+            if state.sync_done {
+                return false;
+            }
+            if state.sync_in_progress {
+                return true;
+            }
+        }
+        self.sync_runtime.sync_active()
     }
 
     pub(super) fn debug_log(&self, msg: &str) {

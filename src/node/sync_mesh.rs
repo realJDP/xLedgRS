@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Sync Mesh piece of the live node runtime.
 use super::*;
 
 pub(crate) fn rotate_sync_peer_window(
@@ -268,30 +267,49 @@ impl Node {
                 .unwrap_or(false)
         };
 
-        let max_useful = peer_useful_counts.values().copied().max().unwrap_or(0);
-        let threshold = max_useful / 2;
-        let mut eligible: Vec<PeerId> = peer_useful_counts
+        let mut useful_peers: Vec<(PeerId, u32, u32)> = peer_useful_counts
             .iter()
-            .filter(|(_, useful)| **useful >= threshold)
-            .map(|(pid, _)| *pid)
-            .filter(|pid| state.peers.get(pid).map(|ps| ps.is_open()).unwrap_or(true))
-            .filter(not_benched)
-            .filter(|pid| {
+            .filter(|(pid, _)| state.peers.get(pid).map(|ps| ps.is_open()).unwrap_or(true))
+            .filter(|(pid, _)| not_benched(pid))
+            .filter(|(pid, _)| {
                 state.peer_ledger_range.get(pid).map_or_else(
                     || is_configured_full_history(pid),
                     |&(min, max)| (seq >= min && seq <= max) || is_configured_full_history(pid),
                 )
             })
+            .map(|(pid, useful)| {
+                let latency = state.peer_latency.get(pid).copied().unwrap_or(u32::MAX / 4);
+                (*pid, *useful, latency)
+            })
             .collect();
 
-        if eligible.is_empty() {
+        if useful_peers.is_empty() {
             return self.select_sync_peers(state, seq, count);
         }
 
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        eligible.shuffle(&mut rng);
-        eligible.truncate(count.min(eligible.len()));
+        useful_peers.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0 .0.cmp(&b.0 .0))
+        });
+        let mut eligible: Vec<PeerId> = useful_peers
+            .into_iter()
+            .take(count)
+            .map(|(pid, _, _)| pid)
+            .collect();
+
+        if eligible.len() < count {
+            for pid in self.select_sync_peers(state, seq, count) {
+                if eligible.contains(&pid) {
+                    continue;
+                }
+                eligible.push(pid);
+                if eligible.len() >= count {
+                    break;
+                }
+            }
+        }
+
         eligible
     }
 
@@ -335,7 +353,7 @@ impl Node {
                     return None;
                 }
                 let age = now.saturating_duration_since(*at);
-                if age > std::time::Duration::from_secs(30) {
+                if age > std::time::Duration::from_secs(120) {
                     return None;
                 }
                 let useful = state.peer_sync_useful.get(pid).copied().unwrap_or(0);

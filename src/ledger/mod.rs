@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Mod support for XRPL ledger state and SHAMap logic.
 //! Ledger primitives, state trees, and transaction application.
 //!
 //! View stack: `ClosedLedger` (`ReadView` + `RawView`) → `OpenView`
@@ -255,28 +254,20 @@ pub fn parse_fee_settings(data: &[u8]) -> Fees {
                 pos += 32;
             }
             6 => {
-                // Amount (variable: 8 bytes for XRP, 48 for IOU)
-                if pos + 8 > data.len() {
-                    break;
-                }
-                let first = data[pos];
-                if first & 0x80 != 0 {
-                    // XRP amount: 8 bytes, top bit is "positive" flag
-                    let raw = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-                    let drops = raw & 0x3FFF_FFFF_FFFF_FFFF; // mask off top 2 bits
-                    match field_code {
-                        22 => fees.base = drops,      // sfBaseFeeDrops (new format)
-                        23 => fees.reserve = drops,   // sfReserveBaseDrops
-                        24 => fees.increment = drops, // sfReserveIncrementDrops
-                        _ => {}
+                // Amount (8 bytes for XRP, 48 for IOU, 33 for MPT). FeeSettings
+                // new-format fields must be native XRP amounts.
+                match crate::transaction::amount::Amount::from_bytes(&data[pos..]) {
+                    Ok((crate::transaction::amount::Amount::Xrp(drops), consumed)) => {
+                        match field_code {
+                            22 => fees.base = drops,      // sfBaseFeeDrops (new format)
+                            23 => fees.reserve = drops,   // sfReserveBaseDrops
+                            24 => fees.increment = drops, // sfReserveIncrementDrops
+                            _ => {}
+                        }
+                        pos += consumed;
                     }
-                    pos += 8;
-                } else {
-                    // IOU amount: 48 bytes — skip (shouldn't appear in FeeSettings)
-                    if pos + 48 > data.len() {
-                        break;
-                    }
-                    pos += 48;
+                    Ok((_non_xrp, consumed)) => pos += consumed,
+                    Err(_) => break,
                 }
             }
             7 => {
@@ -380,10 +371,7 @@ fn encode_vl_length(out: &mut Vec<u8>, len: usize) {
     }
 }
 
-/// Serialize a FeeSettings SLE to binary.
-/// Supports both old format (sfBaseFee/sfReserveBase/sfReserveIncrement) and new
-/// format (sfBaseFeeDrops/sfReserveBaseDrops/sfReserveIncrementDrops).
-/// For simplicity, always writes old format — the XRPFees amendment switches to new.
+/// Serialize a legacy FeeSettings SLE to binary.
 pub fn serialize_fee_settings(fees: &Fees) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
 
@@ -406,6 +394,26 @@ pub fn serialize_fee_settings(fees: &Fees) -> Vec<u8> {
     // sfBaseFee (type=3 UInt64, field=5)
     encode_field_header(&mut out, 3, 5);
     out.extend_from_slice(&fees.base.to_be_bytes());
+
+    out
+}
+
+/// Serialize an XRPFees-era FeeSettings SLE. Rippled writes only native XRP
+/// Amount fields and removes the old integer fee fields after XRPFees enables.
+pub fn serialize_fee_settings_xrp_fees(fees: &Fees) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+
+    encode_field_header(&mut out, 1, 1); // LedgerEntryType
+    out.extend_from_slice(&0x0073u16.to_be_bytes());
+
+    encode_field_header(&mut out, 6, 22); // sfBaseFeeDrops
+    out.extend_from_slice(&crate::transaction::amount::Amount::Xrp(fees.base).to_bytes());
+
+    encode_field_header(&mut out, 6, 23); // sfReserveBaseDrops
+    out.extend_from_slice(&crate::transaction::amount::Amount::Xrp(fees.reserve).to_bytes());
+
+    encode_field_header(&mut out, 6, 24); // sfReserveIncrementDrops
+    out.extend_from_slice(&crate::transaction::amount::Amount::Xrp(fees.increment).to_bytes());
 
     out
 }
@@ -489,6 +497,105 @@ pub fn serialize_negative_unl(
     }
 
     out
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NegativeUnlState {
+    pub disabled_validators: Vec<Vec<u8>>,
+    pub to_disable: Option<Vec<u8>>,
+    pub to_reenable: Option<Vec<u8>>,
+}
+
+/// Parse a NegativeUNL SLE, preserving disabled validators and pending fields.
+pub fn parse_negative_unl(data: &[u8]) -> NegativeUnlState {
+    let mut pos = 0usize;
+    let mut state = NegativeUnlState::default();
+
+    while pos < data.len() {
+        let (type_code, field_code, new_pos) = crate::ledger::meta::read_field_header(data, pos);
+        if new_pos > data.len() {
+            break;
+        }
+        pos = new_pos;
+        match (type_code, field_code) {
+            (7, 20) => {
+                if let Some((blob, next)) = parse_vl_at(data, pos) {
+                    state.to_disable = Some(blob);
+                    pos = next;
+                } else {
+                    break;
+                }
+            }
+            (7, 21) => {
+                if let Some((blob, next)) = parse_vl_at(data, pos) {
+                    state.to_reenable = Some(blob);
+                    pos = next;
+                } else {
+                    break;
+                }
+            }
+            (15, 17) => {
+                let (validators, next) = parse_disabled_validators_array(data, pos);
+                state.disabled_validators = validators;
+                pos = next;
+            }
+            _ => {
+                pos = crate::ledger::meta::skip_field_raw(data, pos, type_code);
+            }
+        }
+    }
+
+    state
+}
+
+fn parse_disabled_validators_array(data: &[u8], mut pos: usize) -> (Vec<Vec<u8>>, usize) {
+    let mut validators = Vec::new();
+    while pos < data.len() {
+        if data[pos] == 0xF1 {
+            pos += 1;
+            break;
+        }
+        let (type_code, field_code, new_pos) = crate::ledger::meta::read_field_header(data, pos);
+        if new_pos > data.len() || type_code != 14 || field_code != 19 {
+            break;
+        }
+        pos = new_pos;
+        while pos < data.len() && data[pos] != 0xE1 {
+            let (inner_type, inner_field, inner_pos) =
+                crate::ledger::meta::read_field_header(data, pos);
+            if inner_pos > data.len() {
+                return (validators, pos);
+            }
+            pos = inner_pos;
+            if inner_type == 7 && inner_field == 1 {
+                if let Some((blob, next)) = parse_vl_at(data, pos) {
+                    validators.push(blob);
+                    pos = next;
+                } else {
+                    return (validators, pos);
+                }
+            } else {
+                pos = crate::ledger::meta::skip_field_raw(data, pos, inner_type);
+            }
+        }
+        if pos < data.len() && data[pos] == 0xE1 {
+            pos += 1;
+        }
+    }
+    (validators, pos)
+}
+
+fn parse_vl_at(data: &[u8], pos: usize) -> Option<(Vec<u8>, usize)> {
+    if pos >= data.len() {
+        return None;
+    }
+    let (len, consumed) = decode_vl_length(&data[pos..]);
+    let start = pos.checked_add(consumed)?;
+    let end = start.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    Some((data[start..end].to_vec(), end))
 }
 
 // ── Amendments (from Amendments ledger object) ──────────────────────────────
@@ -838,6 +945,8 @@ pub struct LedgerState {
     previous_txn_only_touches: HashSet<Key>,
     tx_journal: Option<TxJournal>,
     tx_snapshot: Option<TxSnapshot>,
+    tx_journal_stack: Vec<TxJournal>,
+    tx_snapshot_stack: Vec<TxSnapshot>,
     /// When true, insert_raw/remove_raw skip per-entry storage writes
     /// and buffer data in state_map instead. Used by follower replay to
     /// avoid write amplification — the snapshot persist does a single
@@ -899,6 +1008,8 @@ impl LedgerState {
             previous_txn_only_touches: HashSet::new(),
             tx_journal: None,
             tx_snapshot: None,
+            tx_journal_stack: Vec::new(),
+            tx_snapshot_stack: Vec::new(),
             defer_storage: false,
             nudb_shamap: None,
         }
@@ -960,6 +1071,8 @@ impl LedgerState {
         self.deleted_raw.clear();
         self.tx_journal = None;
         self.tx_snapshot = None;
+        self.tx_journal_stack.clear();
+        self.tx_snapshot_stack.clear();
         self.defer_storage = false;
     }
 
@@ -1055,6 +1168,8 @@ impl LedgerState {
             previous_txn_only_touches: HashSet::new(),
             tx_journal: None,
             tx_snapshot: None,
+            tx_journal_stack: Vec::new(),
+            tx_snapshot_stack: Vec::new(),
             // Dry runs should never write through to the shared backend.
             defer_storage: true,
             nudb_shamap,
@@ -1100,11 +1215,15 @@ impl LedgerState {
     pub fn flush_nudb(&self) -> std::io::Result<usize> {
         match self.nudb_map_guard() {
             Some(mut map) => {
+                let backend = map.backend().cloned();
                 let flushed = map.flush_dirty()?;
+                if let Some(backend) = backend {
+                    backend.flush_to_disk()?;
+                }
                 let evicted = map.evict_clean_leaves();
                 if flushed > 0 || evicted > 0 {
                     tracing::info!(
-                        "flush_nudb: flushed {} node(s), evicted {} clean leaf/leaves",
+                        "flush_nudb: flushed {} node(s), forced backend sync, evicted {} clean leaf/leaves",
                         flushed,
                         evicted,
                     );
@@ -1229,6 +1348,9 @@ impl LedgerState {
     }
 
     pub fn begin_tx_journal(&mut self) {
+        if let Some(journal) = self.tx_journal.take() {
+            self.tx_journal_stack.push(journal);
+        }
         self.tx_journal = Some(TxJournal {
             order: Vec::new(),
             before: HashMap::new(),
@@ -1257,7 +1379,8 @@ impl LedgerState {
     }
 
     pub fn take_tx_journal(&mut self) -> Vec<(Key, Option<Vec<u8>>)> {
-        self.tx_journal
+        let entries = self
+            .tx_journal
             .take()
             .map(|journal| {
                 let TxJournal { order, before } = journal;
@@ -1266,7 +1389,9 @@ impl LedgerState {
                     .filter_map(|key| before.get(&key).cloned().map(|snapshot| (key, snapshot)))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.tx_journal = self.tx_journal_stack.pop();
+        entries
     }
 
     // ── Transactional scope (begin / commit / discard) ───────────────────
@@ -1275,6 +1400,12 @@ impl LedgerState {
     /// (for metadata generation) and a typed snapshot (for rollback).
     pub fn begin_tx(&mut self) {
         self.previous_txn_only_touches.clear();
+        if let Some(journal) = self.tx_journal.take() {
+            self.tx_journal_stack.push(journal);
+        }
+        if let Some(snapshot) = self.tx_snapshot.take() {
+            self.tx_snapshot_stack.push(snapshot);
+        }
         // Raw journal (same as begin_tx_journal)
         self.tx_journal = Some(TxJournal {
             order: Vec::new(),
@@ -1313,8 +1444,54 @@ impl LedgerState {
     /// metadata generation (same data as `take_tx_journal`).  Drops the
     /// typed snapshot — changes are permanent.
     pub fn commit_tx(&mut self) -> Vec<(Key, Option<Vec<u8>>)> {
-        self.tx_snapshot = None;
-        self.take_tx_journal()
+        let child_snapshot = self.tx_snapshot.take();
+        let child_journal = self.tx_journal.take();
+
+        let entries = child_journal
+            .as_ref()
+            .map(|journal| {
+                journal
+                    .order
+                    .iter()
+                    .filter_map(|key| {
+                        journal
+                            .before
+                            .get(key)
+                            .cloned()
+                            .map(|snapshot| (*key, snapshot))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(mut parent) = self.tx_journal_stack.pop() {
+            if let Some(mut child) = child_journal {
+                for key in child.order {
+                    if !parent.before.contains_key(&key) {
+                        if let Some(before) = child.before.remove(&key) {
+                            parent.order.push(key);
+                            parent.before.insert(key, before);
+                        }
+                    }
+                }
+            }
+            self.tx_journal = Some(parent);
+        }
+
+        if let Some(mut parent) = self.tx_snapshot_stack.pop() {
+            if let Some(child) = child_snapshot {
+                let mut parent_keys: HashSet<Key> =
+                    parent.typed_before.iter().map(|(key, _)| *key).collect();
+                for (key, typed) in child.typed_before {
+                    if parent_keys.insert(key) {
+                        parent.typed_before.push((key, typed));
+                    }
+                }
+            }
+            self.tx_snapshot = Some(parent);
+        }
+
+        entries
     }
 
     /// Discard the current transaction, restoring all state to what it was
@@ -1388,6 +1565,9 @@ impl LedgerState {
             self.dirty_raw = snap.dirty_raw_snap;
             self.deleted_raw = snap.deleted_raw_snap;
         }
+
+        self.tx_journal = self.tx_journal_stack.pop();
+        self.tx_snapshot = self.tx_snapshot_stack.pop();
     }
 
     /// Remove a typed entry by SHAMap key without touching raw state or
@@ -1444,9 +1624,19 @@ impl LedgerState {
         }
         if let Some(off) = self.offers.remove(key) {
             // Clean up secondary indexes
-            let bk = offer::BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+            let bk = offer::BookKey::from_amounts_with_domain(
+                &off.taker_pays,
+                &off.taker_gets,
+                off.domain_id,
+            );
             if let Some(book) = self.order_books.get_mut(&bk) {
                 book.remove(&off);
+            }
+            if off.domain_id.is_some() && (off.flags & offer::LSF_HYBRID) != 0 {
+                let open_bk = offer::BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+                if let Some(book) = self.order_books.get_mut(&open_bk) {
+                    book.remove(&off);
+                }
             }
             if let Some(v) = self.account_offers_idx.get_mut(&off.account) {
                 v.retain(|k| k != key);
@@ -1507,11 +1697,22 @@ impl LedgerState {
                 self.nft_offers.insert(key, off);
             }
             TypedEntry::Offer(key, off) => {
-                let bk = offer::BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+                let bk = offer::BookKey::from_amounts_with_domain(
+                    &off.taker_pays,
+                    &off.taker_gets,
+                    off.domain_id,
+                );
                 self.order_books
                     .entry(bk)
                     .or_insert_with(offer::OrderBook::new)
                     .insert(&off);
+                if off.domain_id.is_some() && (off.flags & offer::LSF_HYBRID) != 0 {
+                    let open_bk = offer::BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+                    self.order_books
+                        .entry(open_bk)
+                        .or_insert_with(offer::OrderBook::new)
+                        .insert(&off);
+                }
                 let idx = self.account_offers_idx.entry(off.account).or_default();
                 if !idx.contains(&key) {
                     idx.push(key);
@@ -1975,6 +2176,16 @@ impl LedgerState {
         None
     }
 
+    /// Look up an NFToken from a specific owner's page chain.
+    pub fn get_nftoken_from_owner_pages(
+        &self,
+        owner: &[u8; 20],
+        id: &[u8; 32],
+    ) -> Option<&nft_page::PageToken> {
+        self.iter_nft_pages_for(owner)
+            .find_map(|(_, page)| page.tokens.iter().find(|t| t.nftoken_id == *id))
+    }
+
     /// Find which owner holds a given NFToken in the page store.
     pub fn nftoken_page_owner(&self, id: &[u8; 32]) -> Option<[u8; 20]> {
         for (key, page) in &self.nft_pages {
@@ -1997,7 +2208,7 @@ impl LedgerState {
         owner: &[u8; 20],
         token_id: [u8; 32],
         uri: Option<Vec<u8>>,
-    ) {
+    ) -> Result<(), &'static str> {
         use nft_page::*;
 
         let token = PageToken {
@@ -2007,10 +2218,14 @@ impl LedgerState {
         let target_page_key = page_key_for_token(owner, &token_id);
         let max_key = page_max(owner);
 
-        // Find existing page or use max_key for new page
+        // Find the first existing page whose key is strictly greater than the
+        // token's masked key. NFTokenPage keys are upper bounds.
         let page_key = self
             .nft_pages
-            .range(target_page_key..=max_key)
+            .range((
+                std::ops::Bound::Excluded(target_page_key),
+                std::ops::Bound::Included(max_key),
+            ))
             .next()
             .map(|(k, _)| *k)
             .unwrap_or(max_key);
@@ -2024,7 +2239,11 @@ impl LedgerState {
 
         if needs_split {
             let mut page = self.nft_pages.remove(&page_key).unwrap();
-            let new_page = page.split();
+            let old_prev = page.prev_page;
+            let Some(new_page) = page.split() else {
+                self.nft_pages.insert(page_key, page);
+                return Err("tecNO_SUITABLE_NFTOKEN_PAGE");
+            };
             let new_page_key = new_page.key;
 
             // Re-insert both halves
@@ -2036,20 +2255,31 @@ impl LedgerState {
             self.insert_raw(new_page_key, sle);
             self.nft_pages.insert(new_page_key, new_page);
 
+            if let Some(old_prev_key) = old_prev {
+                let updated = {
+                    if let Some(prev) = self.nft_pages.get_mut(&old_prev_key) {
+                        prev.next_page = Some(new_page_key);
+                        Some(prev.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(prev) = updated {
+                    self.insert_raw(old_prev_key, self.encode_nft_page(&prev));
+                }
+            }
+
             // Now insert into the correct half
-            let first_upper = self.nft_pages[&new_page_key]
-                .tokens
-                .first()
-                .map(|t| t.nftoken_id)
-                .unwrap_or([0xFF; 32]);
-            let insert_key = if token_id >= first_upper {
+            let insert_key = if target_page_key < new_page_key {
                 new_page_key
             } else {
                 page_key
             };
             let updated = {
                 let target = self.nft_pages.get_mut(&insert_key).unwrap();
-                target.insert(token.clone());
+                if !target.insert(token.clone()) {
+                    return Err("tecNO_SUITABLE_NFTOKEN_PAGE");
+                }
                 target.clone()
             };
             let sle = self.encode_nft_page(&updated);
@@ -2057,7 +2287,9 @@ impl LedgerState {
         } else {
             let updated = {
                 let page = self.nft_pages.get_mut(&page_key).unwrap();
-                page.insert(token.clone());
+                if !page.insert(token.clone()) {
+                    return Err("tecNO_SUITABLE_NFTOKEN_PAGE");
+                }
                 page.clone()
             };
             let sle = self.encode_nft_page(&updated);
@@ -2070,13 +2302,106 @@ impl LedgerState {
             NFToken {
                 nftoken_id: token_id,
                 owner: *owner,
-                issuer: *owner,
+                issuer: {
+                    let mut issuer = [0u8; 20];
+                    issuer.copy_from_slice(&token_id[4..24]);
+                    issuer
+                },
                 uri,
-                flags: 0,
-                transfer_fee: 0,
+                flags: u16::from_be_bytes([token_id[0], token_id[1]]),
+                transfer_fee: u16::from_be_bytes([token_id[2], token_id[3]]),
                 taxon: 0,
             },
         );
+        Ok(())
+    }
+
+    pub fn can_insert_nftoken_paged(&self, owner: &[u8; 20], token_id: &[u8; 32]) -> bool {
+        use nft_page::*;
+
+        let target_page_key = page_key_for_token(owner, token_id);
+        let max_key = page_max(owner);
+        let page_key = self
+            .nft_pages
+            .range((
+                std::ops::Bound::Excluded(target_page_key),
+                std::ops::Bound::Included(max_key),
+            ))
+            .next()
+            .map(|(k, _)| *k)
+            .unwrap_or(max_key);
+
+        let Some(page) = self.nft_pages.get(&page_key) else {
+            return true;
+        };
+        if page.len() < MAX_TOKENS_PER_PAGE {
+            return true;
+        }
+
+        let mut page = page.clone();
+        page.split().is_some()
+    }
+
+    /// Update the URI for an existing page-based NFToken and keep the flat
+    /// migration cache synchronized.
+    pub fn update_nftoken_uri_paged(
+        &mut self,
+        owner: &[u8; 20],
+        token_id: &[u8; 32],
+        uri: Option<Vec<u8>>,
+    ) -> bool {
+        use nft_page::*;
+
+        let target_key = page_key_for_token(owner, token_id);
+        let max_key = page_max(owner);
+        let page_key = match self
+            .nft_pages
+            .range((
+                std::ops::Bound::Excluded(target_key),
+                std::ops::Bound::Included(max_key),
+            ))
+            .find(|(_, p)| p.tokens.iter().any(|t| t.nftoken_id == *token_id))
+            .map(|(k, _)| *k)
+        {
+            Some(key) => key,
+            None => return false,
+        };
+
+        let updated = {
+            let Some(page) = self.nft_pages.get_mut(&page_key) else {
+                return false;
+            };
+            let Some(token) = page.tokens.iter_mut().find(|t| t.nftoken_id == *token_id) else {
+                return false;
+            };
+            token.uri = uri.clone();
+            page.clone()
+        };
+        let sle = self.encode_nft_page(&updated);
+        self.insert_raw(page_key, sle);
+
+        if let Some(nft) = self.nftokens.get_mut(token_id) {
+            nft.uri = uri;
+        } else {
+            let flags = u16::from_be_bytes([token_id[0], token_id[1]]);
+            let transfer_fee = u16::from_be_bytes([token_id[2], token_id[3]]);
+            let mut issuer = [0u8; 20];
+            issuer.copy_from_slice(&token_id[4..24]);
+            self.nftokens.insert(
+                *token_id,
+                NFToken {
+                    nftoken_id: *token_id,
+                    owner: *owner,
+                    issuer,
+                    uri,
+                    flags,
+                    transfer_fee,
+                    taxon: 0,
+                },
+            );
+        }
+
+        true
     }
 
     /// Remove an NFToken from the page-based store.
@@ -2091,7 +2416,10 @@ impl LedgerState {
         let page_key = {
             let found = self
                 .nft_pages
-                .range(target_key..=max_key)
+                .range((
+                    std::ops::Bound::Excluded(target_key),
+                    std::ops::Bound::Included(max_key),
+                ))
                 .find(|(_, p)| p.tokens.iter().any(|t| t.nftoken_id == *token_id))
                 .map(|(k, _)| *k);
             match found {
@@ -2110,6 +2438,39 @@ impl LedgerState {
         if page.is_empty() {
             let prev = page.prev_page;
             let next = page.next_page;
+
+            if page_key == max_key {
+                if let Some(prev_key) = prev {
+                    if let Some(mut prev_page) = self.nft_pages.remove(&prev_key) {
+                        let prev_prev = prev_page.prev_page;
+                        page.tokens.append(&mut prev_page.tokens);
+                        page.tokens.sort();
+                        page.prev_page = prev_prev;
+                        page.next_page = None;
+
+                        if let Some(prev_prev_key) = prev_prev {
+                            let updated = {
+                                if let Some(p) = self.nft_pages.get_mut(&prev_prev_key) {
+                                    p.next_page = Some(page_key);
+                                    Some(p.clone())
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(p) = updated {
+                                self.insert_raw(prev_prev_key, self.encode_nft_page(&p));
+                            }
+                        }
+
+                        self.remove_raw(&prev_key);
+                        let updated = page.clone();
+                        self.nft_pages.insert(page_key, page);
+                        self.insert_raw(page_key, self.encode_nft_page(&updated));
+                        self.nftokens.remove(token_id);
+                        return true;
+                    }
+                }
+            }
 
             self.remove_raw(&page_key);
             // Don't re-insert empty page
@@ -2145,10 +2506,14 @@ impl LedgerState {
             // Re-insert the modified page
             self.nft_pages.insert(page_key, page);
 
-            // Attempt merge with previous neighbor, then next
-            let merged =
-                self.try_merge_nft_pages(page_key) || self.try_merge_nft_pages_next(page_key);
-            if !merged {
+            // Attempt merge with previous neighbor, then the survivor's next.
+            let merged_prev = self.try_merge_nft_pages(page_key);
+            let merged_next = self
+                .nft_pages
+                .contains_key(&page_key)
+                .then(|| self.try_merge_nft_pages_next(page_key))
+                .unwrap_or(false);
+            if !(merged_prev || merged_next) {
                 // If no merge, just update the SHAMap for this page
                 if let Some(p) = self.nft_pages.get(&page_key) {
                     let p = p.clone();
@@ -2187,34 +2552,31 @@ impl LedgerState {
             return false;
         }
 
-        // Merge: move all tokens from current into prev
-        let mut current = self.nft_pages.remove(&page_key).unwrap();
-        let next_of_current = current.next_page;
+        // Rippled mergePages(p1, p2) merges lower page p1 into higher page p2
+        // and erases p1. Here prev is p1 and current is p2.
+        let mut prev_page = self.nft_pages.remove(&prev_key).unwrap();
+        let prev_prev = prev_page.prev_page;
 
-        let prev = self.nft_pages.get_mut(&prev_key).unwrap();
-        prev.tokens.append(&mut current.tokens);
-        prev.tokens.sort();
-        prev.next_page = next_of_current;
-        let prev_clone = prev.clone();
+        let current = self.nft_pages.get_mut(&page_key).unwrap();
+        current.tokens.append(&mut prev_page.tokens);
+        current.tokens.sort();
+        current.prev_page = prev_prev;
+        let current_clone = current.clone();
 
-        // Update prev page in SHAMap
-        self.insert_raw(prev_key, self.encode_nft_page(&prev_clone));
+        self.insert_raw(page_key, self.encode_nft_page(&current_clone));
+        self.remove_raw(&prev_key);
 
-        // Remove current page from SHAMap
-        self.remove_raw(&page_key);
-
-        // Fix next page's prev link
-        if let Some(next_key) = next_of_current {
+        if let Some(prev_prev_key) = prev_prev {
             let updated = {
-                if let Some(next) = self.nft_pages.get_mut(&next_key) {
-                    next.prev_page = Some(prev_key);
-                    Some(next.clone())
+                if let Some(prev_prev_page) = self.nft_pages.get_mut(&prev_prev_key) {
+                    prev_prev_page.next_page = Some(page_key);
+                    Some(prev_prev_page.clone())
                 } else {
                     None
                 }
             };
             if let Some(p) = updated {
-                self.insert_raw(next_key, self.encode_nft_page(&p));
+                self.insert_raw(prev_prev_key, self.encode_nft_page(&p));
             }
         }
 
@@ -2244,34 +2606,31 @@ impl LedgerState {
             return false;
         }
 
-        // Merge: move all tokens from next into current
-        let mut next_page = self.nft_pages.remove(&next_key).unwrap();
-        let after_next = next_page.next_page;
+        // Rippled mergePages(p1, p2) merges current lower page into next
+        // higher page and erases current.
+        let mut current_page = self.nft_pages.remove(&page_key).unwrap();
+        let before_current = current_page.prev_page;
 
-        let current = self.nft_pages.get_mut(&page_key).unwrap();
-        current.tokens.append(&mut next_page.tokens);
-        current.tokens.sort();
-        current.next_page = after_next;
-        let current_clone = current.clone();
+        let next = self.nft_pages.get_mut(&next_key).unwrap();
+        next.tokens.append(&mut current_page.tokens);
+        next.tokens.sort();
+        next.prev_page = before_current;
+        let next_clone = next.clone();
 
-        // Update current page in SHAMap
-        self.insert_raw(page_key, self.encode_nft_page(&current_clone));
+        self.insert_raw(next_key, self.encode_nft_page(&next_clone));
+        self.remove_raw(&page_key);
 
-        // Remove next page from SHAMap
-        self.remove_raw(&next_key);
-
-        // Fix the page after next's prev link
-        if let Some(after_key) = after_next {
+        if let Some(before_key) = before_current {
             let updated = {
-                if let Some(p) = self.nft_pages.get_mut(&after_key) {
-                    p.prev_page = Some(page_key);
+                if let Some(p) = self.nft_pages.get_mut(&before_key) {
+                    p.next_page = Some(next_key);
                     Some(p.clone())
                 } else {
                     None
                 }
             };
             if let Some(p) = updated {
-                self.insert_raw(after_key, self.encode_nft_page(&p));
+                self.insert_raw(before_key, self.encode_nft_page(&p));
             }
         }
 
@@ -2380,6 +2739,106 @@ impl LedgerState {
         self.nft_pages.range(min..=max).map(|(k, p)| (*k, p))
     }
 
+    /// Repair the doubly-linked NFTokenPage chain for one owner.
+    ///
+    /// `LedgerStateFix` with `LedgerFixType=1` rewrites broken links and, if
+    /// the directory's final page is not the owner's max page, moves that final
+    /// page into the max-page key like rippled's `repairNFTokenDirectoryLinks`.
+    pub fn repair_nft_page_links(&mut self, owner: &[u8; 20]) -> usize {
+        let min = nft_page::page_min(owner);
+        let max = nft_page::page_max(owner);
+        let mut keys: Vec<Key> = self.nft_pages.range(min..=max).map(|(k, _)| *k).collect();
+        if keys.is_empty() {
+            return 0;
+        }
+
+        let mut repaired = 0usize;
+        if keys.len() == 1 && keys[0] == max {
+            let raw_page = {
+                let Some(page) = self.nft_pages.get_mut(&max) else {
+                    return 0;
+                };
+                if page.prev_page.is_none() && page.next_page.is_none() {
+                    return 0;
+                }
+                page.prev_page = None;
+                page.next_page = None;
+                page.clone()
+            };
+            let raw = self.encode_nft_page(&raw_page);
+            self.insert_raw(max, raw);
+            return 1;
+        }
+
+        for (idx, key) in keys.iter().copied().enumerate() {
+            let prev_page = if idx > 0 { Some(keys[idx - 1]) } else { None };
+            let next_page = if idx + 1 < keys.len() {
+                Some(keys[idx + 1])
+            } else {
+                None
+            };
+            if key == *keys.last().unwrap() && key != max {
+                break;
+            }
+            let raw_page = {
+                let Some(page) = self.nft_pages.get_mut(&key) else {
+                    continue;
+                };
+
+                if page.prev_page == prev_page && page.next_page == next_page {
+                    continue;
+                }
+                page.prev_page = prev_page;
+                page.next_page = next_page;
+                page.clone()
+            };
+            let raw = self.encode_nft_page(&raw_page);
+            self.insert_raw(key, raw);
+            repaired += 1;
+        }
+
+        if let Some(last_key) = keys.pop() {
+            if last_key != max {
+                let Some(mut moved_page) = self.nft_pages.remove(&last_key) else {
+                    return repaired;
+                };
+                let expected_prev = keys.last().copied();
+                moved_page.key = max;
+                moved_page.prev_page = expected_prev;
+                moved_page.next_page = None;
+
+                if let Some(prev_key) = expected_prev {
+                    let updated = {
+                        if let Some(prev_page) = self.nft_pages.get_mut(&prev_key) {
+                            prev_page.next_page = Some(max);
+                            Some(prev_page.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(prev_page) = updated {
+                        self.insert_raw(prev_key, self.encode_nft_page(&prev_page));
+                    }
+                }
+
+                self.remove_raw(&last_key);
+                let raw = self.encode_nft_page(&moved_page);
+                self.insert_raw(max, raw);
+                self.nft_pages.insert(max, moved_page);
+                repaired += 1;
+            } else if let Some(page) = self.nft_pages.get_mut(&max) {
+                if page.next_page.is_some() {
+                    page.next_page = None;
+                    let page = page.clone();
+                    self.insert_raw(max, self.encode_nft_page(&page));
+                    repaired += 1;
+                }
+            }
+        }
+
+        repaired
+    }
+
     pub fn iter_nft_offers(&self) -> impl Iterator<Item = (&Key, &NFTokenOffer)> {
         self.nft_offers.iter()
     }
@@ -2393,11 +2852,19 @@ impl LedgerState {
     /// Used when the SHAMap already has the raw SLE binary from metadata seeding.
     pub fn hydrate_offer(&mut self, off: Offer) {
         let key = off.key();
-        let book_key = BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+        let book_key =
+            BookKey::from_amounts_with_domain(&off.taker_pays, &off.taker_gets, off.domain_id);
         self.order_books
             .entry(book_key)
             .or_insert_with(OrderBook::new)
             .insert(&off);
+        if off.domain_id.is_some() && (off.flags & offer::LSF_HYBRID) != 0 {
+            let open_book_key = BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+            self.order_books
+                .entry(open_book_key)
+                .or_insert_with(OrderBook::new)
+                .insert(&off);
+        }
         let idx = self.account_offers_idx.entry(off.account).or_default();
         if !idx.contains(&key) {
             idx.push(key);
@@ -2416,11 +2883,19 @@ impl LedgerState {
     pub fn insert_offer(&mut self, off: Offer) {
         let key = off.key();
         let data = off.to_sle_binary();
-        let book_key = BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+        let book_key =
+            BookKey::from_amounts_with_domain(&off.taker_pays, &off.taker_gets, off.domain_id);
         self.order_books
             .entry(book_key)
             .or_insert_with(OrderBook::new)
             .insert(&off);
+        if off.domain_id.is_some() && (off.flags & offer::LSF_HYBRID) != 0 {
+            let open_book_key = BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+            self.order_books
+                .entry(open_book_key)
+                .or_insert_with(OrderBook::new)
+                .insert(&off);
+        }
         let idx = self.account_offers_idx.entry(off.account).or_default();
         if !idx.contains(&key) {
             idx.push(key);
@@ -2438,9 +2913,16 @@ impl LedgerState {
         if self.offers.contains_key(key) {
             self.record_preimage(key);
             let off = self.offers.remove(key).unwrap();
-            let book_key = BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+            let book_key =
+                BookKey::from_amounts_with_domain(&off.taker_pays, &off.taker_gets, off.domain_id);
             if let Some(book) = self.order_books.get_mut(&book_key) {
                 book.remove(&off);
+            }
+            if off.domain_id.is_some() && (off.flags & offer::LSF_HYBRID) != 0 {
+                let open_book_key = BookKey::from_amounts(&off.taker_pays, &off.taker_gets);
+                if let Some(book) = self.order_books.get_mut(&open_book_key) {
+                    book.remove(&off);
+                }
             }
             if let Some(v) = self.account_offers_idx.get_mut(&off.account) {
                 v.retain(|k| k != key);
@@ -2702,14 +3184,17 @@ impl LedgerState {
 
     fn take_dirty_impl(&mut self) -> Result<DirtyState, (DirtyState, std::io::Error)> {
         let result = self.drain_dirty_state();
+        let dirty_upserts: Vec<(Key, Vec<u8>)> = result
+            .dirty_raw
+            .iter()
+            .filter_map(|key| self.current_overlay_bytes(key).map(|data| (*key, data)))
+            .collect();
         if let Some(mut map) = self.nudb_map_guard() {
             for key in &result.deleted_raw {
                 map.remove(key);
             }
-            for key in &result.dirty_raw {
-                if let Some(data) = self.state_map.get_if_loaded(key) {
-                    map.insert(*key, data.to_vec());
-                }
+            for (key, data) in dirty_upserts {
+                map.insert(key, data);
             }
         }
 
@@ -3299,6 +3784,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -3308,6 +3794,107 @@ mod tests {
             previous_txn_lgr_seq: 0,
             raw_sle: None,
         }
+    }
+
+    fn make_page_token(owner: &[u8; 20], low_byte: u8) -> nft_page::PageToken {
+        let mut nftoken_id = [0u8; 32];
+        nftoken_id[4..24].copy_from_slice(owner);
+        nftoken_id[31] = low_byte;
+        nft_page::PageToken {
+            nftoken_id,
+            uri: None,
+        }
+    }
+
+    fn insert_test_nft_page(state: &mut LedgerState, page: nft_page::NFTokenPage) {
+        let key = page.key;
+        let raw = state.encode_nft_page(&page);
+        state.nft_pages.insert(key, page);
+        state.insert_raw(key, raw);
+    }
+
+    #[test]
+    fn repair_nft_page_links_noops_clean_single_max_page() {
+        let mut state = LedgerState::new();
+        let owner = [0xA1; 20];
+        let max = nft_page::page_max(&owner);
+        let mut page = nft_page::NFTokenPage::new(max);
+        page.tokens.push(make_page_token(&owner, 1));
+        insert_test_nft_page(&mut state, page);
+        let raw_before = state.get_raw(&max).unwrap().to_vec();
+
+        assert_eq!(state.repair_nft_page_links(&owner), 0);
+        assert_eq!(state.get_raw(&max).unwrap(), raw_before.as_slice());
+    }
+
+    #[test]
+    fn repair_nft_page_links_clears_single_max_page_links() {
+        let mut state = LedgerState::new();
+        let owner = [0xA2; 20];
+        let max = nft_page::page_max(&owner);
+        let bogus = nft_page::page_key_for_token(&owner, &[0x11; 32]);
+        let mut page = nft_page::NFTokenPage::new(max);
+        page.tokens.push(make_page_token(&owner, 1));
+        page.prev_page = Some(bogus);
+        page.next_page = Some(bogus);
+        insert_test_nft_page(&mut state, page);
+
+        assert_eq!(state.repair_nft_page_links(&owner), 1);
+        let repaired = state.nft_pages.get(&max).unwrap();
+        assert_eq!(repaired.prev_page, None);
+        assert_eq!(repaired.next_page, None);
+    }
+
+    #[test]
+    fn repair_nft_page_links_moves_malformed_last_page_to_max() {
+        let mut state = LedgerState::new();
+        let owner = [0xA3; 20];
+        let token = make_page_token(&owner, 0x20);
+        let old_last = nft_page::page_key_for_token(&owner, &token.nftoken_id);
+        let max = nft_page::page_max(&owner);
+        let mut page = nft_page::NFTokenPage::new(old_last);
+        page.tokens.push(token.clone());
+        insert_test_nft_page(&mut state, page);
+
+        assert_eq!(state.repair_nft_page_links(&owner), 1);
+        assert!(state.nft_pages.get(&old_last).is_none());
+        assert!(state.get_raw(&old_last).is_none());
+        let repaired = state.nft_pages.get(&max).unwrap();
+        assert_eq!(repaired.tokens, vec![token]);
+        assert_eq!(repaired.prev_page, None);
+        assert_eq!(repaired.next_page, None);
+        assert!(state.get_raw(&max).is_some());
+        assert_eq!(state.nft_page_count(&owner), 1);
+    }
+
+    #[test]
+    fn removing_only_token_from_max_page_moves_previous_page_into_max() {
+        let mut state = LedgerState::new();
+        let owner = [0xA4; 20];
+        let lower_token = make_page_token(&owner, 0x10);
+        let max_token = make_page_token(&owner, 0xF0);
+        let lower_key = nft_page::page_key_for_token(&owner, &lower_token.nftoken_id);
+        let max = nft_page::page_max(&owner);
+
+        let mut lower = nft_page::NFTokenPage::new(lower_key);
+        lower.tokens.push(lower_token.clone());
+        lower.next_page = Some(max);
+        insert_test_nft_page(&mut state, lower);
+
+        let mut last = nft_page::NFTokenPage::new(max);
+        last.tokens.push(max_token.clone());
+        last.prev_page = Some(lower_key);
+        insert_test_nft_page(&mut state, last);
+
+        assert!(state.remove_nftoken_paged(&owner, &max_token.nftoken_id));
+        assert!(state.nft_pages.get(&lower_key).is_none());
+        assert!(state.get_raw(&lower_key).is_none());
+        let survivor = state.nft_pages.get(&max).unwrap();
+        assert_eq!(survivor.tokens, vec![lower_token]);
+        assert_eq!(survivor.prev_page, None);
+        assert_eq!(survivor.next_page, None);
+        assert_eq!(state.nft_page_count(&owner), 1);
+        assert!(state.get_raw(&max).is_some());
     }
 
     #[test]
@@ -3379,6 +3966,47 @@ mod tests {
         // Account should be gone after discard
         assert!(state.get_account(&acct.account_id).is_none());
         assert_eq!(state.account_count(), 0);
+    }
+
+    #[test]
+    fn nested_commit_is_still_rolled_back_by_outer_discard() {
+        let mut state = LedgerState::new();
+        let acct = make_account(1, 1000, 1);
+
+        state.begin_tx();
+        state.insert_account(acct.clone());
+
+        state.begin_tx();
+        let mut inner = acct.clone();
+        inner.balance = 500;
+        state.insert_account(inner);
+        let inner_journal = state.commit_tx();
+
+        assert_eq!(inner_journal.len(), 1);
+        assert_eq!(state.get_account(&acct.account_id).unwrap().balance, 500);
+
+        state.discard_tx();
+
+        assert!(state.get_account(&acct.account_id).is_none());
+    }
+
+    #[test]
+    fn nested_discard_preserves_parent_changes() {
+        let mut state = LedgerState::new();
+        let acct = make_account(1, 1000, 1);
+
+        state.begin_tx();
+        state.insert_account(acct.clone());
+
+        state.begin_tx();
+        let mut inner = acct.clone();
+        inner.balance = 500;
+        state.insert_account(inner);
+        state.discard_tx();
+
+        assert_eq!(state.get_account(&acct.account_id).unwrap().balance, 1000);
+        state.commit_tx();
+        assert_eq!(state.get_account(&acct.account_id).unwrap().balance, 1000);
     }
 
     #[test]
@@ -3462,6 +4090,7 @@ mod tests {
             destination_node: 0,
             source_tag: None,
             destination_tag: None,
+            invoice_id: None,
             raw_sle: None,
         };
 
@@ -3528,6 +4157,7 @@ mod tests {
             destination_node: 0,
             source_tag: None,
             destination_tag: None,
+            invoice_id: None,
             raw_sle: None,
         };
         state.insert_check(chk.clone());
@@ -3570,6 +4200,7 @@ mod tests {
             destination_node: 0,
             source_tag: None,
             destination_tag: None,
+            invoice_id: None,
             raw_sle: None,
         };
         state.insert_check(chk.clone());

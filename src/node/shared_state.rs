@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Shared State piece of the live node runtime.
 use super::*;
 
 impl SharedState {
@@ -19,6 +18,9 @@ impl SharedState {
             peer_cooldowns: HashMap::new(),
             sync_peer_cooldown: HashMap::new(),
             peer_sync_useful: HashMap::new(),
+            peer_sync_useful_total: HashMap::new(),
+            peer_sync_duplicates: HashMap::new(),
+            peer_sync_duplicates_total: HashMap::new(),
             peer_sync_last_useful: HashMap::new(),
             implausible_validation_state: HashMap::new(),
             rpc_sync_state: None,
@@ -35,6 +37,7 @@ impl SharedState {
             peer_squelch: HashMap::new(),
             validated_hashes: std::collections::HashMap::new(),
             validated_hash_order: std::collections::VecDeque::new(),
+            outside_round_validations: crate::consensus::PreferredLedgerTracker::new(),
         }
     }
 

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Inspect Bundle Tx diagnostic utility for parity investigation.
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 

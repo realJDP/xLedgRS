@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Keylet support for XRPL ledger state and SHAMap logic.
 //! Keylet — type-safe SHAMap lookup key.
 //!
 //! A Keylet pairs a 32-byte SHAMap key with its expected LedgerEntryType.
@@ -12,6 +11,7 @@
 use crate::crypto::sha512_first_half;
 use crate::ledger::sle::{LedgerEntryType, SLE};
 use crate::ledger::Key;
+use crate::transaction::amount::Issue;
 
 /// A type-safe lookup key: SHAMap key + expected entry type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,22 +47,23 @@ const SPACE_DEPOSIT_PREAUTH: [u8; 2] = [0x00, 0x70]; // 'p'
 const SPACE_TICKET: [u8; 2] = [0x00, 0x54]; // 'T'
 const SPACE_SIGNER_LIST: [u8; 2] = [0x00, 0x53]; // 'S'
 const SPACE_PAYCHAN: [u8; 2] = [0x00, 0x78]; // 'x'
-const SPACE_NFT_OFFER: [u8; 2] = [0x00, 0x37]; // '7'
+const SPACE_NFT_OFFER: [u8; 2] = [0x00, 0x71]; // 'q'
 const SPACE_SKIP: [u8; 2] = [0x00, 0x73]; // 's' (ledger hashes)
 const SPACE_AMENDMENTS: [u8; 2] = [0x00, 0x66]; // 'f'
 const SPACE_FEES: [u8; 2] = [0x00, 0x65]; // 'e'
 const SPACE_NEGATIVE_UNL: [u8; 2] = [0x00, 0x4E]; // 'N'
 const SPACE_DID: [u8; 2] = [0x00, 0x49]; // 'I'
-#[allow(dead_code)]
 const SPACE_AMM: [u8; 2] = [0x00, 0x41]; // 'A'
-#[allow(dead_code)]
 const SPACE_ORACLE: [u8; 2] = [0x00, 0x52]; // 'R'
-#[allow(dead_code)]
 const SPACE_CREDENTIAL: [u8; 2] = [0x00, 0x44]; // 'D'
-#[allow(dead_code)]
 const SPACE_MPTOKEN: [u8; 2] = [0x00, 0x74]; // 't'
-#[allow(dead_code)]
 const SPACE_MPTOKEN_ISSUANCE: [u8; 2] = [0x00, 0x7E]; // '~'
+const SPACE_DELEGATE: [u8; 2] = [0x00, 0x45]; // 'E'
+
+const NFT_PAGE_MASK: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+];
 
 // ── Keylet constructors ─────────────────────────────────────────────────────
 
@@ -179,7 +180,7 @@ pub fn signer_list(account: &[u8; 20]) -> Keylet {
     Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::SignerList)
 }
 
-/// NFTokenOffer keylet: SHA-512-half(0x0037 || account || sequence)
+/// NFTokenOffer keylet: SHA-512-half(0x0071 || account || sequence)
 pub fn nft_offer(account: &[u8; 20], sequence: u32) -> Keylet {
     let mut buf = [0u8; 26];
     buf[..2].copy_from_slice(&SPACE_NFT_OFFER);
@@ -238,6 +239,162 @@ pub fn did(account: &[u8; 20]) -> Keylet {
     Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::DID)
 }
 
+fn issue_parts(issue: &Issue) -> ([u8; 20], [u8; 20]) {
+    match issue {
+        Issue::Xrp => ([0u8; 20], [0u8; 20]),
+        Issue::Iou { currency, issuer } => (*issuer, currency.code),
+        Issue::Mpt(_) => ([0u8; 20], [0u8; 20]),
+    }
+}
+
+/// AMM keylet: SHA-512-half(0x0041 || minIssue.account || minIssue.currency || maxIssue.account || maxIssue.currency)
+pub fn amm(issue1: &Issue, issue2: &Issue) -> Keylet {
+    if matches!(issue1, Issue::Mpt(_)) || matches!(issue2, Issue::Mpt(_)) {
+        return amm_with_tagged_issues(issue1, issue2);
+    }
+    let (acct1, cur1) = issue_parts(issue1);
+    let (acct2, cur2) = issue_parts(issue2);
+    let (min_acct, min_cur, max_acct, max_cur) = match cur1.cmp(&cur2) {
+        std::cmp::Ordering::Less => (acct1, cur1, acct2, cur2),
+        std::cmp::Ordering::Greater => (acct2, cur2, acct1, cur1),
+        std::cmp::Ordering::Equal => {
+            if cur1 == [0u8; 20] || acct1 <= acct2 {
+                (acct1, cur1, acct2, cur2)
+            } else {
+                (acct2, cur2, acct1, cur1)
+            }
+        }
+    };
+
+    let mut buf = Vec::with_capacity(82);
+    buf.extend_from_slice(&SPACE_AMM);
+    buf.extend_from_slice(&min_acct);
+    buf.extend_from_slice(&min_cur);
+    buf.extend_from_slice(&max_acct);
+    buf.extend_from_slice(&max_cur);
+    Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::AMM)
+}
+
+fn tagged_issue_bytes(issue: &Issue) -> Vec<u8> {
+    let mut out = Vec::with_capacity(45);
+    match issue {
+        Issue::Xrp => out.push(0),
+        Issue::Iou { currency, issuer } => {
+            out.push(1);
+            out.extend_from_slice(&currency.code);
+            out.extend_from_slice(issuer);
+        }
+        Issue::Mpt(mptid) => {
+            out.push(2);
+            out.extend_from_slice(mptid);
+        }
+    }
+    out
+}
+
+fn amm_with_tagged_issues(issue1: &Issue, issue2: &Issue) -> Keylet {
+    let mut a = tagged_issue_bytes(issue1);
+    let mut b = tagged_issue_bytes(issue2);
+    if b < a {
+        std::mem::swap(&mut a, &mut b);
+    }
+    let mut buf = Vec::with_capacity(2 + a.len() + b.len());
+    buf.extend_from_slice(&SPACE_AMM);
+    buf.extend_from_slice(&a);
+    buf.extend_from_slice(&b);
+    Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::AMM)
+}
+
+/// AMM keylet from an already-derived AMM object id.
+pub fn amm_id(id: [u8; 32]) -> Keylet {
+    Keylet::new(Key(id), LedgerEntryType::AMM)
+}
+
+/// Oracle keylet: SHA-512-half(0x0052 || account || OracleDocumentID)
+pub fn oracle(account: &[u8; 20], document_id: u32) -> Keylet {
+    let mut buf = Vec::with_capacity(26);
+    buf.extend_from_slice(&SPACE_ORACLE);
+    buf.extend_from_slice(account);
+    buf.extend_from_slice(&document_id.to_be_bytes());
+    Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::Oracle)
+}
+
+/// Credential keylet: SHA-512-half(0x0044 || subject || issuer || CredentialType)
+pub fn credential(subject: &[u8; 20], issuer: &[u8; 20], credential_type: &[u8]) -> Keylet {
+    let mut buf = Vec::with_capacity(42 + credential_type.len());
+    buf.extend_from_slice(&SPACE_CREDENTIAL);
+    buf.extend_from_slice(subject);
+    buf.extend_from_slice(issuer);
+    buf.extend_from_slice(credential_type);
+    Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::Credential)
+}
+
+/// MPTokenIssuance keylet: SHA-512-half(0x007E || MPTID)
+pub fn mpt_issuance(mptid: &[u8; 24]) -> Keylet {
+    let mut buf = Vec::with_capacity(26);
+    buf.extend_from_slice(&SPACE_MPTOKEN_ISSUANCE);
+    buf.extend_from_slice(mptid);
+    Keylet::new(
+        Key(sha512_first_half(&buf)),
+        LedgerEntryType::MPTokenIssuance,
+    )
+}
+
+/// MPTokenIssuance keylet from issuer sequence and account.
+pub fn mpt_issuance_from_seq(sequence: u32, issuer: &[u8; 20]) -> Keylet {
+    let mut mptid = [0u8; 24];
+    mptid[..4].copy_from_slice(&sequence.to_be_bytes());
+    mptid[4..].copy_from_slice(issuer);
+    mpt_issuance(&mptid)
+}
+
+/// MPToken keylet: SHA-512-half(0x0074 || issuance_key || holder)
+pub fn mptoken_by_issuance_key(issuance_key: &[u8; 32], holder: &[u8; 20]) -> Keylet {
+    let mut buf = Vec::with_capacity(54);
+    buf.extend_from_slice(&SPACE_MPTOKEN);
+    buf.extend_from_slice(issuance_key);
+    buf.extend_from_slice(holder);
+    Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::MPToken)
+}
+
+/// MPToken keylet from MPTID and holder.
+pub fn mptoken(mptid: &[u8; 24], holder: &[u8; 20]) -> Keylet {
+    let issuance = mpt_issuance(mptid);
+    mptoken_by_issuance_key(&issuance.key.0, holder)
+}
+
+/// Delegate keylet: SHA-512-half(0x0045 || account || authorize)
+pub fn delegate(account: &[u8; 20], authorize: &[u8; 20]) -> Keylet {
+    let mut buf = Vec::with_capacity(42);
+    buf.extend_from_slice(&SPACE_DELEGATE);
+    buf.extend_from_slice(account);
+    buf.extend_from_slice(authorize);
+    Keylet::new(Key(sha512_first_half(&buf)), LedgerEntryType::Delegate)
+}
+
+/// Minimum NFTokenPage key for an owner.
+pub fn nftpage_min(owner: &[u8; 20]) -> Keylet {
+    let mut key = [0u8; 32];
+    key[..20].copy_from_slice(owner);
+    Keylet::new(Key(key), LedgerEntryType::NFTokenPage)
+}
+
+/// Maximum NFTokenPage key for an owner.
+pub fn nftpage_max(owner: &[u8; 20]) -> Keylet {
+    let mut key = NFT_PAGE_MASK;
+    key[..20].copy_from_slice(owner);
+    Keylet::new(Key(key), LedgerEntryType::NFTokenPage)
+}
+
+/// NFTokenPage keylet for a token under a page base.
+pub fn nftpage(base: &Keylet, token: &[u8; 32]) -> Keylet {
+    let mut key = base.key.0;
+    for i in 20..32 {
+        key[i] = (key[i] & !NFT_PAGE_MASK[i]) + (token[i] & NFT_PAGE_MASK[i]);
+    }
+    Keylet::new(Key(key), LedgerEntryType::NFTokenPage)
+}
+
 /// Look up a keylet by its raw 32-byte key and entry type code.
 /// Useful when you have the key from metadata but need a Keylet.
 pub fn from_raw(key: [u8; 32], entry_type_code: u16) -> Option<Keylet> {
@@ -279,5 +436,33 @@ mod tests {
         let root = [0x42; 32];
         let kl = dir_page(&root, 0);
         assert_eq!(kl.key.0, root);
+    }
+
+    #[test]
+    fn amm_mpt_issue_does_not_collide_with_xrp_or_other_mpts() {
+        let xrp_key = amm(
+            &Issue::Xrp,
+            &Issue::Iou {
+                currency: crate::transaction::amount::Currency { code: [1u8; 20] },
+                issuer: [2u8; 20],
+            },
+        );
+        let mpt_key = amm(
+            &Issue::Mpt([0u8; 24]),
+            &Issue::Iou {
+                currency: crate::transaction::amount::Currency { code: [1u8; 20] },
+                issuer: [2u8; 20],
+            },
+        );
+        let other_mpt_key = amm(
+            &Issue::Mpt([3u8; 24]),
+            &Issue::Iou {
+                currency: crate::transaction::amount::Currency { code: [1u8; 20] },
+                issuer: [2u8; 20],
+            },
+        );
+
+        assert_ne!(mpt_key.key, xrp_key.key);
+        assert_ne!(mpt_key.key, other_mpt_key.key);
     }
 }

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Nftoken support for XRPL ledger state and SHAMap logic.
 //! NFToken — non-fungible tokens on the XRP Ledger.
 //!
 //! Simplified flat storage model (one entry per NFT) rather than the page
@@ -224,7 +223,9 @@ impl NFTokenOffer {
         // OwnerNode (UInt64, 3, 4)
         sle.set_field_u64(3, 4, self.owner_node);
 
-        // NFTokenOfferNode (UInt64, 3, ?) — need to check field code
+        // NFTokenOfferNode (UInt64, 3, 12)
+        sle.set_field_u64(3, 12, self.nft_offer_node);
+
         // NFTokenID (Hash256, 5, 10)
         sle.set_field_h256(5, 10, &self.nftoken_id);
 
@@ -282,6 +283,11 @@ impl NFTokenOffer {
                 type_code: 3,
                 field_code: 4,
                 data: self.owner_node.to_be_bytes().to_vec(),
+            },
+            crate::ledger::meta::ParsedField {
+                type_code: 3,
+                field_code: 12,
+                data: self.nft_offer_node.to_be_bytes().to_vec(),
             },
         ];
 

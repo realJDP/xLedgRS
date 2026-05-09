@@ -1,7 +1,6 @@
-//! xLedgRS purpose: Check support for XRPL ledger state and SHAMap logic.
 //! Check — a deferred payment instrument on the XRP Ledger.
 //!
-//! A check authorizes a destination to claim up to a specified amount of XRP.
+//! A check authorizes a destination to claim up to a specified XRP or IOU amount.
 //! Unlike escrow, the creator's balance is NOT locked at creation — it's
 //! debited only when the check is cashed.
 //!
@@ -43,6 +42,8 @@ pub struct Check {
     pub source_tag: Option<u32>,
     /// Optional destination tag.
     pub destination_tag: Option<u32>,
+    /// Optional invoice ID.
+    pub invoice_id: Option<[u8; 32]>,
     /// Original binary SLE data — preserved for round-trip safety.
     #[serde(skip)]
     pub raw_sle: Option<Vec<u8>>,
@@ -88,6 +89,13 @@ impl Check {
             sle.set_field_u32(2, 14, tag);
         } else {
             sle.remove_field(2, 14);
+        }
+
+        // InvoiceID (Hash256, 5, 17)
+        if let Some(id) = self.invoice_id {
+            sle.set_field_raw_pub(5, 17, &id);
+        } else {
+            sle.remove_field(5, 17);
         }
 
         // OwnerNode (UInt64, 3, 4)
@@ -161,9 +169,62 @@ impl Check {
                 data: tag.to_be_bytes().to_vec(),
             });
         }
+        if let Some(id) = self.invoice_id {
+            fields.push(crate::ledger::meta::ParsedField {
+                type_code: 5,
+                field_code: 17,
+                data: id.to_vec(),
+            });
+        }
 
         crate::ledger::meta::build_sle(0x0043, &fields, None, None)
     }
+
+    pub fn from_sle(key: &Key, raw_sle: Vec<u8>) -> Option<Self> {
+        let parsed = crate::ledger::meta::parse_sle(&raw_sle)?;
+        if parsed.entry_type != 0x0043 {
+            return None;
+        }
+        let account = account_field(&parsed.fields, 1)?;
+        let sequence = u32_field(&parsed.fields, 4)?;
+        let check = Self {
+            account,
+            destination: account_field(&parsed.fields, 3)?,
+            send_max: crate::transaction::Amount::from_bytes(&field(&parsed.fields, 6, 9)?)
+                .ok()?
+                .0,
+            sequence,
+            expiration: u32_field(&parsed.fields, 10).unwrap_or(0),
+            owner_node: u64_field(&parsed.fields, 4).unwrap_or(0),
+            destination_node: u64_field(&parsed.fields, 9).unwrap_or(0),
+            source_tag: u32_field(&parsed.fields, 3),
+            destination_tag: u32_field(&parsed.fields, 14),
+            invoice_id: field(&parsed.fields, 5, 17).and_then(|data| data.try_into().ok()),
+            raw_sle: Some(raw_sle),
+        };
+        (check.key() == *key).then_some(check)
+    }
+}
+
+fn field(fields: &[crate::ledger::meta::ParsedField], tc: u16, fc: u16) -> Option<Vec<u8>> {
+    fields
+        .iter()
+        .find(|field| field.type_code == tc && field.field_code == fc)
+        .map(|field| field.data.clone())
+}
+
+fn u32_field(fields: &[crate::ledger::meta::ParsedField], fc: u16) -> Option<u32> {
+    let data = field(fields, 2, fc)?;
+    Some(u32::from_be_bytes(data.get(..4)?.try_into().ok()?))
+}
+
+fn u64_field(fields: &[crate::ledger::meta::ParsedField], fc: u16) -> Option<u64> {
+    let data = field(fields, 3, fc)?;
+    Some(u64::from_be_bytes(data.get(..8)?.try_into().ok()?))
+}
+
+fn account_field(fields: &[crate::ledger::meta::ParsedField], fc: u16) -> Option<[u8; 20]> {
+    field(fields, 8, fc)?.try_into().ok()
 }
 
 #[cfg(test)]

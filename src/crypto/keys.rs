@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Keys helpers for XRPL keys, signing, and addresses.
 //! XRPL key generation, derivation, signing, and verification.
 //!
 //! The XRPL supports two key families:
