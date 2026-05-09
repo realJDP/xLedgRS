@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Inbound support for XRPL ledger state and SHAMap logic.
 //! InboundLedger — per-hash ledger acquisition, modeled after rippled's
 //! InboundLedger / InboundLedgers.
 //!
@@ -16,12 +15,12 @@ use crate::ledger::LedgerHeader;
 pub(crate) const LEDGER_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(3_000);
 pub(crate) const LEDGER_TIMEOUT_RETRIES_MAX: u8 = 6;
 pub(crate) const LEDGER_REACQUIRE_INTERVAL: Duration = Duration::from_secs(300);
-pub(crate) const LEDGER_BECOME_AGGRESSIVE_THRESHOLD: u8 = 4;
 pub(crate) const MISSING_NODES_FIND: usize = 256;
 pub(crate) const REQ_NODES_REPLY: usize = 128;
 pub(crate) const REQ_NODES_TIMEOUT: usize = 12;
-pub(crate) const REPLY_FOLLOWUP_PEERS: usize = 6;
-pub(crate) const TIMEOUT_FOLLOWUP_PEERS: usize = 3;
+pub(crate) const REQ_OBJECTS_TIMEOUT: usize = 4;
+pub(crate) const REPLY_FOLLOWUP_PEERS: usize = 10;
+pub(crate) const TIMEOUT_FOLLOWUP_PEERS: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundReason {
@@ -112,13 +111,20 @@ pub struct InboundLedger {
     pub header: Option<LedgerHeader>,
     /// Filled when liTX_NODE response arrives: (tx_blob, meta_blob) pairs.
     pub tx_blobs: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Account-state tree root from the ledger header.
+    state_root: Option<[u8; 32]>,
+    /// True once the account-state SHAMap for `state_root` has been verified.
+    state_complete: bool,
     /// Transaction tree root computed directly from the received wire nodes.
     tx_root: Option<[u8; 32]>,
     /// Indexed liTX_NODE wire nodes collected across one or more replies.
     tx_wire_nodes: BTreeMap<[u8; 33], Vec<u8>>,
-    /// Watch channel — stores completion state. Late readers always see it.
+    /// Watch channel — stores full ledger completion state. Late readers always see it.
     watch_tx: Arc<tokio::sync::watch::Sender<bool>>,
     pub watch_rx: tokio::sync::watch::Receiver<bool>,
+    /// Explicit tx-only watch channel for historical replay/follower fetches.
+    tx_watch_tx: Arc<tokio::sync::watch::Sender<bool>>,
+    tx_watch_rx: tokio::sync::watch::Receiver<bool>,
     /// For timeout cleanup.
     pub created_at: Instant,
     /// Last meaningful interaction with this acquisition.
@@ -137,7 +143,12 @@ pub struct InboundLedgerSummary {
     pub ledger_seq: u32,
     pub reason: String,
     pub has_header: bool,
+    pub has_state: bool,
     pub has_transactions: bool,
+    pub tx_complete: bool,
+    pub tx_missing_nodes: usize,
+    pub state_root_known: bool,
+    pub full_complete: bool,
     pub complete: bool,
     pub failed: bool,
     pub timeout_count: u32,
@@ -149,6 +160,11 @@ pub struct InboundLedgerSummary {
 pub struct InboundLedgersSnapshot {
     pub active: usize,
     pub complete: usize,
+    pub header_complete: usize,
+    pub state_complete: usize,
+    pub tx_complete: usize,
+    pub full_complete: usize,
+    pub tx_missing_nodes_total: usize,
     pub failed: usize,
     pub retry_ready: usize,
     pub stale: usize,
@@ -167,6 +183,9 @@ pub struct InboundLedgersSnapshot {
     pub history: usize,
     pub generic: usize,
     pub consensus: usize,
+    pub header_responses_total: u64,
+    pub tx_node_responses_total: u64,
+    pub state_tree_complete_total: u64,
     pub entries: Vec<InboundLedgerSummary>,
 }
 
@@ -177,6 +196,7 @@ impl InboundLedger {
 
     pub fn with_reason(ledger_hash: [u8; 32], ledger_seq: u32, reason: InboundReason) -> Self {
         let (tx, rx) = tokio::sync::watch::channel(false);
+        let (tx_only_tx, tx_only_rx) = tokio::sync::watch::channel(false);
         let now = Instant::now();
         Self {
             ledger_hash,
@@ -184,10 +204,14 @@ impl InboundLedger {
             reason,
             header: None,
             tx_blobs: None,
+            state_root: None,
+            state_complete: false,
             tx_root: None,
             tx_wire_nodes: BTreeMap::new(),
             watch_tx: Arc::new(tx),
             watch_rx: rx,
+            tx_watch_tx: Arc::new(tx_only_tx),
+            tx_watch_rx: tx_only_rx,
             created_at: now,
             last_action: now,
             last_timeout: now,
@@ -204,7 +228,22 @@ impl InboundLedger {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.timeout.complete || (self.header.is_some() && self.tx_blobs.is_some())
+        self.timeout.complete || self.is_fully_complete()
+    }
+
+    pub fn is_fully_complete(&self) -> bool {
+        self.header.is_some()
+            && self.tx_blobs.is_some()
+            && self.tx_root_matches_header()
+            && self.state_complete
+    }
+
+    pub fn is_tx_complete(&self) -> bool {
+        self.header.is_some() && self.tx_blobs.is_some() && self.tx_root_matches_header()
+    }
+
+    pub fn has_state(&self) -> bool {
+        self.state_complete
     }
 
     pub fn is_failed(&self) -> bool {
@@ -219,7 +258,7 @@ impl InboundLedger {
         self.recent_nodes.clear();
     }
 
-    /// Ingest a liBASE header. Returns true if now complete.
+    /// Ingest a liBASE header. Returns true if the full ledger is now complete.
     pub fn got_header(&mut self, header: LedgerHeader) -> bool {
         if self.header.is_some() {
             return false;
@@ -227,13 +266,44 @@ impl InboundLedger {
         if header.hash != self.ledger_hash {
             return false;
         }
-        if header.transaction_hash == [0u8; 32] {
+        self.state_root = Some(header.account_hash);
+        if header.account_hash == [0u8; 32] {
+            self.state_complete = true;
+        }
+        let transaction_hash = header.transaction_hash;
+        self.header = Some(header);
+        if transaction_hash == [0u8; 32] {
             self.tx_blobs = Some(Vec::new());
             self.tx_root = Some([0u8; 32]);
         } else {
             self.try_finalize_tx_tree();
         }
-        self.header = Some(header);
+        self.touch();
+        self.timeout.note_progress();
+        if self.is_tx_complete() {
+            let _ = self.tx_watch_tx.send(true);
+        }
+        if self.is_complete() {
+            self.timeout.mark_complete();
+            let _ = self.watch_tx.send(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark the account-state tree complete after the independent SHAMap sync
+    /// has verified `account_hash`. This is separate from tx acquisition so
+    /// callers can see whether they have a full rippled-style ledger or only
+    /// enough transaction data to replay/follow.
+    pub fn got_state_tree(&mut self, account_hash: [u8; 32]) -> bool {
+        if let Some(expected) = self.state_root {
+            if expected != account_hash {
+                return false;
+            }
+        }
+        self.state_root = Some(account_hash);
+        self.state_complete = true;
         self.touch();
         self.timeout.note_progress();
         if self.is_complete() {
@@ -245,7 +315,7 @@ impl InboundLedger {
         }
     }
 
-    /// Ingest a liTX_NODE response. Returns true if now complete.
+    /// Ingest a liTX_NODE response. Returns true if the full ledger is now complete.
     pub fn got_tx_data(&mut self, nodes: &[crate::proto::TmLedgerNode]) -> bool {
         if self.tx_blobs.is_some() {
             return false;
@@ -254,6 +324,9 @@ impl InboundLedger {
         self.try_finalize_tx_tree();
         self.touch();
         self.timeout.note_progress();
+        if self.is_tx_complete() {
+            let _ = self.tx_watch_tx.send(true);
+        }
         if self.is_complete() {
             self.timeout.mark_complete();
             let _ = self.watch_tx.send(true);
@@ -301,10 +374,39 @@ impl InboundLedger {
                 nodeid: Some(node_id.to_vec()),
             })
             .collect();
-        self.tx_root = compute_tx_root_from_wire_nodes(&indexed_nodes);
+        let Some(tx_root) = compute_tx_root_from_wire_nodes(&indexed_nodes) else {
+            self.tx_root = None;
+            self.tx_wire_nodes.clear();
+            return;
+        };
+        self.tx_root = Some(tx_root);
+
+        let Some(header) = self.header.as_ref() else {
+            return;
+        };
+        if tx_root != header.transaction_hash {
+            tracing::warn!(
+                "inbound ledger tx root mismatch: hash={} seq={} expected={} got={}",
+                hex::encode_upper(&self.ledger_hash[..8]),
+                self.ledger_seq,
+                hex::encode_upper(&header.transaction_hash[..8]),
+                hex::encode_upper(&tx_root[..8]),
+            );
+            self.tx_root = None;
+            self.tx_wire_nodes.clear();
+            return;
+        }
+
         self.tx_blobs = Some(crate::ledger::close::extract_tx_blobs_from_tx_tree(
             &indexed_nodes,
         ));
+    }
+
+    fn tx_root_matches_header(&self) -> bool {
+        let Some(header) = self.header.as_ref() else {
+            return false;
+        };
+        self.tx_root == Some(header.transaction_hash)
     }
 }
 
@@ -444,6 +546,12 @@ pub struct InboundLedgers {
     stop_total: u64,
     /// Wall-clock timestamp of the most recent stop.
     last_stop_unix: Option<u64>,
+    /// Count of liBASE/header responses routed into acquisitions.
+    header_responses_total: u64,
+    /// Count of liTX_NODE responses routed into acquisitions.
+    tx_node_responses_total: u64,
+    /// Count of account-state tree completions routed into acquisitions.
+    state_tree_complete_total: u64,
 }
 
 impl InboundLedgers {
@@ -478,6 +586,9 @@ impl InboundLedgers {
             last_sweep_unix: None,
             stop_total: 0,
             last_stop_unix: None,
+            header_responses_total: 0,
+            tx_node_responses_total: 0,
+            state_tree_complete_total: 0,
         }
     }
 
@@ -496,7 +607,12 @@ impl InboundLedgers {
                 ledger_seq: ledger.ledger_seq,
                 reason: ledger.reason.label().to_string(),
                 has_header: ledger.header.is_some(),
+                has_state: ledger.has_state(),
                 has_transactions: ledger.tx_blobs.is_some(),
+                tx_complete: ledger.is_tx_complete(),
+                tx_missing_nodes: ledger.missing_tx_node_ids(usize::MAX).len(),
+                state_root_known: ledger.state_root.is_some(),
+                full_complete: ledger.is_fully_complete(),
                 complete: ledger.is_complete(),
                 failed: ledger.is_failed(),
                 timeout_count: ledger.timeout.timeouts,
@@ -522,6 +638,31 @@ impl InboundLedgers {
                 .values()
                 .filter(|ledger| ledger.is_complete())
                 .count(),
+            header_complete: self
+                .map
+                .values()
+                .filter(|ledger| ledger.header.is_some())
+                .count(),
+            state_complete: self
+                .map
+                .values()
+                .filter(|ledger| ledger.has_state())
+                .count(),
+            tx_complete: self
+                .map
+                .values()
+                .filter(|ledger| ledger.is_tx_complete())
+                .count(),
+            full_complete: self
+                .map
+                .values()
+                .filter(|ledger| ledger.is_fully_complete())
+                .count(),
+            tx_missing_nodes_total: self
+                .map
+                .values()
+                .map(|ledger| ledger.missing_tx_node_ids(usize::MAX).len())
+                .sum(),
             failed: self
                 .map
                 .values()
@@ -544,6 +685,9 @@ impl InboundLedgers {
             history: 0,
             generic: 0,
             consensus: 0,
+            header_responses_total: self.header_responses_total,
+            tx_node_responses_total: self.tx_node_responses_total,
+            state_tree_complete_total: self.state_tree_complete_total,
             entries,
         };
         for ledger in self.map.values() {
@@ -628,7 +772,7 @@ impl InboundLedgers {
         self.map.get(hash)
     }
 
-    /// rippled-style acquire/create entry point.
+    /// rippled-style acquire/create entry point for full ledger acquisition.
     pub fn acquire(
         &mut self,
         hash: [u8; 32],
@@ -662,6 +806,50 @@ impl InboundLedgers {
         il.watch_rx.clone()
     }
 
+    /// Create or get an acquisition for tx-only historical replay paths.
+    ///
+    /// This intentionally does not model rippled `InboundLedger` completion;
+    /// callers must use `take`, not `take_full`, and must not advance accepted
+    /// ledger context from this signal.
+    pub fn acquire_tx_only(
+        &mut self,
+        hash: [u8; 32],
+        seq: u32,
+        reason: InboundReason,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        self.prune_recent_failures();
+        let is_new = !self.map.contains_key(&hash);
+        let total = self.map.len();
+        let il = self
+            .map
+            .entry(hash)
+            .or_insert_with(|| InboundLedger::with_reason(hash, seq, reason));
+        if !is_new {
+            il.update(seq);
+        }
+        if is_new {
+            tracing::info!(
+                "inbound_ledgers.acquire_tx_only: NEW hash={} seq={} reason={:?} total={}",
+                hex::encode_upper(&hash[..8]),
+                seq,
+                reason,
+                total + 1,
+            );
+        } else {
+            tracing::info!(
+                "inbound_ledgers.acquire_tx_only: EXISTING hash={} seq={} reason={:?} has_header={} has_tx={} tx_complete={} full_complete={}",
+                hex::encode_upper(&hash[..8]),
+                seq,
+                il.reason,
+                il.header.is_some(),
+                il.tx_blobs.is_some(),
+                il.is_tx_complete(),
+                il.is_complete(),
+            );
+        }
+        il.tx_watch_rx.clone()
+    }
+
     /// Create or get an acquisition. Returns a watch receiver that
     /// the caller can await — it will see `true` when complete, even
     /// if the completion happened before the caller starts watching.
@@ -673,6 +861,7 @@ impl InboundLedgers {
     /// Also records seq→hash for follower catch-up lookups.
     pub fn got_header(&mut self, hash: &[u8; 32], header: LedgerHeader) -> bool {
         self.prune_recent_failures();
+        self.header_responses_total = self.header_responses_total.saturating_add(1);
         // Always record seq→hash for follower catch-up
         if header.sequence > 0 {
             self.seq_hashes.insert(header.sequence, *hash);
@@ -712,11 +901,13 @@ impl InboundLedgers {
         }
     }
 
-    /// Route a liTX_NODE response by hash. If no acquisition exists yet,
-    /// create one and buffer the indexed TX tree nodes — the header may arrive
-    /// shortly after, or a later follow-up may fill missing descendants.
+    /// Route a liTX_NODE response by hash. Unknown tx-node data is ignored:
+    /// rippled does not let unsolicited transaction-tree messages create
+    /// acquisition state. Callers must create/acquire the hash from liBASE,
+    /// validation, follower, or anchor state before tx nodes can be merged.
     pub fn got_tx_data(&mut self, hash: &[u8; 32], nodes: &[crate::proto::TmLedgerNode]) -> bool {
         self.prune_recent_failures();
+        self.tx_node_responses_total = self.tx_node_responses_total.saturating_add(1);
         if let Some(il) = self.map.get_mut(hash) {
             let was_complete = il.is_complete();
             let result = il.got_tx_data(nodes);
@@ -726,16 +917,40 @@ impl InboundLedgers {
             );
             return result;
         }
-        // TX data arrived before header — create acquisition and buffer it.
         tracing::debug!(
-            "inbound_ledgers.got_tx_data: hash={} NO ACQUISITION — auto-creating (nodes={})",
+            "inbound_ledgers.got_tx_data: hash={} NO ACQUISITION — dropping unsolicited liTX_NODE (nodes={})",
             hex::encode_upper(&hash[..8]),
             nodes.len(),
         );
-        let mut il = InboundLedger::new(*hash, 0);
-        il.got_tx_data(nodes);
-        self.map.insert(*hash, il);
         false
+    }
+
+    /// Record that the account-state tree for this ledger has been verified.
+    /// This is the state side of rippled's full `InboundLedger` completion.
+    pub fn got_state_tree(&mut self, hash: &[u8; 32], account_hash: [u8; 32]) -> bool {
+        self.prune_recent_failures();
+        self.state_tree_complete_total = self.state_tree_complete_total.saturating_add(1);
+        match self.map.get_mut(hash) {
+            Some(il) => {
+                let was_full = il.is_fully_complete();
+                let full_complete = il.got_state_tree(account_hash);
+                tracing::info!(
+                    "inbound_ledgers.got_state_tree: hash={} seq={} matched=true was_full={} now_full={} full_complete={}",
+                    hex::encode_upper(&hash[..8]),
+                    il.ledger_seq,
+                    was_full,
+                    il.is_fully_complete(),
+                    full_complete,
+                );
+                full_complete
+            }
+            None => {
+                let mut il = InboundLedger::new(*hash, 0);
+                il.got_state_tree(account_hash);
+                self.map.insert(*hash, il);
+                false
+            }
+        }
     }
 
     pub fn missing_tx_node_ids(&self, hash: &[u8; 32], limit: usize) -> Vec<Vec<u8>> {
@@ -745,25 +960,36 @@ impl InboundLedgers {
             .unwrap_or_default()
     }
 
-    /// Check if complete.
+    /// Check if rippled-style full ledger acquisition is complete.
     pub fn is_complete(&self, hash: &[u8; 32]) -> bool {
         self.map.get(hash).map_or(false, |il| il.is_complete())
     }
 
-    /// Take a completed acquisition out. Returns (header, tx_blobs, tx_root).
+    pub fn is_fully_complete(&self, hash: &[u8; 32]) -> bool {
+        self.map
+            .get(hash)
+            .map_or(false, |il| il.is_fully_complete())
+    }
+
+    /// Take a transaction-complete acquisition out.
+    ///
+    /// This remains available for historical/follower paths that can fall back
+    /// to RPC or validated replay. Validator-critical handoff should use
+    /// `take_full`, which also requires the account-state tree to be verified.
     pub fn take(
         &mut self,
         hash: &[u8; 32],
     ) -> Option<(LedgerHeader, Vec<(Vec<u8>, Vec<u8>)>, Option<[u8; 32]>)> {
         self.prune_recent_failures();
-        let complete = self.is_complete(hash);
+        let complete = self.map.get(hash).is_some_and(|il| il.is_tx_complete());
         if !complete {
             // Diagnostic: why isn't it complete?
             if let Some(il) = self.map.get(hash) {
                 tracing::info!(
-                    "inbound_ledgers.take: hash={} seq={} INCOMPLETE has_header={} has_tx={} age={:.1}s",
+                    "inbound_ledgers.take: hash={} seq={} TX_INCOMPLETE has_header={} has_tx={} full_complete={} age={:.1}s",
                     hex::encode_upper(&hash[..8]), il.ledger_seq,
                     il.header.is_some(), il.tx_blobs.is_some(),
+                    il.is_complete(),
                     il.created_at.elapsed().as_secs_f64(),
                 );
             } else {
@@ -778,12 +1004,53 @@ impl InboundLedgers {
         let il = self.map.remove(hash)?;
         self.on_ledger_fetched(il.reason);
         tracing::info!(
-            "inbound_ledgers.take: hash={} seq={} COMPLETE tx_count={}",
+            "inbound_ledgers.take: hash={} seq={} TX_ONLY_COMPLETE tx_count={}",
             hex::encode_upper(&hash[..8]),
             il.ledger_seq,
             il.tx_blobs.as_ref().map_or(0, |b| b.len()),
         );
         Some((il.header.unwrap(), il.tx_blobs.unwrap(), il.tx_root))
+    }
+
+    /// Take a rippled-style full acquisition: header + state tree + tx tree.
+    pub fn take_full(
+        &mut self,
+        hash: &[u8; 32],
+    ) -> Option<(LedgerHeader, Vec<(Vec<u8>, Vec<u8>)>, [u8; 32])> {
+        self.prune_recent_failures();
+        if !self.is_fully_complete(hash) {
+            if let Some(il) = self.map.get(hash) {
+                tracing::info!(
+                    "inbound_ledgers.take_full: hash={} seq={} INCOMPLETE has_header={} has_state={} has_tx={} age={:.1}s",
+                    hex::encode_upper(&hash[..8]),
+                    il.ledger_seq,
+                    il.header.is_some(),
+                    il.has_state(),
+                    il.tx_blobs.is_some(),
+                    il.created_at.elapsed().as_secs_f64(),
+                );
+            } else {
+                tracing::info!(
+                    "inbound_ledgers.take_full: hash={} NOT FOUND (pending={})",
+                    hex::encode_upper(&hash[..8]),
+                    self.map.len(),
+                );
+            }
+            return None;
+        }
+        let il = self.map.remove(hash)?;
+        self.on_ledger_fetched(il.reason);
+        let tx_root = il.tx_root?;
+        tracing::info!(
+            "inbound_ledgers.take_full: hash={} seq={} FULL tx_count={} state_hash={}",
+            hex::encode_upper(&hash[..8]),
+            il.ledger_seq,
+            il.tx_blobs.as_ref().map_or(0, |b| b.len()),
+            il.state_root
+                .map(|h| hex::encode_upper(&h[..8]))
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+        Some((il.header.unwrap(), il.tx_blobs.unwrap(), tx_root))
     }
 
     /// Remove stale acquisitions older than max_age.
@@ -1139,7 +1406,7 @@ mod tests {
         let mut inbound = InboundLedgers::new();
 
         let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
-        assert!(inbound.got_header(&hdr.hash, hdr.clone()));
+        assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
         assert!(!inbound.got_tx_data(&hdr.hash, &[]));
 
         let taken = inbound.take(&hdr.hash);
@@ -1298,7 +1565,9 @@ mod tests {
             inbound.got_tx_data(&hdr.hash, &followup);
         }
 
-        assert!(inbound.is_complete(&hdr.hash));
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.is_tx_complete());
+        assert!(!ledger.is_fully_complete());
         let (_taken_header, tx_blobs, tx_root) =
             inbound.take(&hdr.hash).expect("complete acquisition");
         assert_eq!(tx_blobs.len(), expected_txs);
@@ -1306,17 +1575,156 @@ mod tests {
     }
 
     #[test]
-    fn tx_prefetch_before_header_still_completes_after_attach() {
+    fn tx_tree_root_must_match_base_header_before_completion() {
+        let (mut hdr, mut tx_map, _expected_txs) = tx_fixture();
+        hdr.transaction_hash = [0xFE; 32];
+        hdr.hash = hdr.compute_hash();
+        let mut inbound = InboundLedgers::new();
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
+
+        for (node_id, nodedata) in
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 16)
+        {
+            inbound.got_tx_data(&hdr.hash, &tm_nodes_from_wire(vec![(node_id, nodedata)]));
+        }
+
+        assert!(!inbound.is_complete(&hdr.hash));
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.tx_blobs.is_none());
+        assert_ne!(ledger.tx_root, Some(hdr.transaction_hash));
+        assert!(inbound.take(&hdr.hash).is_none());
+    }
+
+    #[test]
+    fn snapshot_tracks_header_state_and_transaction_phases_independently() {
+        let (hdr, mut tx_map, _expected_txs) = tx_fixture();
+        let mut inbound = InboundLedgers::new();
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        inbound.got_header(&hdr.hash, hdr.clone());
+        let first_node = tx_map
+            .get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 0)
+            .into_iter()
+            .next()
+            .expect("root tx node");
+        inbound.got_tx_data(&hdr.hash, &tm_nodes_from_wire(vec![first_node]));
+
+        let snapshot = inbound.snapshot(8);
+        assert_eq!(snapshot.active, 1);
+        assert_eq!(snapshot.header_complete, 1);
+        assert_eq!(snapshot.state_complete, 0);
+        assert_eq!(snapshot.tx_complete, 0);
+        assert_eq!(snapshot.full_complete, 0);
+        assert_eq!(snapshot.header_responses_total, 1);
+        assert_eq!(snapshot.tx_node_responses_total, 1);
+        assert_eq!(snapshot.state_tree_complete_total, 0);
+        assert!(snapshot.tx_missing_nodes_total > 0);
+
+        let entry = snapshot.entries.first().expect("entry");
+        assert!(entry.has_header);
+        assert!(entry.state_root_known);
+        assert!(!entry.has_state);
+        assert!(!entry.tx_complete);
+        assert!(entry.tx_missing_nodes > 0);
+    }
+
+    #[test]
+    fn unknown_tx_node_data_does_not_create_acquisition() {
         let (hdr, mut tx_map, expected_txs) = tx_fixture();
         let mut inbound = InboundLedgers::new();
 
+        for (node_id, nodedata) in
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 16)
+        {
+            inbound.got_tx_data(&hdr.hash, &tm_nodes_from_wire(vec![(node_id, nodedata)]));
+        }
+
+        assert!(inbound.get(&hdr.hash).is_none());
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
+        for (node_id, nodedata) in
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 16)
+        {
+            inbound.got_tx_data(&hdr.hash, &tm_nodes_from_wire(vec![(node_id, nodedata)]));
+        }
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.is_tx_complete());
+        assert!(!ledger.is_fully_complete());
+        let (_taken_header, tx_blobs, tx_root) =
+            inbound.take(&hdr.hash).expect("complete acquisition");
+        assert_eq!(tx_blobs.len(), expected_txs);
+        assert_eq!(tx_root, Some(hdr.transaction_hash));
+    }
+
+    #[test]
+    fn full_completion_requires_state_tree_mark() {
+        let (hdr, mut tx_map, expected_txs) = tx_fixture();
+        let mut inbound = InboundLedgers::new();
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
+
+        for (node_id, nodedata) in
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 16)
+        {
+            inbound.got_tx_data(&hdr.hash, &tm_nodes_from_wire(vec![(node_id, nodedata)]));
+        }
+
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.is_tx_complete());
+        assert!(!ledger.is_complete());
+        assert!(!ledger.is_fully_complete());
+        assert!(!ledger.has_state());
+
+        assert!(inbound.got_state_tree(&hdr.hash, hdr.account_hash));
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.is_fully_complete());
+        assert!(ledger.has_state());
+        assert_eq!(ledger.tx_blobs.as_ref().map(Vec::len), Some(expected_txs));
+    }
+
+    #[test]
+    fn take_full_waits_for_state_tree() {
+        let (hdr, mut tx_map, expected_txs) = tx_fixture();
+        let mut inbound = InboundLedgers::new();
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        inbound.got_header(&hdr.hash, hdr.clone());
+        for (node_id, nodedata) in
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 16)
+        {
+            inbound.got_tx_data(&hdr.hash, &tm_nodes_from_wire(vec![(node_id, nodedata)]));
+        }
+
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.is_tx_complete());
+        assert!(!inbound.is_fully_complete(&hdr.hash));
+        assert!(inbound.take_full(&hdr.hash).is_none());
+
+        inbound.got_state_tree(&hdr.hash, hdr.account_hash);
+        let (_header, tx_blobs, tx_root) = inbound.take_full(&hdr.hash).expect("full acquisition");
+        assert_eq!(tx_blobs.len(), expected_txs);
+        assert_eq!(tx_root, hdr.transaction_hash);
+    }
+
+    #[test]
+    fn known_acquisition_can_receive_tx_nodes_before_header() {
+        let (hdr, mut tx_map, expected_txs) = tx_fixture();
+        let mut inbound = InboundLedgers::new();
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
         let root_only = tm_nodes_from_wire(
             tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 0),
         );
         assert!(!inbound.got_tx_data(&hdr.hash, &root_only));
-        assert_eq!(inbound.get(&hdr.hash).map(|il| il.ledger_seq), Some(0));
+        assert_eq!(
+            inbound.get(&hdr.hash).map(|il| il.ledger_seq),
+            Some(hdr.sequence)
+        );
 
-        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
         assert!(!inbound.got_header(&hdr.hash, hdr.clone()));
         assert!(!inbound.is_complete(&hdr.hash));
 
@@ -1329,6 +1737,37 @@ mod tests {
             inbound.got_tx_data(&hdr.hash, &followup);
         }
 
-        assert!(inbound.is_complete(&hdr.hash));
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.is_tx_complete());
+        assert!(!ledger.is_fully_complete());
+    }
+
+    #[test]
+    fn invalid_tx_tree_clears_frontier_for_fresh_root_retry() {
+        let (hdr, mut tx_map, _expected_txs) = tx_fixture();
+        let mut inbound = InboundLedgers::new();
+
+        let _ = inbound.acquire(hdr.hash, hdr.sequence, InboundReason::History);
+        inbound.got_header(&hdr.hash, hdr.clone());
+        let mut nodes = tm_nodes_from_wire(
+            tx_map.get_wire_nodes_for_query(&crate::ledger::shamap_id::SHAMapNodeID::root(), 16),
+        );
+        let leaf = nodes
+            .iter_mut()
+            .find(|node| node.nodedata.last().copied() == Some(0x04))
+            .expect("fixture has tx leaves");
+        leaf.nodedata[0] ^= 0xFF;
+        inbound.got_tx_data(&hdr.hash, &nodes);
+
+        let missing = inbound.missing_tx_node_ids(&hdr.hash, 16);
+        assert_eq!(
+            missing,
+            vec![crate::ledger::shamap_id::SHAMapNodeID::root()
+                .to_wire()
+                .to_vec()]
+        );
+        let ledger = inbound.get(&hdr.hash).expect("acquisition");
+        assert!(ledger.tx_root.is_none());
+        assert!(ledger.tx_blobs.is_none());
     }
 }

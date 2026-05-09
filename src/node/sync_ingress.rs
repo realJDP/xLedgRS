@@ -1,5 +1,6 @@
-//! xLedgRS purpose: Sync Ingress piece of the live node runtime.
 use super::*;
+
+const MAX_STALE_AS_NODE_STASH: usize = 128;
 
 impl Node {
     pub(super) async fn handle_sync_header_trigger(
@@ -42,19 +43,19 @@ impl Node {
             return;
         }
 
-        let leaf_count = self
+        let persisted_leaf_count = self
             .storage
             .as_ref()
-            .and_then(|store| store.get_leaf_count())
-            .map(|lc| lc as usize);
-        let plan = self.sync_runtime.plan_header_trigger(
+            .and_then(|store| store.get_leaf_count().map(|count| count as usize));
+        let mut plan = self.sync_runtime.plan_header_trigger(
             header.clone(),
             &ld,
             self.nudb_backend.clone(),
-            leaf_count,
+            persisted_leaf_count,
             open_peers,
             already_syncing,
             sync_in_progress,
+            is_current,
         );
 
         if let Some((target_seq, target_hash)) = plan.ignore_mismatched_fixed_target {
@@ -64,6 +65,28 @@ impl Node {
                 target_seq,
                 hex::encode_upper(&target_hash[..8]),
             );
+            return;
+        }
+
+        if let Some((shamap, sync_header, sync_info)) = plan.completed_from_disk.take() {
+            info!(
+                "state sync startup: complete NuDB tree detected for ledger {} — running normal handoff finalizer",
+                sync_header.sequence,
+            );
+            {
+                let mut state = self.state.write().await;
+                state.sync_in_progress = true;
+            }
+            let mut pending_leaves = Vec::new();
+            if !self
+                .finalize_completed_sync_epoch(shamap, sync_header, sync_info, &mut pending_leaves)
+                .await
+            {
+                warn!("state sync startup: disk-complete finalization failed; will retry peer sync on next liBASE");
+                let mut state = self.state.write().await;
+                state.sync_in_progress = false;
+                state.sync_done = false;
+            }
             return;
         }
 
@@ -93,6 +116,11 @@ impl Node {
             warn!("sync lock busy during syncer install — will retry on next liBASE");
         }
 
+        if plan.restart_fixed_target || plan.installed_syncer || plan.bootstrap.is_some() {
+            self.seed_sync_anchor_tx_acquisition(peer_id, &header, &ld)
+                .await;
+        }
+
         if let Some(bootstrap) = plan.bootstrap {
             info!(
                 "state sync bootstrap: {} inner + {} leaf",
@@ -109,24 +137,42 @@ impl Node {
                     }
                 }
                 if bootstrap.restarted {
-                    info!("fixed-target restart: distributing initial liAS requests across seed peers");
+                    if plan.retarget_fixed_target {
+                        info!(
+                            "fixed-target retarget: distributing initial liAS requests across seed peers"
+                        );
+                    } else {
+                        info!(
+                            "fixed-target restart: distributing initial liAS requests across seed peers"
+                        );
+                    }
                 }
+                drop(state);
+
+                let mut sent = 0usize;
                 if target_peers.is_empty() {
-                    state.broadcast(&bootstrap.reqs[0], None);
+                    sent += self
+                        .sync_send_request(&bootstrap.reqs[0], header.sequence, None)
+                        .await;
                 } else {
                     for (idx, req) in bootstrap.reqs.iter().enumerate() {
                         let pid = target_peers[idx % target_peers.len()];
-                        if let Some(tx) = state.peer_txs.get(&pid) {
-                            let _ = tx.try_send(req.clone());
+                        let targeted = self
+                            .sync_send_request(req, header.sequence, Some(pid))
+                            .await;
+                        sent += targeted;
+                        if targeted == 0 {
+                            sent += self.sync_send_request(req, header.sequence, None).await;
                         }
                     }
-                    if bootstrap.reqs.len() > 1 || target_peers.len() > 1 {
-                        info!(
-                            "seeded {} initial liAS request(s) across {} peer(s)",
-                            bootstrap.reqs.len(),
-                            target_peers.len(),
-                        );
-                    }
+                }
+                if bootstrap.reqs.len() > 1 || target_peers.len() > 1 {
+                    info!(
+                        "seeded {} initial liAS request(s) across {} peer(s), sent={}",
+                        bootstrap.reqs.len(),
+                        target_peers.len().max(1),
+                        sent,
+                    );
                 }
             }
 
@@ -181,7 +227,10 @@ impl Node {
                             );
                         }
                     }
-                    syncer.build_multi_requests(3, crate::sync::SyncRequestReason::Reply)
+                    syncer.build_multi_requests(
+                        crate::ledger::inbound::REPLY_FOLLOWUP_PEERS,
+                        crate::sync::SyncRequestReason::Reply,
+                    )
                 } else {
                     Vec::new()
                 }
@@ -192,30 +241,45 @@ impl Node {
             Vec::new()
         };
         if !fresh_reqs.is_empty() {
-            let (target_peers, peer_txs) = {
+            let target_peers = {
                 let state = self.state.read().await;
-                let secondary_peers = self.select_sync_peers(&state, header.sequence, 3);
+                let secondary_peers = self.select_sync_peers(
+                    &state,
+                    header.sequence,
+                    crate::ledger::inbound::REPLY_FOLLOWUP_PEERS,
+                );
                 let mut target_peers = vec![peer_id];
                 target_peers.extend(secondary_peers.into_iter().filter(|pid| *pid != peer_id));
-                let peer_txs = target_peers
-                    .iter()
-                    .filter_map(|pid| state.peer_txs.get(pid).cloned())
-                    .collect::<Vec<_>>();
-                (target_peers, peer_txs)
+                target_peers
             };
-            if peer_txs.is_empty() {
-                let state = self.state.read().await;
-                state.broadcast(&fresh_reqs[0], None);
+
+            let mut sent = 0usize;
+            if target_peers.is_empty() {
+                sent += self
+                    .sync_send_request(&fresh_reqs[0], header.sequence, None)
+                    .await;
+                info!(
+                    "fresh liBASE broadcast {} liAS request(s), sent={}",
+                    fresh_reqs.len(),
+                    sent,
+                );
             } else {
                 for (idx, req) in fresh_reqs.iter().enumerate() {
-                    let tx = &peer_txs[idx % peer_txs.len()];
-                    let _ = tx.try_send(req.clone());
+                    let pid = target_peers[idx % target_peers.len()];
+                    let targeted = self
+                        .sync_send_request(req, header.sequence, Some(pid))
+                        .await;
+                    sent += targeted;
+                    if targeted == 0 {
+                        sent += self.sync_send_request(req, header.sequence, None).await;
+                    }
                 }
                 if fresh_reqs.len() > 1 || target_peers.len() > 1 {
                     info!(
-                        "fresh liBASE seeded {} liAS request(s) across {} peer(s)",
+                        "fresh liBASE seeded {} liAS request(s) across {} peer(s), sent={}",
                         fresh_reqs.len(),
-                        peer_txs.len(),
+                        target_peers.len(),
+                        sent,
                     );
                 }
             }
@@ -248,9 +312,12 @@ impl Node {
                         .and_then(|s| (!s.active()).then_some((s.ledger_seq(), *s.ledger_hash()))),
                     Err(_) => None,
                 };
-                let is_current = {
+                let (is_current, accepted_context_update) = {
                     let mut state = self.state.write().await;
-                    if header.sequence >= state.ctx.ledger_seq {
+                    let is_current = header.sequence >= state.ctx.ledger_seq;
+                    let can_advance_from_base =
+                        is_current && (state.sync_done || self.storage.is_none());
+                    if can_advance_from_base {
                         state.ctx.ledger_header = header.clone();
                         state.ctx.ledger_seq = header.sequence;
                         state.ctx.ledger_hash = hex::encode_upper(header.hash);
@@ -260,13 +327,18 @@ impl Node {
                             .write()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert_ledger(header.clone(), vec![]);
-                        true
                     } else {
-                        false
+                        if is_current {
+                            debug!(
+                                "deferring liBASE context advance for ledger {} until state sync/full acquisition completes",
+                                header.sequence,
+                            );
+                        }
                     }
+                    (is_current, can_advance_from_base)
                 };
 
-                if is_current {
+                if accepted_context_update {
                     if let Some(ref store) = self.storage {
                         let store2 = store.clone();
                         let header2 = header.clone();
@@ -362,20 +434,36 @@ impl Node {
         peer: &Peer,
         ld: &crate::proto::TmLedgerData,
     ) {
+        if let Err(reason) = crate::sync::validate_ledger_data_nodes(
+            ld,
+            crate::proto::TmLedgerInfoType::LiAsNode as i32,
+        ) {
+            debug!(
+                "dropping malformed liAS_NODE from {:?}: {} nodes={}",
+                peer.id,
+                reason,
+                ld.nodes.len()
+            );
+            return;
+        }
+
+        if self.sync_runtime.bootstrap_active() || self.sync_runtime.sync_active() {
+            let accepted_by_gate =
+                self.sync_runtime
+                    .gate_accepts_response(Some(&ld.ledger_hash), None, false);
+            if accepted_by_gate {
+                self.sync_runtime.queue_sync_data(peer.id, ld.clone());
+            }
+            return;
+        }
+
         let sync_done = {
             let state = self.state.read().await;
             state.sync_done
         };
         if sync_done {
-            if self
-                .sync_runtime
-                .diff_sync_sender()
-                .send(ld.clone())
-                .await
-                .is_err()
-            {
-                warn!("diff sync response channel closed");
-            }
+            self.sync_runtime.note_diff_sync_discarded();
+            tracing::debug!("discarded post-sync liAS_NODE response: diff-sync queue is disabled");
         } else {
             let accepted_by_gate =
                 self.sync_runtime
@@ -389,7 +477,7 @@ impl Node {
                     state.services.fetch_pack.clone()
                 };
                 if let Some(fetch_pack) = fetch_pack {
-                    for node in &ld.nodes {
+                    for node in ld.nodes.iter().take(MAX_STALE_AS_NODE_STASH) {
                         match fetch_pack
                             .stash_wire_node(&node.nodedata, crate::ledger::MapType::AccountState)
                         {

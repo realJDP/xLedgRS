@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Mod support for JSON-RPC and WebSocket APIs.
 //! JSON-RPC and WebSocket APIs for supported rippled-compatible requests.
 //!
 //! Unsupported methods and transaction types return explicit errors rather than
@@ -125,6 +124,18 @@ pub struct PeerSummary {
 pub struct FetchInfoSnapshot {
     pub key: String,
     pub hash: String,
+    pub sync_active: bool,
+    pub sync_in_progress: bool,
+    pub sync_done: bool,
+    pub pending_sync_anchor: Option<String>,
+    pub target_seq: u32,
+    pub target_hash: String,
+    pub target_account_hash: String,
+    pub computed_root_hash: String,
+    pub root_matches: bool,
+    pub ready: bool,
+    pub readiness: String,
+    pub readiness_blockers: Vec<String>,
     pub have_header: bool,
     pub have_state: bool,
     pub have_transactions: bool,
@@ -133,6 +144,13 @@ pub struct FetchInfoSnapshot {
     pub peers: usize,
     pub timeouts: u32,
     pub in_flight: usize,
+    pub outstanding_cookies: usize,
+    pub outstanding_object_queries: usize,
+    pub recent_nodes: usize,
+    pub useful_idle_secs: u64,
+    pub response_idle_secs: u64,
+    pub queue_len: usize,
+    pub queue_bytes: usize,
     pub inner_nodes: usize,
     pub state_nodes: usize,
     pub pass: u32,
@@ -181,6 +199,19 @@ pub struct TxRelayMetricsSnapshot {
     pub persisted_transactions: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SyncPeerUsefulnessSnapshot {
+    pub peer_id: String,
+    pub address: String,
+    pub useful_score: u32,
+    pub useful_nodes_total: u64,
+    pub duplicate_score: u32,
+    pub duplicate_responses_total: u64,
+    pub last_useful_secs: Option<u64>,
+    pub latency: Option<u32>,
+    pub ledger_range: Option<(u32, u32)>,
+}
+
 /// Returns true if this RPC method needs write access (mutates tx_pool/broadcast_queue).
 pub fn needs_write(method: &str) -> bool {
     matches!(
@@ -210,6 +241,7 @@ pub fn needs_admin(method: &str) -> bool {
             | "consensus_info"
             | "fetch_info"
             | "get_counts"
+            | "sync_metrics"
             | "ledger_accept"
             | "ledger_cleaner"
             | "ledger_request"
@@ -223,8 +255,6 @@ pub fn needs_admin(method: &str) -> bool {
             | "sign"
             | "sign_for"
             | "stop"
-            | "submit"
-            | "submit_multisigned"
             | "unl_list"
             | "validation_create"
             | "validator_info"
@@ -246,12 +276,14 @@ fn ensure_method_allowed(method: &str, ctx: &NodeContext) -> Result<(), RpcError
 /// Route a read-only request. All handlers except submit work with &NodeContext.
 pub fn dispatch_read(req: RpcRequest, ctx: &NodeContext) -> RpcResponse {
     let method = req.method.clone();
+    let request = rpc_error_request(&req);
     if let Err(e) = ensure_method_allowed(&method, ctx) {
-        return RpcResponse::err(e, req.id);
+        return RpcResponse::err_with_request(e, req.id, request);
     }
     let result = match req.method.as_str() {
         "server_info" => handlers::server_info(ctx),
         "server_state" => handlers::server_state(ctx),
+        "sync_metrics" => handlers::sync_metrics(ctx),
         "ping" => handlers::ping(),
         "storage_info" => handlers::storage_info(ctx),
         "account_info" => handlers::account_info(&req.params, ctx),
@@ -321,8 +353,15 @@ pub fn dispatch_read(req: RpcRequest, ctx: &NodeContext) -> RpcResponse {
     let id = req.id;
     match result {
         Ok(r) => RpcResponse::ok(r, id),
-        Err(e) => RpcResponse::err(e, id),
+        Err(e) => RpcResponse::err_with_request(e, id, request),
     }
+}
+
+fn rpc_error_request(req: &RpcRequest) -> serde_json::Value {
+    serde_json::json!({
+        "method": req.method,
+        "params": req.params,
+    })
 }
 
 /// Lock-free snapshot of RPC-visible state.
@@ -385,11 +424,13 @@ impl Default for RpcSnapshot {
 /// Route a parsed request to the correct handler and return a response.
 pub fn dispatch(req: RpcRequest, ctx: &mut NodeContext) -> RpcResponse {
     let method = req.method.clone();
+    let request = rpc_error_request(&req);
     if let Err(e) = ensure_method_allowed(&method, ctx) {
-        return RpcResponse::err(e, req.id);
+        return RpcResponse::err_with_request(e, req.id, request);
     }
     let result = match req.method.as_str() {
         "server_info" => handlers::server_info(ctx),
+        "sync_metrics" => handlers::sync_metrics(ctx),
         "ping" => handlers::ping(),
         "storage_info" => handlers::storage_info(ctx),
         "account_info" => handlers::account_info(&req.params, ctx),
@@ -431,7 +472,8 @@ pub fn dispatch(req: RpcRequest, ctx: &mut NodeContext) -> RpcResponse {
         "simulate" => handlers::simulate(&req.params, ctx),
         "server_definitions" => handlers::server_definitions(&req.params),
         "subscribe" => ws::subscription_change_snapshot(&req.params, ctx, true),
-        "submit" | "submit_multisigned" => handlers::submit(&req.params, ctx),
+        "submit" => handlers::submit(&req.params, ctx),
+        "submit_multisigned" => handlers::submit_multisigned(&req.params, ctx),
         "transaction_entry" => handlers::transaction_entry(&req.params, ctx),
         "tx" => handlers::tx(&req.params, ctx),
         "tx_history" => handlers::tx_history(&req.params, ctx),
@@ -466,7 +508,7 @@ pub fn dispatch(req: RpcRequest, ctx: &mut NodeContext) -> RpcResponse {
 
     match result {
         Ok(v) => RpcResponse::ok(v, req.id),
-        Err(e) => RpcResponse::err(e, req.id),
+        Err(e) => RpcResponse::err_with_request(e, req.id, request),
     }
 }
 
@@ -489,6 +531,8 @@ pub struct NodeContext {
     /// Transaction pool — validated txs waiting for the next ledger close.
     /// Behind Arc<RwLock> so the RPC read path shares live data instead of cloning.
     pub tx_pool: std::sync::Arc<std::sync::RwLock<crate::ledger::TxPool>>,
+    /// Immutable consensus candidate sets keyed by tx-set hash.
+    pub consensus_tx_sets: std::sync::Arc<std::sync::Mutex<crate::consensus::ConsensusTxSets>>,
     /// The current ledger header (updated after each close).
     pub ledger_header: crate::ledger::LedgerHeader,
     /// Closed ledger history and transaction index.
@@ -510,6 +554,10 @@ pub struct NodeContext {
     pub peer_summaries: Vec<PeerSummary>,
     /// Snapshot of the current state-sync fetch, if any.
     pub fetch_info: Option<FetchInfoSnapshot>,
+    /// Counters for live sync and peer-route pressure.
+    pub sync_metrics: Option<crate::sync_runtime::SyncMetricsSnapshot>,
+    /// Per-peer sync usefulness scores for live acquisition diagnostics.
+    pub sync_peer_usefulness: Vec<SyncPeerUsefulnessSnapshot>,
     /// Snapshot of the current consensus round, if one is active.
     pub consensus_info: Option<ConsensusInfoSnapshot>,
     /// Request flag for admin `fetch_info` clear=true calls.
@@ -618,6 +666,9 @@ impl Default for NodeContext {
                 crate::ledger::LedgerState::new(),
             )),
             tx_pool: std::sync::Arc::new(std::sync::RwLock::new(crate::ledger::TxPool::new())),
+            consensus_tx_sets: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::consensus::ConsensusTxSets::new(),
+            )),
             history: std::sync::Arc::new(std::sync::RwLock::new(crate::ledger::LedgerStore::new())),
             broadcast_queue: Vec::new(),
             ledger_header: crate::ledger::LedgerHeader {
@@ -639,6 +690,8 @@ impl Default for NodeContext {
             validator_key: String::new(),
             peer_summaries: Vec::new(),
             fetch_info: None,
+            sync_metrics: None,
+            sync_peer_usefulness: Vec::new(),
             consensus_info: None,
             sync_clear_requested: None,
             connect_requests: None,

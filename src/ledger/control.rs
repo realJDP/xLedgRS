@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Control support for XRPL ledger state and SHAMap logic.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Pool support for XRPL ledger state and SHAMap logic.
 //! Transaction pool (mempool) with fee escalation matching rippled's TxQ.
 //!
 //! Key formula: `required_fee_level = multiplier × current² / target²`
@@ -39,7 +38,7 @@ pub struct PoolEntry {
 }
 
 /// The subset of parsed fields needed for ordering and deduplication.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolTxInfo {
     pub account: [u8; 20],
     pub sequence: u32,
@@ -137,6 +136,30 @@ impl TxPool {
         }
     }
 
+    /// Build a pool from exact candidate-set entries, preserving fee metrics
+    /// from the live open-ledger queue. This is used when consensus accepts an
+    /// acquired immutable tx set that must be closed separately from the mempool.
+    pub fn from_entries_with_metrics(entries: Vec<PoolEntry>, metrics: FeeMetrics) -> Self {
+        let mut pool = Self {
+            entries: HashMap::new(),
+            account_counts: HashMap::new(),
+            metrics,
+        };
+        pool.extend_entries(entries);
+        pool
+    }
+
+    /// Add already-normalized pool entries without re-running admission limits.
+    pub fn extend_entries(&mut self, entries: Vec<PoolEntry>) {
+        for entry in entries {
+            if self.entries.contains_key(&entry.hash) {
+                continue;
+            }
+            *self.account_counts.entry(entry.parsed.account).or_insert(0) += 1;
+            self.entries.insert(entry.hash, entry);
+        }
+    }
+
     /// Add a pre-validated transaction to the pool.
     ///
     /// The caller (submit handler) has already verified the signature, auth,
@@ -218,6 +241,16 @@ impl TxPool {
         self.entries.is_empty()
     }
 
+    /// Iterate the currently queued transaction entries without mutating the pool.
+    pub fn entries(&self) -> impl Iterator<Item = &PoolEntry> {
+        self.entries.values()
+    }
+
+    /// Clone the current pool entries without mutating queue/account state.
+    pub fn snapshot_entries(&self) -> Vec<PoolEntry> {
+        self.entries.values().cloned().collect()
+    }
+
     /// Count transactions in the pool from a specific account.
     pub fn count_by_account(&self, account: &[u8; 20]) -> usize {
         self.account_counts.get(account).copied().unwrap_or(0)
@@ -231,21 +264,7 @@ impl TxPool {
     /// Deterministic transaction-set hash matching a tx SHAMap root:
     /// transactions are placed by txID, and each leaf hash is the transaction ID.
     pub fn canonical_set_hash(&self) -> [u8; 32] {
-        if self.entries.is_empty() {
-            return [0u8; 32];
-        }
-
-        let mut map = crate::ledger::sparse_shamap::SparseSHAMap::new();
-        for entry in self.entries.values() {
-            let mut payload = Vec::with_capacity(
-                crate::transaction::serialize::PREFIX_TX_ID.len() + entry.blob.len(),
-            );
-            payload.extend_from_slice(&crate::transaction::serialize::PREFIX_TX_ID);
-            payload.extend_from_slice(&entry.blob);
-            let tx_id = crate::crypto::sha512_first_half(&payload);
-            map.insert(entry.hash, tx_id);
-        }
-        map.root_hash()
+        canonical_set_hash_from_blobs(self.entries.values().map(|entry| entry.blob.as_slice()))
     }
 
     /// Remove a single transaction by hash (e.g., if it expires).
@@ -265,6 +284,28 @@ impl TxPool {
     /// Update fee metrics after a ledger closes.
     pub fn update_metrics(&mut self, tx_count: u64, slow_consensus: bool) {
         self.metrics.update(tx_count, slow_consensus);
+    }
+}
+
+/// Compute the canonical consensus transaction-set hash from raw transaction
+/// blobs. This mirrors rippled's candidate tx-set SHAMap: key = txID and leaf
+/// hash = SHA512Half(TXN\0 || raw_tx_blob), with inner nodes hashed as MIN\0.
+pub fn canonical_set_hash_from_blobs<'a>(blobs: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
+    let mut map = crate::ledger::sparse_shamap::SparseSHAMap::new();
+    let mut count = 0usize;
+    for blob in blobs {
+        let mut payload =
+            Vec::with_capacity(crate::transaction::serialize::PREFIX_TX_ID.len() + blob.len());
+        payload.extend_from_slice(&crate::transaction::serialize::PREFIX_TX_ID);
+        payload.extend_from_slice(blob);
+        let tx_id = crate::crypto::sha512_first_half(&payload);
+        map.insert(tx_id, tx_id);
+        count += 1;
+    }
+    if count == 0 {
+        [0u8; 32]
+    } else {
+        map.root_hash()
     }
 }
 
@@ -371,6 +412,21 @@ mod tests {
     fn test_canonical_set_hash_empty_is_zero() {
         let pool = TxPool::new();
         assert_eq!(pool.canonical_set_hash(), [0u8; 32]);
+    }
+
+    #[test]
+    fn test_canonical_set_hash_from_blobs_matches_pool() {
+        let mut pool = TxPool::new();
+        let (blob1, hash1) = make_signed_tx(1);
+        let parsed1 = parse_blob(&blob1).unwrap();
+        let (blob2, hash2) = make_signed_tx(2);
+        let parsed2 = parse_blob(&blob2).unwrap();
+
+        pool.insert(hash1, blob1.clone(), &parsed1);
+        pool.insert(hash2, blob2.clone(), &parsed2);
+
+        let from_blobs = canonical_set_hash_from_blobs([blob2.as_slice(), blob1.as_slice()]);
+        assert_eq!(pool.canonical_set_hash(), from_blobs);
     }
 
     #[test]

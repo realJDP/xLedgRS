@@ -1,4 +1,3 @@
-//! xLedgRS purpose: History support for XRPL ledger state and SHAMap logic.
 //! Ledger history — stores closed ledger headers and their transactions.
 //!
 //! Provides O(1) lookup of:
@@ -7,7 +6,7 @@
 //!
 //! This is an in-memory store; a production node would persist to disk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -96,17 +95,7 @@ impl LedgerStore {
         let tx_hashes: Vec<[u8; 32]> = tx_records.iter().map(|r| r.hash).collect();
 
         for rec in tx_records {
-            // Index by account: parse the blob to find the sender
-            if let Ok(parsed) = crate::transaction::parse_blob(&rec.blob) {
-                self.account_txs
-                    .entry(parsed.account)
-                    .or_default()
-                    .push(rec.hash);
-                // Also index by destination if present
-                if let Some(dest) = parsed.destination {
-                    self.account_txs.entry(dest).or_default().push(rec.hash);
-                }
-            }
+            self.index_accounts_for_tx(&rec);
             self.tx_index.insert(rec.hash, rec);
         }
 
@@ -139,7 +128,7 @@ impl LedgerStore {
                     hashes.retain(|h| !pruned_set.contains(h));
                     !hashes.is_empty()
                 });
-                self.min_seq = prune_below;
+                self.refresh_sequence_bounds();
             }
         }
     }
@@ -165,16 +154,35 @@ impl LedgerStore {
 
     /// Insert a single transaction into the in-memory index.
     pub fn insert_tx(&mut self, rec: TxRecord) {
+        self.index_accounts_for_tx(&rec);
+        self.tx_index.insert(rec.hash, rec);
+    }
+
+    fn index_accounts_for_tx(&mut self, rec: &TxRecord) {
+        let mut accounts = HashSet::new();
         if let Ok(parsed) = crate::transaction::parse_blob(&rec.blob) {
-            self.account_txs
-                .entry(parsed.account)
-                .or_default()
-                .push(rec.hash);
+            accounts.insert(parsed.account);
             if let Some(dest) = parsed.destination {
-                self.account_txs.entry(dest).or_default().push(rec.hash);
+                accounts.insert(dest);
             }
         }
-        self.tx_index.insert(rec.hash, rec);
+        for node in crate::ledger::meta::parse_metadata(&rec.meta) {
+            for field in node.fields.iter().chain(node.previous_fields.iter()) {
+                if field.type_code == 8 && field.data.len() == 20 {
+                    let mut account = [0u8; 20];
+                    account.copy_from_slice(&field.data);
+                    accounts.insert(account);
+                }
+            }
+        }
+        for account in accounts {
+            self.account_txs.entry(account).or_default().push(rec.hash);
+        }
+    }
+
+    fn refresh_sequence_bounds(&mut self) {
+        self.min_seq = self.ledgers.keys().copied().min().unwrap_or(0);
+        self.max_seq = self.ledgers.keys().copied().max().unwrap_or(0);
     }
 
     /// Look up a transaction by its hash.
@@ -228,26 +236,40 @@ impl LedgerStore {
 
     /// Range string for `server_info` complete_ledgers field.
     ///
-    /// Simplification: this assumes a contiguous range between min_seq and max_seq.
-    /// rippled uses a RangeSet for proper gap tracking. This is acceptable here
-    /// because the pruned in-memory cache maintains a contiguous window.
     pub fn complete_ledgers(&self) -> String {
         if self.ledgers.is_empty() {
-            "empty".to_string()
-        } else {
-            format!("{}-{}", self.min_seq, self.max_seq)
+            return "empty".to_string();
         }
+
+        let mut seqs: Vec<u32> = self.ledgers.keys().copied().collect();
+        seqs.sort_unstable();
+
+        let mut ranges = Vec::new();
+        let mut start = seqs[0];
+        let mut prev = seqs[0];
+        for seq in seqs.into_iter().skip(1) {
+            if seq == prev.saturating_add(1) {
+                prev = seq;
+                continue;
+            }
+            ranges.push(format_ledger_range(start, prev));
+            start = seq;
+            prev = seq;
+        }
+        ranges.push(format_ledger_range(start, prev));
+        ranges.join(",")
     }
 
     pub fn covers_ledger_range(&self, min_seq: u32, max_seq: u32) -> bool {
         if self.ledgers.is_empty() || min_seq > max_seq {
             return false;
         }
-        self.min_seq <= min_seq
-            && self.max_seq >= max_seq
-            && self.ledgers.contains_key(&min_seq)
-            && self.ledgers.contains_key(&max_seq)
+        (min_seq..=max_seq).all(|seq| self.ledgers.contains_key(&seq))
     }
+}
+
+fn format_ledger_range(start: u32, end: u32) -> String {
+    format!("{start}-{end}")
 }
 
 impl Default for LedgerStore {
@@ -326,7 +348,12 @@ mod tests {
 
         store.insert_ledger(header(3), vec![]);
         store.insert_ledger(header(5), vec![]);
+        assert_eq!(store.complete_ledgers(), "3-3,5-5");
+        assert!(!store.covers_ledger_range(3, 5));
+
+        store.insert_ledger(header(4), vec![]);
         assert_eq!(store.complete_ledgers(), "3-5");
+        assert!(store.covers_ledger_range(3, 5));
     }
 
     #[test]
@@ -382,5 +409,37 @@ mod tests {
         store.insert_ledger(header(1), vec![]);
         assert_eq!(store.ledger_count(), 0);
         assert_eq!(store.complete_ledgers(), "empty");
+    }
+
+    #[test]
+    fn test_account_tx_index_includes_metadata_affected_accounts() {
+        let affected = [0x77; 20];
+        let meta = crate::ledger::meta::encode_metadata(
+            0,
+            0,
+            &[crate::ledger::meta::AffectedNode {
+                action: crate::ledger::meta::Action::Modified,
+                entry_type: 0x0061,
+                ledger_index: [0xAA; 32],
+                fields: vec![crate::ledger::meta::ParsedField {
+                    type_code: 8,
+                    field_code: 1,
+                    data: affected.to_vec(),
+                }],
+                previous_fields: Vec::new(),
+                prev_txn_id: None,
+                prev_txn_lgrseq: None,
+            }],
+            None,
+        );
+        let tx = TxRecord {
+            meta,
+            ..tx_rec(0xDD, 9)
+        };
+        let mut store = LedgerStore::new();
+
+        store.insert_ledger(header(9), vec![tx]);
+
+        assert_eq!(store.get_account_txs(&affected), &[[0xDD; 32]]);
     }
 }

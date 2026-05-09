@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Sfield Meta support for XRPL ledger state and SHAMap logic.
 //! SField metadata flags — controls which fields appear in transaction metadata.
 //!
 //! Matches rippled's sMD_* flags from SField.h and sfields.macro.
@@ -46,9 +45,6 @@ fn should_meta_with_value(type_code: u16, field_code: u16, context: u8, data: &[
     if flags & context == 0 {
         return false;
     }
-    if flags & SMD_ALWAYS != 0 {
-        return true;
-    }
     !crate::ledger::meta::field_data_is_default(data)
 }
 
@@ -73,14 +69,7 @@ pub fn filter_for_modified_final(
 ) -> Vec<crate::ledger::meta::ParsedField> {
     fields
         .iter()
-        .filter(|f| {
-            should_meta_with_value(
-                f.type_code,
-                f.field_code,
-                SMD_ALWAYS | SMD_CHANGE_NEW,
-                &f.data,
-            )
-        })
+        .filter(|f| should_meta(f.type_code, f.field_code, SMD_ALWAYS | SMD_CHANGE_NEW))
         .cloned()
         .collect()
 }
@@ -92,7 +81,7 @@ pub fn filter_for_modified_previous(
 ) -> Vec<crate::ledger::meta::ParsedField> {
     fields
         .iter()
-        .filter(|f| should_meta_with_value(f.type_code, f.field_code, SMD_CHANGE_ORIG, &f.data))
+        .filter(|f| should_meta(f.type_code, f.field_code, SMD_CHANGE_ORIG))
         .cloned()
         .collect()
 }
@@ -104,14 +93,7 @@ pub fn filter_for_deleted_final(
 ) -> Vec<crate::ledger::meta::ParsedField> {
     fields
         .iter()
-        .filter(|f| {
-            should_meta_with_value(
-                f.type_code,
-                f.field_code,
-                SMD_ALWAYS | SMD_DELETE_FINAL,
-                &f.data,
-            )
-        })
+        .filter(|f| should_meta(f.type_code, f.field_code, SMD_ALWAYS | SMD_DELETE_FINAL))
         .cloned()
         .collect()
 }
@@ -170,8 +152,8 @@ mod tests {
 
         assert_eq!(filter_for_created(&[non_default.clone()]).len(), 1);
         assert!(filter_for_created(&[defaultish.clone()]).is_empty());
-        assert!(filter_for_modified_final(&[defaultish.clone()]).is_empty());
-        assert!(filter_for_modified_previous(&[defaultish.clone()]).is_empty());
-        assert!(filter_for_deleted_final(&[defaultish]).is_empty());
+        assert_eq!(filter_for_modified_final(&[defaultish.clone()]).len(), 1);
+        assert_eq!(filter_for_modified_previous(&[defaultish.clone()]).len(), 1);
+        assert_eq!(filter_for_deleted_final(&[defaultish]).len(), 1);
     }
 }

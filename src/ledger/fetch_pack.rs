@@ -1,11 +1,12 @@
-//! xLedgRS purpose: Fetch Pack support for XRPL ledger state and SHAMap logic.
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ledger::node_store::NodeStore;
+use crate::ledger::node_store::{NodeObjectType, NodeStore};
 
-const MAX_FETCH_PACK_NODES: usize = 16_384;
+const MAX_FETCH_PACK_NODES: usize = 2_048;
+const MAX_FETCH_PACK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AUTO_STASH_BYTES: usize = 64 * 1024;
 const FETCH_PACK_RETENTION_SECS: u64 = 15 * 60;
 const MAX_QUARANTINED_HASHES: usize = 262_144;
 
@@ -42,12 +43,14 @@ pub struct FetchPackSnapshot {
     pub last_flush_duration_ms: Option<u64>,
     pub last_flush_error: Option<String>,
     pub entries: Vec<FetchPackEntrySummary>,
+    pub bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FetchPackImportResult {
     pub imported: usize,
     pub persisted: usize,
+    pub duplicates: usize,
     pub persist_errors: usize,
     pub unchecked_fallbacks: usize,
     pub last_error: Option<String>,
@@ -63,6 +66,7 @@ pub struct FetchPackObjectReplyImportResult {
     pub normalize_reject: usize,
     pub hash_mismatch: usize,
     pub persisted: usize,
+    pub duplicates: usize,
     pub persist_errors: usize,
     pub unchecked_fallbacks: usize,
     pub last_error: Option<String>,
@@ -80,6 +84,7 @@ struct FetchPackEntry {
 struct FetchPackState {
     entries: HashMap<[u8; 32], FetchPackEntry>,
     order: VecDeque<[u8; 32]>,
+    bytes: usize,
     stashed_total: u64,
     backend_fill_total: u64,
     imported_total: u64,
@@ -183,6 +188,7 @@ impl FetchPackStore {
             last_flush_duration_ms: state.last_flush_duration_ms,
             last_flush_error: state.last_flush_error.clone(),
             entries,
+            bytes: state.bytes,
         }
     }
 
@@ -202,9 +208,6 @@ impl FetchPackStore {
             .err()
             .map(|err| err.to_string());
         if batch_error.is_none() {
-            for (hash, data) in nodes {
-                self.stash(*hash, data.clone());
-            }
             result.persisted = nodes.len();
             self.note_import_result(&result);
             return result;
@@ -213,7 +216,6 @@ impl FetchPackStore {
         for (hash, data) in nodes {
             match self.inner.store(hash, data) {
                 Ok(()) => {
-                    self.stash(*hash, data.clone());
                     result.persisted += 1;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
@@ -241,6 +243,14 @@ impl FetchPackStore {
         &self,
         objects: &[crate::proto::TmIndexedObject],
     ) -> FetchPackObjectReplyImportResult {
+        self.import_object_reply_objects_typed(NodeObjectType::AccountNode, objects)
+    }
+
+    pub fn import_object_reply_objects_typed(
+        &self,
+        object_type: NodeObjectType,
+        objects: &[crate::proto::TmIndexedObject],
+    ) -> FetchPackObjectReplyImportResult {
         let mut result = FetchPackObjectReplyImportResult {
             raw_objects: objects.len(),
             ..FetchPackObjectReplyImportResult::default()
@@ -262,7 +272,9 @@ impl FetchPackStore {
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(hash);
-            let Some(store_data) = crate::sync::object_reply_to_verified_store(&key, data) else {
+            let Some(store_data) =
+                crate::sync::object_reply_to_verified_store_typed(object_type, &key, data)
+            else {
                 result.normalize_reject += 1;
                 if crate::sync::object_reply_to_store(data).is_some() {
                     result.hash_mismatch += 1;
@@ -273,11 +285,27 @@ impl FetchPackStore {
         }
 
         result.verified_objects = verified.len();
-        let import = self.import_verified_objects(&verified);
-        result.persisted = import.persisted;
-        result.persist_errors = import.persist_errors;
-        result.unchecked_fallbacks = import.unchecked_fallbacks;
-        result.last_error = import.last_error;
+        for (hash, data) in &verified {
+            match self.inner.contains(hash) {
+                Ok(true) => {
+                    result.duplicates += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    result.persist_errors += 1;
+                    result.last_error = Some(err.to_string());
+                    continue;
+                }
+            }
+            match self.store_typed(object_type, hash, data) {
+                Ok(()) => result.persisted += 1,
+                Err(err) => {
+                    result.persist_errors += 1;
+                    result.last_error = Some(err.to_string());
+                }
+            }
+        }
         self.note_object_reply_result(&result);
         result
     }
@@ -288,13 +316,18 @@ impl FetchPackStore {
     }
 
     fn stash(&self, hash: [u8; 32], data: Vec<u8>) {
+        if data.len() > MAX_AUTO_STASH_BYTES {
+            return;
+        }
         let now_unix = unix_now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        match state.entries.get_mut(&hash) {
+        let data_len = data.len();
+        let replaced_len = match state.entries.get_mut(&hash) {
             Some(entry) => {
+                let old_len = entry.data.len();
                 entry.data = data;
                 entry.last_stashed_unix = now_unix;
-                state.order.retain(|queued| queued != &hash);
+                Some(old_len)
             }
             None => {
                 state.entries.insert(
@@ -306,7 +339,13 @@ impl FetchPackStore {
                         reuse_hits: 0,
                     },
                 );
+                state.bytes = state.bytes.saturating_add(data_len);
+                None
             }
+        };
+        if let Some(old_len) = replaced_len {
+            state.bytes = state.bytes.saturating_sub(old_len).saturating_add(data_len);
+            state.order.retain(|queued| queued != &hash);
         }
         state.order.push_back(hash);
         state.stashed_total = state.stashed_total.saturating_add(1);
@@ -337,6 +376,7 @@ impl FetchPackStore {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.entries.clear();
         state.order.clear();
+        state.bytes = 0;
     }
 
     fn note_import_result(&self, result: &FetchPackImportResult) {
@@ -419,9 +459,10 @@ impl FetchPackStore {
     }
 
     fn trim_locked(state: &mut FetchPackState, now_unix: u64) {
-        while state.entries.len() > MAX_FETCH_PACK_NODES {
+        while state.entries.len() > MAX_FETCH_PACK_NODES || state.bytes > MAX_FETCH_PACK_BYTES {
             if let Some(hash) = state.order.pop_front() {
-                if state.entries.remove(&hash).is_some() {
+                if let Some(entry) = state.entries.remove(&hash) {
+                    state.bytes = state.bytes.saturating_sub(entry.data.len());
                     state.evicted_total = state.evicted_total.saturating_add(1);
                 }
             }
@@ -438,7 +479,8 @@ impl FetchPackStore {
                 break;
             }
             state.order.pop_front();
-            if state.entries.remove(&hash).is_some() {
+            if let Some(entry) = state.entries.remove(&hash) {
+                state.bytes = state.bytes.saturating_sub(entry.data.len());
                 state.evicted_total = state.evicted_total.saturating_add(1);
             }
         }
@@ -467,12 +509,31 @@ impl NodeStore for FetchPackStore {
         Ok(fetched)
     }
 
+    fn contains(&self, hash: &[u8; 32]) -> std::io::Result<bool> {
+        if self.fetch_overlay(hash).is_some() {
+            return Ok(true);
+        }
+        if self.is_quarantined(hash) {
+            return Ok(false);
+        }
+        self.inner.contains(hash)
+    }
+
     fn count(&self) -> u64 {
         self.inner.count()
     }
 
     fn store_unchecked(&self, hash: &[u8; 32], data: &[u8]) -> std::io::Result<()> {
-        self.inner.store_unchecked(hash, data)?;
+        self.inner.store_unchecked(hash, data)
+    }
+
+    fn store_typed(
+        &self,
+        object_type: NodeObjectType,
+        hash: &[u8; 32],
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.store_typed(object_type, hash, data)?;
         self.stash(*hash, data.to_vec());
         Ok(())
     }
@@ -489,9 +550,7 @@ impl NodeStore for FetchPackStore {
                 let mut fallback_error = None;
                 for (hash, data) in nodes {
                     match self.inner.store(hash, data) {
-                        Ok(()) => {
-                            self.stash(*hash, data.clone());
-                        }
+                        Ok(()) => self.stash(*hash, data.clone()),
                         Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
                             fallback_error = Some(err.to_string());
                         }
@@ -716,6 +775,7 @@ mod tests {
             FetchPackImportResult {
                 imported: 1,
                 persisted: 1,
+                duplicates: 0,
                 persist_errors: 0,
                 unchecked_fallbacks: 0,
                 last_error: None,
@@ -1005,5 +1065,65 @@ mod tests {
         assert_eq!(snapshot.verified_objects_total, 1);
         assert_eq!(snapshot.normalize_reject_total, 1);
         assert_eq!(snapshot.hash_mismatch_total, 1);
+    }
+
+    #[test]
+    fn import_object_reply_objects_counts_duplicates_without_persist_progress() {
+        let inner: Arc<dyn NodeStore> = Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let (_backend, fetch_pack) = FetchPackStore::wrap(inner);
+        let key = [0xAD; 32];
+        let mut leaf = b"leaf".to_vec();
+        leaf.extend_from_slice(&key);
+        let hash = {
+            let mut payload = Vec::with_capacity(4 + leaf.len());
+            payload.extend_from_slice(&crate::ledger::shamap::PREFIX_LEAF_STATE);
+            payload.extend_from_slice(&leaf);
+            crate::crypto::sha512_first_half(&payload)
+        };
+        let objects = vec![crate::proto::TmIndexedObject {
+            hash: Some(hash.to_vec()),
+            data: Some(leaf),
+            index: None,
+            ledger_seq: Some(1),
+            node_id: None,
+        }];
+
+        let first = fetch_pack.import_object_reply_objects(&objects);
+        assert_eq!(first.verified_objects, 1);
+        assert_eq!(first.persisted, 1);
+        assert_eq!(first.duplicates, 0);
+
+        let second = fetch_pack.import_object_reply_objects(&objects);
+        assert_eq!(second.verified_objects, 1);
+        assert_eq!(second.persisted, 0);
+        assert_eq!(second.duplicates, 1);
+    }
+
+    #[test]
+    fn import_object_reply_objects_typed_accepts_transaction_node() {
+        let inner: Arc<dyn NodeStore> = Arc::new(crate::ledger::node_store::MemNodeStore::new());
+        let (backend, fetch_pack) = FetchPackStore::wrap(inner);
+        let key = [0xBC; 32];
+        let mut tx_leaf = b"tx+meta".to_vec();
+        tx_leaf.extend_from_slice(&key);
+        let tx_hash = {
+            let mut payload = Vec::with_capacity(4 + tx_leaf.len());
+            payload.extend_from_slice(&crate::ledger::shamap::PREFIX_LEAF_TX);
+            payload.extend_from_slice(&tx_leaf);
+            crate::crypto::sha512_first_half(&payload)
+        };
+        let objects = vec![crate::proto::TmIndexedObject {
+            hash: Some(tx_hash.to_vec()),
+            data: Some(tx_leaf.clone()),
+            index: None,
+            ledger_seq: Some(1),
+            node_id: None,
+        }];
+
+        let result =
+            fetch_pack.import_object_reply_objects_typed(NodeObjectType::TransactionNode, &objects);
+        assert_eq!(result.verified_objects, 1);
+        assert_eq!(result.persisted, 1);
+        assert_eq!(backend.fetch(&tx_hash).unwrap(), Some(tx_leaf));
     }
 }

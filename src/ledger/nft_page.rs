@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Nft Page support for XRPL ledger state and SHAMap logic.
 //! NFTokenPage — page-based storage matching rippled's NFTokenPage SLE model.
 //!
 //! Each NFTokenPage holds up to 32 tokens, doubly-linked to adjacent pages.
@@ -122,33 +121,30 @@ impl NFTokenPage {
         self.tokens.len()
     }
 
-    /// Split this full page into two. Returns the new page (upper half).
-    /// This page retains the lower half.
-    pub fn split(&mut self) -> NFTokenPage {
+    /// Split this full page into two. Returns the new lower page.
+    /// This page retains the upper half, matching rippled's NFTokenPage split
+    /// where the newly-created page points to the existing page as next.
+    pub fn split(&mut self) -> Option<NFTokenPage> {
         let mid = MAX_TOKENS_PER_PAGE / 2;
-        // Find split point that doesn't break equivalent tokens (same low 96 bits)
-        let mut split_at = mid;
-        while split_at < self.tokens.len() - 1 {
-            let a_low = &self.tokens[split_at].nftoken_id[20..32];
-            let b_low = &self.tokens[split_at + 1].nftoken_id[20..32];
-            if a_low != b_low {
-                split_at += 1; // split AFTER the boundary
-                break;
-            }
-            split_at += 1;
-        }
-        if split_at >= self.tokens.len() {
-            split_at = mid; // fallback if all equivalent
-        }
+        let split_at = (mid..self.tokens.len())
+            .find(|&i| self.tokens[i - 1].nftoken_id[20..32] != self.tokens[i].nftoken_id[20..32])
+            .or_else(|| {
+                (1..mid).rev().find(|&i| {
+                    self.tokens[i - 1].nftoken_id[20..32] != self.tokens[i].nftoken_id[20..32]
+                })
+            })?;
 
-        let upper_tokens: Vec<PageToken> = self.tokens.drain(split_at..).collect();
+        let upper_tokens: Vec<PageToken> = self.tokens.split_off(split_at);
+        let lower_tokens = std::mem::replace(&mut self.tokens, upper_tokens);
 
-        // New page key = key derived from first token in upper half
-        let new_key = if !upper_tokens.is_empty() {
+        // New page key = boundary key derived from the first token retained in
+        // the upper page. Tokens in the new lower page are strictly less than
+        // this boundary.
+        let new_key = if !self.tokens.is_empty() {
             let mut k = [0u8; 32];
             k[..20].copy_from_slice(&self.key.0[..20]); // same owner
             for i in 20..32 {
-                k[i] = upper_tokens[0].nftoken_id[i] & PAGE_MASK[i];
+                k[i] = self.tokens[0].nftoken_id[i] & PAGE_MASK[i];
             }
             Key(k)
         } else {
@@ -156,14 +152,14 @@ impl NFTokenPage {
         };
 
         let mut new_page = NFTokenPage::new(new_key);
-        new_page.tokens = upper_tokens;
+        new_page.tokens = lower_tokens;
 
-        // Link: new_page sits between self and self.next_page
-        new_page.prev_page = Some(self.key);
-        new_page.next_page = self.next_page.take();
-        self.next_page = Some(new_page.key);
+        // Link: old previous -> new lower page -> existing upper page.
+        new_page.prev_page = self.prev_page.take();
+        new_page.next_page = Some(self.key);
+        self.prev_page = Some(new_page.key);
 
-        new_page
+        Some(new_page)
     }
 
     /// Can this page merge with another (combined size <= 32)?
@@ -232,16 +228,30 @@ mod tests {
         }
         assert_eq!(page.len(), 32);
 
-        let upper = page.split();
+        let lower = page.split().expect("page has legal split");
 
         // Both halves should have tokens
         assert!(page.len() > 0);
-        assert!(upper.len() > 0);
-        assert_eq!(page.len() + upper.len(), 32);
+        assert!(lower.len() > 0);
+        assert_eq!(page.len() + lower.len(), 32);
 
         // Links should be set
-        assert_eq!(page.next_page, Some(upper.key));
-        assert_eq!(upper.prev_page, Some(page.key));
+        assert_eq!(lower.next_page, Some(page.key));
+        assert_eq!(page.prev_page, Some(lower.key));
+        assert!(lower.key < page.key);
+    }
+
+    #[test]
+    fn page_split_rejects_all_equivalent_low96_tokens() {
+        let mut page = NFTokenPage::new(page_max(&make_owner()));
+        for i in 0..MAX_TOKENS_PER_PAGE {
+            let mut token = make_token(7);
+            token.nftoken_id[0] = i as u8;
+            page.insert(token);
+        }
+
+        assert!(page.split().is_none());
+        assert_eq!(page.len(), MAX_TOKENS_PER_PAGE);
     }
 
     #[test]

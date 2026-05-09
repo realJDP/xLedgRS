@@ -1,0 +1,80 @@
+{
+  "group": "Group 3 protocol-control production proof inventory",
+  "updated": "2026-05-08",
+  "production_complete": false,
+  "required_findings": [1, 32, 33, 35],
+  "families": [
+    {
+      "id": "control_plane_deterministic_vectors",
+      "findings": [1, 32, 33],
+      "surface": "proposal signing, validation signing, manifest verification, accepted-set selection",
+      "source": "committed",
+      "executable": true,
+      "command": "cargo test --test group3_acceptance_gates deterministic_local_control_plane_fixture_matches_committed_vectors",
+      "rippled_parity": false,
+      "deterministic_harness": true,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "local deterministic vectors lock canonical signing payloads, manifest trust wiring, and peer proposal selection semantics while live rippled fixtures are unavailable",
+      "residual_blockers": [
+        "needs rippled side-by-side proposal stream fixture with serialized TMProposeSet payloads and expected accepted-set transitions",
+        "needs rippled validation stream fixture with sfSigningTime, sfCloseTime, sfConsensusHash, and sfValidatedHash fields captured from live validation objects",
+        "needs rippled manifest verification fixture covering validator-token manifest load, ephemeral signing-key delegation, rotation, and revocation"
+      ]
+    },
+    {
+      "id": "validator_list_negative_unl_pending",
+      "findings": [1, 32, 35],
+      "surface": "validator-list expiration/effective transitions and NegativeUNL disable/reenable",
+      "source": "pending",
+      "executable": false,
+      "command": "",
+      "rippled_parity": false,
+      "deterministic_harness": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "must prove effective UNL filtering and 60 percent original-UNL floor against rippled flag-ledger behavior before production parity can be declared",
+      "residual_blockers": [
+        "needs committed or reproducible rippled fixture for validator-list expiration and effective UNL transition snapshots",
+        "needs committed or reproducible rippled fixture for NegativeUNL scheduled disable, active disabled validator filtering, and reenable lifecycle",
+        "needs close-loop proof that live validation trust/quorum uses the parent-ledger effective UNL rather than the static configured UNL"
+      ]
+    },
+    {
+      "id": "amendment_fee_voting_pending",
+      "findings": [1, 32, 35],
+      "surface": "amendment majority and fee voting",
+      "source": "pending",
+      "executable": false,
+      "command": "",
+      "rippled_parity": false,
+      "deterministic_harness": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "must prove flag-ledger amendment and fee vote generation, aggregation, and pseudo-transaction acceptance against rippled before production parity can be declared",
+      "residual_blockers": [
+        "needs rippled amendment majority fixture covering open-for-voting, majority timing, amendment-blocked reporting, and EnableAmendment pseudo-transaction construction",
+        "needs rippled fee voting fixture covering base fee, reserve base, reserve increment, SetFee pseudo-transaction construction, and XRPFees transition behavior",
+        "needs protocol-control reporting fixture proving feature, fee, amendment, and validation-quorum admin surfaces reflect validated-ledger state"
+      ]
+    },
+    {
+      "id": "control_plane_replay_tooling_pending",
+      "findings": [1, 33, 35],
+      "surface": "control-plane replay tooling",
+      "source": "pending",
+      "executable": false,
+      "command": "",
+      "rippled_parity": false,
+      "deterministic_harness": false,
+      "private_opt_in": false,
+      "skipped_by_default": false,
+      "assertion": "replay tooling must ingest proposal, validation, manifest, validator-list, amendment, fee, and NegativeUNL control-plane traffic instead of transaction/prestate bundles only",
+      "residual_blockers": [
+        "needs committed replay schema for proposal streams, validation streams, manifest streams, amendment votes, fee votes, and NegativeUNL control flow",
+        "needs deterministic runner that can compare xLedgRS accepted sets, validation trust decisions, and protocol-control reports to captured rippled outputs",
+        "needs CI target that runs committed public fixtures and fails on missing or bridge-only proof"
+      ]
+    }
+  ]
+}

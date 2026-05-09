@@ -1,4 +1,3 @@
-# xLedgRS purpose: Provide a placeholder validators file for follower configs.
 [validators]
 # Follower mode does not require a local validator list yet.
 # Keep this file present so rippled-style config loading succeeds.

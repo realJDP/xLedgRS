@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Ticket support for XRPL ledger state and SHAMap logic.
 //! Ticket — a reserved sequence number for future use.
 //!
 //! TicketCreate reserves one or more sequence numbers that can be used

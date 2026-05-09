@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peer Session piece of the live node runtime.
 use super::http_io::read_http_headers;
 use super::*;
 
@@ -12,7 +11,7 @@ impl Node {
     ) where
         S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
     {
-        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RtxpMessage>(64);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<RtxpMessage>(256);
         let id = self.register_connecting_peer(outbound_tx, dir).await;
         let peerfinder_slot = {
             let mut state = self.state.write().await;
@@ -41,6 +40,7 @@ impl Node {
             }
         };
         let mut peer = Peer::new(id, addr, dir, resource_consumer);
+        peer.idle_timeout = self.config.sync_tuning.peer_idle_timeout();
         peer.set_peerfinder_slot(peerfinder_slot);
 
         peer.handle(PeerEvent::TlsEstablished);
@@ -58,7 +58,7 @@ impl Node {
             }
         };
 
-        let use_compression = match self
+        let _use_compression = match self
             .finalize_peer_handshake(
                 &mut stream,
                 &mut peer,
@@ -79,9 +79,32 @@ impl Node {
             let _ = dec.feed(&leftover);
         }
         let mut buf = vec![0u8; 8192];
+        let (route_tx, route_rx, route_result_tx, mut route_result_rx) = self.peer_route_channel();
+        let route_worker = tokio::spawn(self.clone().run_peer_route_worker(
+            id,
+            route_rx,
+            route_result_tx,
+        ));
+        let mut route_seq = 0u64;
+        let mut next_route_result_seq = 0u64;
+        let mut pending_route_results = std::collections::BTreeMap::new();
+        let mut idle_check = tokio::time::interval(std::time::Duration::from_secs(1));
+        idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
+                _ = idle_check.tick() => {
+                    let action = peer.check_idle();
+                    if let Err(e) = self
+                        .execute_action(&mut stream, &mut peer, action, &session_hash)
+                        .await
+                    {
+                        warn!("peer {id:?} idle action error: {e}");
+                        break;
+                    }
+                    self.sync_peer_state_snapshot(&peer).await;
+                }
+
                 result = stream.read(&mut buf) => {
                     let n = match result {
                         Ok(0) => {
@@ -104,6 +127,9 @@ impl Node {
                             &mut dec,
                             &buf[..n],
                             &session_hash,
+                            &route_tx,
+                            &mut route_seq,
+                            next_route_result_seq,
                         )
                         .await
                     {
@@ -112,10 +138,26 @@ impl Node {
                 }
 
                 Some(msg) = outbound_rx.recv() => {
-                    let wire = if use_compression { msg.encode_compressed() } else { msg.encode() };
+                    // Keep outbound frames uncompressed for now. We still accept
+                    // compressed inbound RTXP frames, but some mainnet peers reset
+                    // immediately after our first compressed post-handshake frame.
+                    let wire = msg.encode();
                     if let Err(e) = stream.write_all(&wire).await {
                         warn!("peer {id:?} write error: {e}");
                         break;
+                    }
+                }
+
+                Some(result) = route_result_rx.recv() => {
+                    pending_route_results.insert(result.seq, result);
+                    while let Some(result) = pending_route_results.remove(&next_route_result_seq) {
+                        next_route_result_seq = next_route_result_seq.saturating_add(1);
+                        self.apply_peer_route_result(
+                            &mut stream,
+                            &mut peer,
+                            result,
+                            &session_hash,
+                        ).await;
                     }
                 }
             }
@@ -123,6 +165,33 @@ impl Node {
             if peer.state.is_closed() {
                 break;
             }
+        }
+
+        drop(route_tx);
+        loop {
+            match tokio::time::timeout(
+                self.config.sync_tuning.peer_route_drain_timeout(),
+                route_result_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(result)) => {
+                    pending_route_results.insert(result.seq, result);
+                    while let Some(result) = pending_route_results.remove(&next_route_result_seq) {
+                        next_route_result_seq = next_route_result_seq.saturating_add(1);
+                        self.apply_peer_route_result(&mut stream, &mut peer, result, &session_hash)
+                            .await;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    warn!("peer {id:?} route worker drain timed out during disconnect");
+                    break;
+                }
+            }
+        }
+        if !route_worker.is_finished() {
+            route_worker.abort();
         }
 
         let peer_reserved = self.deregister_peer(id, addr).await;

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Views support for XRPL ledger state and SHAMap logic.
 //! View traits — the layered state access interface matching rippled.
 //!
 //! ReadView: read-only ledger state access

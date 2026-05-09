@@ -1,2 +1,2 @@
-# xLedgRS purpose: Ignore vendored NuDB build outputs.
 target/
+.DS_Store

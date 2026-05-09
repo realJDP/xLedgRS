@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Did support for XRPL ledger state and SHAMap logic.
 //! DID — Decentralized Identifier SLE.
 //!
 //! SHAMap key: `SHA-512-half(0x0049 || account)`

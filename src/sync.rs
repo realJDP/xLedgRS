@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Coordinate ledger state synchronization from peer data.
 //! Ledger synchronization from peer responses.
 //!
 //! When a validation arrives for a ledger sequence ahead of the local state,
@@ -151,7 +150,7 @@ pub fn object_reply_to_store(data: &[u8]) -> Option<Vec<u8>> {
     Some(data.to_vec())
 }
 
-fn add_storage_prefix(data: &[u8]) -> Option<Vec<u8>> {
+fn add_storage_prefix_with_leaf(data: &[u8], leaf_prefix: &[u8; 4]) -> Option<Vec<u8>> {
     if data.len() == 16 * 32 {
         let mut prefixed = Vec::with_capacity(4 + data.len());
         prefixed.extend_from_slice(&STORAGE_PREFIX_INNER);
@@ -161,7 +160,7 @@ fn add_storage_prefix(data: &[u8]) -> Option<Vec<u8>> {
 
     if data.len() > 32 {
         let mut prefixed = Vec::with_capacity(4 + data.len());
-        prefixed.extend_from_slice(&STORAGE_PREFIX_LEAF);
+        prefixed.extend_from_slice(leaf_prefix);
         prefixed.extend_from_slice(data);
         return Some(prefixed);
     }
@@ -170,23 +169,92 @@ fn add_storage_prefix(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub fn store_to_object_reply(data: &[u8]) -> Option<Vec<u8>> {
-    if data.starts_with(&STORAGE_PREFIX_INNER) || data.starts_with(&STORAGE_PREFIX_LEAF) {
-        return Some(data.to_vec());
+    store_to_object_reply_typed(crate::ledger::node_store::NodeObjectType::AccountNode, data)
+}
+
+pub fn store_to_object_reply_typed(
+    object_type: crate::ledger::node_store::NodeObjectType,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    match object_type {
+        crate::ledger::node_store::NodeObjectType::Ledger => {
+            if data.starts_with(b"LWR\0") {
+                Some(data.to_vec())
+            } else {
+                let mut prefixed = Vec::with_capacity(4 + data.len());
+                prefixed.extend_from_slice(b"LWR\0");
+                prefixed.extend_from_slice(data);
+                Some(prefixed)
+            }
+        }
+        crate::ledger::node_store::NodeObjectType::AccountNode => {
+            if data.starts_with(&STORAGE_PREFIX_INNER) || data.starts_with(&STORAGE_PREFIX_LEAF) {
+                return Some(data.to_vec());
+            }
+            add_storage_prefix_with_leaf(data, &STORAGE_PREFIX_LEAF)
+        }
+        crate::ledger::node_store::NodeObjectType::TransactionNode => {
+            if data.starts_with(&STORAGE_PREFIX_INNER) || data.starts_with(b"SND\0") {
+                return Some(data.to_vec());
+            }
+            add_storage_prefix_with_leaf(data, b"SND\0")
+        }
     }
-    add_storage_prefix(data)
 }
 
 /// Normalize a TMGetObjectByHash payload and verify that the normalized bytes
 /// hash to the expected SHAMap node hash.
 pub fn object_reply_to_verified_store(expected_hash: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
-    if data.starts_with(&STORAGE_PREFIX_INNER) || data.starts_with(&STORAGE_PREFIX_LEAF) {
+    object_reply_to_verified_store_typed(
+        crate::ledger::node_store::NodeObjectType::AccountNode,
+        expected_hash,
+        data,
+    )
+}
+
+pub fn object_reply_to_verified_store_typed(
+    object_type: crate::ledger::node_store::NodeObjectType,
+    expected_hash: &[u8; 32],
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    match object_type {
+        crate::ledger::node_store::NodeObjectType::Ledger => {
+            if data.starts_with(b"LWR\0") {
+                if &crate::crypto::sha512_first_half(data) == expected_hash {
+                    return Some(data[4..].to_vec());
+                }
+                return None;
+            }
+            let mut prefixed = Vec::with_capacity(4 + data.len());
+            prefixed.extend_from_slice(b"LWR\0");
+            prefixed.extend_from_slice(data);
+            if &crate::crypto::sha512_first_half(&prefixed) == expected_hash {
+                return Some(data.to_vec());
+            }
+            None
+        }
+        crate::ledger::node_store::NodeObjectType::AccountNode => {
+            object_reply_to_verified_shamap_store(expected_hash, data, &STORAGE_PREFIX_LEAF)
+        }
+        crate::ledger::node_store::NodeObjectType::TransactionNode => {
+            object_reply_to_verified_shamap_store(expected_hash, data, b"SND\0")
+        }
+    }
+}
+
+fn object_reply_to_verified_shamap_store(
+    expected_hash: &[u8; 32],
+    data: &[u8],
+    leaf_prefix: &[u8; 4],
+) -> Option<Vec<u8>> {
+    if data.starts_with(&STORAGE_PREFIX_INNER) || data.starts_with(leaf_prefix) {
         if &crate::crypto::sha512_first_half(data) == expected_hash {
-            return object_reply_to_store(data);
+            return Some(data[4..].to_vec());
         }
         return None;
     }
 
-    if let Some(prefixed) = add_storage_prefix(data) {
+    if let Some(prefixed) = add_storage_prefix_with_leaf(data, leaf_prefix) {
         if &crate::crypto::sha512_first_half(&prefixed) == expected_hash {
             return Some(data.to_vec());
         }
@@ -473,24 +541,15 @@ impl PeerSyncManager {
         if !ltclosed && resp_hash != self.ledger_hash {
             return false;
         }
-        let Some(c32) = cookie else {
-            return false;
-        };
-        if !self.outstanding_cookies.remove(&c32) {
-            return false;
-        }
-        self.responded_cookies.insert(c32);
-        if self.in_flight > 0 {
-            self.in_flight -= 1;
+        if let Some(c32) = cookie {
+            self.outstanding_cookies.remove(&c32);
+            self.responded_cookies.insert(c32);
         }
         self.last_response = std::time::Instant::now();
         true
     }
 
-    pub fn accept_object_response(&mut self, resp_hash: &[u8], seq: Option<u32>) -> bool {
-        let Some(s32) = seq.map(|s| s as u32) else {
-            return false;
-        };
+    pub fn accept_object_response(&mut self, resp_hash: &[u8], _seq: Option<u32>) -> bool {
         let ltclosed = self.ledger_hash == [0u8; 32];
         if resp_hash.len() != 32 {
             return false;
@@ -498,10 +557,6 @@ impl PeerSyncManager {
         if !ltclosed && resp_hash != self.ledger_hash {
             return false;
         }
-        if !self.outstanding_object_queries.remove(&s32) {
-            return false;
-        }
-        self.responded_object_queries.insert(s32);
         self.last_response = std::time::Instant::now();
         true
     }
@@ -681,17 +736,14 @@ impl PeerSyncManager {
             .iter()
             .map(|(nid, _)| nid.to_wire().to_vec())
             .collect();
-        let cookie = next_cookie() as u32;
         reqs.push(crate::network::relay::encode_get_ledger_state(
             &request_hash,
             &batch,
-            u64::from(cookie),
+            0,
             query_depth,
             query_type,
             self.ledger_seq,
         ));
-        self.outstanding_cookies.insert(cookie);
-        self.in_flight = self.in_flight.saturating_add(reqs.len());
         reqs
     }
 
@@ -708,6 +760,8 @@ impl PeerSyncManager {
 pub struct ParsedSyncResponse {
     /// (SHAMapNodeID, wire_data) pairs for add_known_node.
     pub nodes: Vec<(crate::ledger::shamap_id::SHAMapNodeID, Vec<u8>)>,
+    /// Leaf nodes validated by hash without cloning their full wire payload.
+    pub leaf_nodes: Vec<(crate::ledger::shamap_id::SHAMapNodeID, [u8; 32])>,
     /// (key_bytes, sle_data) pairs for direct NuDB leaf storage.
     pub leaves: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -720,6 +774,7 @@ pub(crate) fn parse_sync_response(
     log_initial_nodes: bool,
 ) -> ParsedSyncResponse {
     let mut nodes = Vec::new();
+    let mut leaf_nodes = Vec::new();
     let mut leaves = Vec::new();
 
     for node in &ld.nodes {
@@ -757,7 +812,15 @@ pub(crate) fn parse_sync_response(
 
         if wire_type == 0x01 && data.len() > 32 {
             let key_start = data.len() - 32;
-            leaves.push((data[key_start..].to_vec(), data[..key_start].to_vec()));
+            let key = &data[key_start..];
+            let leaf_data = &data[..key_start];
+            let mut key_hash = [0u8; 32];
+            key_hash.copy_from_slice(key);
+            leaves.push((key.to_vec(), leaf_data.to_vec()));
+            leaf_nodes.push((
+                nid,
+                crate::ledger::sparse_shamap::leaf_hash(leaf_data, &key_hash),
+            ));
         } else if wire_type != 0x02 && wire_type != 0x03 {
             tracing::debug!(
                 "sync: unknown wire_type={:#04x} data_len={}",
@@ -766,10 +829,59 @@ pub(crate) fn parse_sync_response(
             );
         }
 
-        nodes.push((nid, node.nodedata.clone()));
+        if wire_type == 0x02 || wire_type == 0x03 || wire_type != 0x01 {
+            nodes.push((nid, node.nodedata.clone()));
+        }
     }
 
-    ParsedSyncResponse { nodes, leaves }
+    ParsedSyncResponse {
+        nodes,
+        leaf_nodes,
+        leaves,
+    }
+}
+
+/// Validate a ledger-data payload before it is allowed to refresh sync progress.
+pub(crate) fn validate_ledger_data_nodes(
+    ld: &crate::proto::TmLedgerData,
+    expected_type: i32,
+) -> Result<(), &'static str> {
+    if ld.r#type != expected_type {
+        return Err("wrong ledger data type");
+    }
+    if ld.ledger_hash.len() != 32 {
+        return Err("bad ledger hash length");
+    }
+    if ld.error.is_none() && ld.nodes.is_empty() {
+        return Err("zero node response");
+    }
+
+    let requires_node_id = expected_type == crate::proto::TmLedgerInfoType::LiAsNode as i32
+        || expected_type == crate::proto::TmLedgerInfoType::LiTxNode as i32;
+
+    for node in &ld.nodes {
+        let wire_type = node.nodedata.last().copied().ok_or("empty node data")?;
+        match node.nodeid.as_deref() {
+            None | Some([]) if !requires_node_id => {}
+            Some(id)
+                if id.len() == 33
+                    && crate::ledger::shamap_id::SHAMapNodeID::from_wire(id).is_some() => {}
+            _ => return Err("bad node id"),
+        }
+
+        let ok = if expected_type == crate::proto::TmLedgerInfoType::LiAsNode as i32 {
+            matches!(wire_type, 0x01 | 0x02 | 0x03)
+        } else if expected_type == crate::proto::TmLedgerInfoType::LiTxNode as i32 {
+            matches!(wire_type, 0x00 | 0x02 | 0x03 | 0x04)
+        } else {
+            true
+        };
+        if !ok {
+            return Err("bad wire type");
+        }
+    }
+
+    Ok(())
 }
 
 // SyncRequestReason already defined above (line ~143)
@@ -1281,13 +1393,10 @@ impl StateSyncer {
         if needed.is_empty() {
             return None;
         }
-        let seq = next_cookie() as u32;
-        self.outstanding_object_queries.insert(seq);
         Some(crate::network::relay::encode_get_state_nodes_by_hash(
             &self.ledger_hash,
             &needed,
             self.ledger_seq,
-            seq,
         ))
     }
 
@@ -1352,19 +1461,8 @@ impl StateSyncer {
     }
 
     /// Accept GetObjects responses with same fanout-safe logic.
-    pub fn accept_object_response(&mut self, ledger_hash: &[u8], seq: Option<u32>) -> bool {
+    pub fn accept_object_response(&mut self, ledger_hash: &[u8], _seq: Option<u32>) -> bool {
         if ledger_hash.len() != 32 || ledger_hash != self.ledger_hash {
-            return false;
-        }
-        let Some(seq) = seq else {
-            return false;
-        };
-        if self.outstanding_object_queries.contains(&seq) {
-            self.outstanding_object_queries.remove(&seq);
-            self.responded_object_queries.insert(seq);
-        } else if self.responded_object_queries.contains(&seq) {
-            // Duplicate — accept
-        } else {
             return false;
         }
         self.last_response = std::time::Instant::now();
@@ -1923,6 +2021,148 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_ledger_data_nodes_accepts_matching_state_node() {
+        let node_id = crate::ledger::shamap_id::SHAMapNodeID::root();
+        let ld = crate::proto::TmLedgerData {
+            ledger_hash: vec![0xAB; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiAsNode as i32,
+            nodes: vec![crate::proto::TmLedgerNode {
+                nodedata: {
+                    let mut data = vec![0u8; 512];
+                    data.push(0x02);
+                    data
+                },
+                nodeid: Some(node_id.to_wire().to_vec()),
+            }],
+            request_cookie: None,
+            error: None,
+        };
+
+        assert!(
+            validate_ledger_data_nodes(&ld, crate::proto::TmLedgerInfoType::LiAsNode as i32)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_ledger_data_nodes_rejects_malformed_state_node() {
+        let ld = crate::proto::TmLedgerData {
+            ledger_hash: vec![0xAB; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiAsNode as i32,
+            nodes: vec![crate::proto::TmLedgerNode {
+                nodedata: vec![0x04],
+                nodeid: Some(vec![0; 34]),
+            }],
+            request_cookie: None,
+            error: None,
+        };
+
+        assert!(
+            validate_ledger_data_nodes(&ld, crate::proto::TmLedgerInfoType::LiAsNode as i32)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_ledger_data_nodes_rejects_zero_node_success_response() {
+        let ld = crate::proto::TmLedgerData {
+            ledger_hash: vec![0xAB; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiAsNode as i32,
+            nodes: Vec::new(),
+            request_cookie: None,
+            error: None,
+        };
+
+        assert_eq!(
+            validate_ledger_data_nodes(&ld, crate::proto::TmLedgerInfoType::LiAsNode as i32),
+            Err("zero node response")
+        );
+    }
+
+    #[test]
+    fn test_validate_ledger_data_nodes_allows_zero_node_error_response() {
+        let ld = crate::proto::TmLedgerData {
+            ledger_hash: vec![0xAB; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiAsNode as i32,
+            nodes: Vec::new(),
+            request_cookie: None,
+            error: Some(crate::proto::TmReplyError::ReNoNode as i32),
+        };
+
+        assert!(
+            validate_ledger_data_nodes(&ld, crate::proto::TmLedgerInfoType::LiAsNode as i32)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_ledger_data_nodes_rejects_missing_state_node_id() {
+        let ld = crate::proto::TmLedgerData {
+            ledger_hash: vec![0xAB; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiAsNode as i32,
+            nodes: vec![crate::proto::TmLedgerNode {
+                nodedata: {
+                    let mut data = vec![0u8; 512];
+                    data.push(0x02);
+                    data
+                },
+                nodeid: None,
+            }],
+            request_cookie: None,
+            error: None,
+        };
+
+        assert!(
+            validate_ledger_data_nodes(&ld, crate::proto::TmLedgerInfoType::LiAsNode as i32)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_ledger_data_nodes_rejects_missing_tx_node_id() {
+        let ld = crate::proto::TmLedgerData {
+            ledger_hash: vec![0xAB; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiTxNode as i32,
+            nodes: vec![crate::proto::TmLedgerNode {
+                nodedata: vec![0x00],
+                nodeid: Some(Vec::new()),
+            }],
+            request_cookie: None,
+            error: None,
+        };
+
+        assert!(
+            validate_ledger_data_nodes(&ld, crate::proto::TmLedgerInfoType::LiTxNode as i32)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_ledger_data_nodes_allows_missing_base_node_id() {
+        let ld = crate::proto::TmLedgerData {
+            ledger_hash: vec![0xAB; 32],
+            ledger_seq: 10,
+            r#type: crate::proto::TmLedgerInfoType::LiBase as i32,
+            nodes: vec![crate::proto::TmLedgerNode {
+                nodedata: vec![0x00],
+                nodeid: None,
+            }],
+            request_cookie: None,
+            error: None,
+        };
+
+        assert!(
+            validate_ledger_data_nodes(&ld, crate::proto::TmLedgerInfoType::LiBase as i32).is_ok()
+        );
+    }
+
+    #[test]
     fn test_build_child_id() {
         let parent = [0u8; 32];
         // Depth 0, branch 5 → nibble at pos 0 high nibble = 0x50
@@ -2017,21 +2257,17 @@ mod tests {
     fn test_peer_sync_manager_accepts_ltclosed_ledgerdata_responses() {
         let mut peer = PeerSyncManager::new(10, [0u8; 32], [0xCD; 32]);
         assert!(peer.accepts_ltclosed_responses());
-        peer.outstanding_cookies.insert(55);
-        peer.in_flight = 1;
-        assert!(peer.accept_response(&[0xAB; 32], Some(55)));
-        assert_eq!(peer.in_flight, 0);
+        assert!(peer.accept_response(&[0xAB; 32], None));
+        assert!(peer.accept_response(&[0xCD; 32], Some(55)));
     }
 
     #[test]
-    fn test_peer_sync_manager_accepts_ltclosed_object_response_by_seq() {
+    fn test_peer_sync_manager_accepts_ltclosed_object_response_without_seq() {
         let mut peer = PeerSyncManager::new(10, [0u8; 32], [0xCD; 32]);
-        peer.outstanding_object_queries.insert(77);
 
-        assert!(peer.accept_object_response(&[0xEF; 32], Some(77)));
-        assert!(!peer.outstanding_object_queries.contains(&77));
-        assert!(peer.responded_object_queries.contains(&77));
-        assert!(!peer.accept_object_response(&[0xEF; 32], Some(78)));
+        assert!(peer.accept_object_response(&[0xEF; 32], None));
+        assert!(peer.accept_object_response(&[0xEF; 32], Some(78)));
+        assert!(peer.responded_object_queries.is_empty());
     }
 
     #[test]
@@ -2080,7 +2316,7 @@ mod tests {
         };
 
         let parsed = peer.parse_response(&ld);
-        assert_eq!(parsed.nodes.len(), 1);
+        assert_eq!(parsed.leaf_nodes.len(), 1);
         assert!(peer.recent_nodes.contains(&node_hash));
 
         peer.clear_recent();
@@ -2100,10 +2336,8 @@ mod tests {
         let reply_pb = crate::proto::TmGetLedger::decode(reply_req[0].payload.as_slice())
             .expect("reply request should decode");
         assert_eq!(reply_pb.query_depth, Some(1));
-        let reply_cookie = reply_pb
-            .request_cookie
-            .expect("reply request should carry a cookie") as u32;
-        assert!(reply_peer.has_cookie(reply_cookie));
+        assert_eq!(reply_pb.request_cookie, None);
+        assert_eq!(reply_peer.outstanding_cookie_count(), 0);
 
         let mut timeout_peer = PeerSyncManager::new(10, [0xAB; 32], [0xCD; 32]);
         let timeout_req =
@@ -2112,10 +2346,8 @@ mod tests {
         let timeout_pb = crate::proto::TmGetLedger::decode(timeout_req[0].payload.as_slice())
             .expect("timeout request should decode");
         assert_eq!(timeout_pb.query_depth, Some(0));
-        let timeout_cookie = timeout_pb
-            .request_cookie
-            .expect("timeout request should carry a cookie") as u32;
-        assert!(timeout_peer.has_cookie(timeout_cookie));
+        assert_eq!(timeout_pb.request_cookie, None);
+        assert_eq!(timeout_peer.outstanding_cookie_count(), 0);
     }
 
     #[test]
@@ -2155,7 +2387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_sync_manager_tracks_reply_requests_as_in_flight() {
+    fn test_peer_sync_manager_uses_cookie_free_ledgerdata_requests() {
         use prost::Message as _;
 
         let node_id = crate::ledger::shamap_id::SHAMapNodeID::new(1, [0u8; 32]);
@@ -2164,17 +2396,17 @@ mod tests {
 
         let reqs = peer.build_requests_from_missing(&missing, SyncRequestReason::Reply);
         assert_eq!(reqs.len(), 1);
-        assert_eq!(peer.in_flight, 1);
+        assert_eq!(peer.in_flight, 0);
         let pb = crate::proto::TmGetLedger::decode(reqs[0].payload.as_slice())
             .expect("request should decode");
-        let cookie = pb.request_cookie.expect("request should carry cookie") as u32;
+        assert_eq!(pb.request_cookie, None);
 
-        assert!(peer.accept_response(&[0xAB; 32], Some(cookie)));
+        assert!(peer.accept_response(&[0xAB; 32], None));
         assert_eq!(peer.in_flight, 0);
     }
 
     #[test]
-    fn test_peer_sync_manager_rejects_unknown_cookie_and_prefix_only_hash_match() {
+    fn test_peer_sync_manager_accepts_by_full_hash_not_cookie() {
         let mut peer = PeerSyncManager::new(10, [0xAB; 32], [0xCD; 32]);
         peer.outstanding_cookies.insert(7);
 
@@ -2183,9 +2415,9 @@ mod tests {
         assert!(!peer.accept_response(&prefix_only, Some(7)));
         assert!(peer.outstanding_cookies.contains(&7));
 
-        assert!(!peer.accept_response(&[0xAB; 32], Some(8)));
+        assert!(peer.accept_response(&[0xAB; 32], Some(8)));
         assert!(peer.outstanding_cookies.contains(&7));
-        assert!(!peer.accept_response(&[0xAB; 32], None));
+        assert!(peer.accept_response(&[0xAB; 32], None));
         assert!(peer.outstanding_cookies.contains(&7));
     }
 
@@ -2460,6 +2692,59 @@ mod tests {
         assert_eq!(
             store_to_object_reply(&normalized).expect("stripped leaf should reprifix"),
             expected
+        );
+    }
+
+    #[test]
+    fn test_typed_transaction_object_reply_uses_tx_prefix() {
+        let normalized = vec![0xDD; 96];
+        let mut expected = b"SND\0".to_vec();
+        expected.extend_from_slice(&normalized);
+        assert_eq!(
+            store_to_object_reply_typed(
+                crate::ledger::node_store::NodeObjectType::TransactionNode,
+                &normalized
+            )
+            .expect("stripped tx leaf should re-prefix"),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_typed_transaction_verified_store_accepts_matching_leaf() {
+        let key = [0x81; 32];
+        let mut normalized = b"txpayload".to_vec();
+        normalized.extend_from_slice(&key);
+        let mut prefixed = b"SND\0".to_vec();
+        prefixed.extend_from_slice(&normalized);
+        let expected_hash = crate::crypto::sha512_first_half(&prefixed);
+
+        assert_eq!(
+            object_reply_to_verified_store_typed(
+                crate::ledger::node_store::NodeObjectType::TransactionNode,
+                &expected_hash,
+                &prefixed,
+            )
+            .expect("matching tx leaf should verify"),
+            normalized
+        );
+    }
+
+    #[test]
+    fn test_typed_ledger_verified_store_accepts_prefixed_header() {
+        let header = b"ledger-header".to_vec();
+        let mut prefixed = b"LWR\0".to_vec();
+        prefixed.extend_from_slice(&header);
+        let expected_hash = crate::crypto::sha512_first_half(&prefixed);
+
+        assert_eq!(
+            object_reply_to_verified_store_typed(
+                crate::ledger::node_store::NodeObjectType::Ledger,
+                &expected_hash,
+                &prefixed,
+            )
+            .expect("matching ledger object should verify"),
+            header
         );
     }
 

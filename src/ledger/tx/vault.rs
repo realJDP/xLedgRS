@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Vault transaction engine logic for ledger replay.
 //! Vault — VaultCreate (65), VaultSet (66), VaultDelete (67),
 //!         VaultDeposit (68), VaultWithdraw (69), VaultClawback (70).
 //!
@@ -16,8 +15,11 @@
 use crate::crypto::{ripemd160, sha256, sha512_first_half};
 use crate::ledger::tx::TxContext;
 use crate::ledger::{directory, AccountRoot, Key, LedgerState};
+use crate::transaction::amount::{Amount, Issue};
 use crate::transaction::ParsedTx;
 
+use super::asset_flow::{self, AssetDelta};
+use super::mptoken;
 use super::{bridge_metadata_only_tx, ApplyResult};
 
 /// LedgerNameSpace::VAULT = 'V' = 0x56.
@@ -42,6 +44,14 @@ const LT_MPTOKEN: u16 = 0x007F;
 const LSF_DISABLE_MASTER: u32 = 0x00100000;
 const LSF_DEFAULT_RIPPLE: u32 = 0x00800000;
 const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
+const LSF_VAULT_PRIVATE: u32 = 0x00010000;
+const LSF_MPT_REQUIRE_AUTH: u32 = 0x00000004;
+const MAX_DATA_PAYLOAD_LENGTH: usize = 256;
+const VAULT_STRATEGY_FIRST_COME_FIRST_SERVE: u8 = 1;
+
+const SF_OWNER_NODE: u16 = 4;
+const SF_OUTSTANDING_AMOUNT: u16 = 25;
+const SF_MPT_AMOUNT: u16 = 26;
 
 /// Compute the Vault SHAMap key.
 /// `SHA-512-Half(0x0056 || owner || sequence)`
@@ -76,6 +86,53 @@ fn mptoken_key(issuance_key: &[u8; 32], holder: &[u8; 20]) -> Key {
     data.extend_from_slice(issuance_key);
     data.extend_from_slice(holder);
     Key(sha512_first_half(&data))
+}
+
+fn issue_from_amount(amount: &Amount) -> Option<Issue> {
+    match amount {
+        Amount::Xrp(_) => Some(Issue::Xrp),
+        Amount::Iou {
+            currency, issuer, ..
+        } => Some(Issue::Iou {
+            currency: currency.clone(),
+            issuer: *issuer,
+        }),
+        Amount::Mpt(_) => amount.mpt_parts().map(|(_, mptid)| Issue::Mpt(mptid)),
+    }
+}
+
+fn amount_units(amount: &Amount) -> Option<u64> {
+    match amount {
+        Amount::Xrp(drops) => Some(*drops),
+        Amount::Iou { value, .. } => {
+            if !value.is_positive() {
+                return Some(0);
+            }
+            let mut v = value.mantissa as i128;
+            if value.exponent >= 0 {
+                v = v.checked_mul(10_i128.checked_pow(value.exponent as u32)?)?;
+            } else {
+                v /= 10_i128.checked_pow((-value.exponent) as u32)?;
+            }
+            (v >= 0 && v <= u64::MAX as i128).then_some(v as u64)
+        }
+        Amount::Mpt(_) => amount.mpt_parts().map(|(value, _)| value),
+    }
+}
+
+fn amount_from_issue(issue: &Issue, units: u64) -> Option<Amount> {
+    match issue {
+        Issue::Xrp => Some(Amount::Xrp(units)),
+        Issue::Iou { currency, issuer } => Some(Amount::Iou {
+            value: crate::transaction::amount::IouValue {
+                mantissa: i64::try_from(units).ok()?,
+                exponent: 0,
+            },
+            currency: currency.clone(),
+            issuer: *issuer,
+        }),
+        Issue::Mpt(mptid) => Some(Amount::from_mpt_value(units, *mptid)),
+    }
 }
 
 /// Derive a pseudo-account address from a vault key and parent hash.
@@ -113,10 +170,13 @@ fn build_vault_sle(
     share_mptid: &[u8; 24],
     owner_node: u64,
     flags: u32,
+    asset: &Issue,
+    assets_maximum: i64,
+    data: Option<&[u8]>,
 ) -> Vec<u8> {
     use crate::ledger::meta::ParsedField;
 
-    let fields = vec![
+    let mut fields = vec![
         // sfOwner (ACCOUNT=8, field=2)
         ParsedField {
             type_code: 8,
@@ -141,6 +201,12 @@ fn build_vault_sle(
             field_code: 2,
             data: flags.to_be_bytes().to_vec(),
         },
+        // sfAsset (ISSUE=24, field=3) — held asset type
+        ParsedField {
+            type_code: 24,
+            field_code: 3,
+            data: asset.to_bytes(),
+        },
         // sfOwnerNode (UINT64=3, field=4)
         ParsedField {
             type_code: 3,
@@ -159,6 +225,12 @@ fn build_vault_sle(
             field_code: 4,
             data: 0i64.to_be_bytes().to_vec(),
         },
+        // sfAssetsMaximum (NUMBER=9, field=3) — 0 means unlimited
+        ParsedField {
+            type_code: 9,
+            field_code: 3,
+            data: assets_maximum.to_be_bytes().to_vec(),
+        },
         // sfAssetsAvailable (NUMBER=9, field=2) — 0 initially
         ParsedField {
             type_code: 9,
@@ -171,11 +243,11 @@ fn build_vault_sle(
             field_code: 5,
             data: 0i64.to_be_bytes().to_vec(),
         },
-        // sfWithdrawalPolicy (UINT8=16, field=20) — default: FirstComeFirstServe = 0
+        // sfWithdrawalPolicy (UINT8=16, field=20) — FirstComeFirstServe
         ParsedField {
             type_code: 16,
             field_code: 20,
-            data: vec![0],
+            data: vec![VAULT_STRATEGY_FIRST_COME_FIRST_SERVE],
         },
         // sfScale (UINT8=16, field=4) — 0 for XRP
         ParsedField {
@@ -184,12 +256,24 @@ fn build_vault_sle(
             data: vec![0],
         },
     ];
+    if let Some(data) = data {
+        fields.push(ParsedField {
+            type_code: 7,
+            field_code: 27,
+            data: data.to_vec(),
+        });
+    }
 
     crate::ledger::meta::build_sle(LT_VAULT, &fields, None, None)
 }
 
 /// Build an MPTokenIssuance SLE for vault shares.
-fn build_share_issuance_sle(pseudo_account: &[u8; 20], sequence: u32) -> Vec<u8> {
+fn build_share_issuance_sle(
+    pseudo_account: &[u8; 20],
+    sequence: u32,
+    flags: u32,
+    owner_node: u64,
+) -> Vec<u8> {
     use crate::ledger::meta::ParsedField;
     crate::ledger::meta::build_sle(
         LT_MPT_ISSUANCE,
@@ -206,23 +290,23 @@ fn build_share_issuance_sle(pseudo_account: &[u8; 20], sequence: u32) -> Vec<u8>
                 field_code: 4,
                 data: sequence.to_be_bytes().to_vec(),
             },
-            // sfOutstandingAmount (UINT64=3, field=4) — 0 initially
+            // sfOwnerNode (UINT64=3, field=4)
             ParsedField {
                 type_code: 3,
-                field_code: 4,
-                data: 0u64.to_be_bytes().to_vec(),
+                field_code: SF_OWNER_NODE,
+                data: owner_node.to_be_bytes().to_vec(),
             },
-            // sfLockedAmount (UINT64=3, field=25) — 0 initially
+            // sfOutstandingAmount (UINT64=3, field=25) — 0 initially
             ParsedField {
                 type_code: 3,
-                field_code: 25,
+                field_code: SF_OUTSTANDING_AMOUNT,
                 data: 0u64.to_be_bytes().to_vec(),
             },
-            // sfFlags (UINT32=2, field=2) — CanEscrow | CanTrade | CanTransfer
+            // sfFlags (UINT32=2, field=2)
             ParsedField {
                 type_code: 2,
                 field_code: 2,
-                data: 0u32.to_be_bytes().to_vec(),
+                data: flags.to_be_bytes().to_vec(),
             },
         ],
         None,
@@ -231,7 +315,7 @@ fn build_share_issuance_sle(pseudo_account: &[u8; 20], sequence: u32) -> Vec<u8>
 }
 
 /// Build an MPToken SLE for a holder.
-fn build_mptoken_sle(account: &[u8; 20], mptid: &[u8; 24], flags: u32) -> Vec<u8> {
+fn build_mptoken_sle(account: &[u8; 20], mptid: &[u8; 24], flags: u32, owner_node: u64) -> Vec<u8> {
     use crate::ledger::meta::ParsedField;
     crate::ledger::meta::build_sle(
         LT_MPTOKEN,
@@ -251,14 +335,14 @@ fn build_mptoken_sle(account: &[u8; 20], mptid: &[u8; 24], flags: u32) -> Vec<u8
             // sfMPTAmount (UINT64=3, field=26) — 0 initially
             ParsedField {
                 type_code: 3,
-                field_code: 26,
+                field_code: SF_MPT_AMOUNT,
                 data: 0u64.to_be_bytes().to_vec(),
             },
-            // sfLockedAmount (UINT64=3, field=4)
+            // sfOwnerNode (UINT64=3, field=4)
             ParsedField {
                 type_code: 3,
-                field_code: 4,
-                data: 0u64.to_be_bytes().to_vec(),
+                field_code: SF_OWNER_NODE,
+                data: owner_node.to_be_bytes().to_vec(),
             },
             // sfFlags (UINT32=2, field=2)
             ParsedField {
@@ -282,6 +366,15 @@ pub(super) fn vault_sle_pseudo_id(raw: &[u8]) -> Option<[u8; 20]> {
 /// sfOwner = (ACCOUNT=8, field=2) — 20 bytes after VL prefix.
 fn vault_sle_owner(raw: &[u8]) -> Option<[u8; 20]> {
     extract_account_field(raw, 2)
+}
+
+fn vault_sle_asset(raw: &[u8]) -> Option<Issue> {
+    let parsed = crate::ledger::meta::parse_sle(raw)?;
+    parsed
+        .fields
+        .iter()
+        .find(|field| field.type_code == 24 && field.field_code == 3)
+        .and_then(|field| Issue::from_bytes(&field.data).map(|(issue, _)| issue))
 }
 
 /// Extract sfShareMPTID from a Vault SLE.
@@ -350,6 +443,7 @@ pub(crate) fn apply_vault_create(
         flags: LSF_DISABLE_MASTER | LSF_DEFAULT_RIPPLE | LSF_DEPOSIT_AUTH,
         regular_key: None,
         minted_nftokens: 0,
+        first_nftoken_sequence: 0,
         burned_nftokens: 0,
         transfer_rate: 0,
         domain: Vec::new(),
@@ -364,8 +458,14 @@ pub(crate) fn apply_vault_create(
     // 5. Create MPTokenIssuance for shares (pseudo-account, sequence=1)
     let share_mptid = make_mptid(1, &pseudo_id);
     let issuance_key = mpt_issuance_key(&share_mptid);
-    let issuance_sle = build_share_issuance_sle(&pseudo_id, 1);
-    directory::dir_add(state, &pseudo_id, issuance_key.0);
+    let tx_flags = tx.flags & LSF_VAULT_PRIVATE;
+    let issuance_flags = if (tx_flags & LSF_VAULT_PRIVATE) != 0 {
+        LSF_MPT_REQUIRE_AUTH
+    } else {
+        0
+    };
+    let issuance_owner_node = directory::dir_add(state, &pseudo_id, issuance_key.0);
+    let issuance_sle = build_share_issuance_sle(&pseudo_id, 1, issuance_flags, issuance_owner_node);
     state.insert_raw(issuance_key, issuance_sle);
     // Increment pseudo-account owner_count for the issuance
     if let Some(pa) = state.get_account(&pseudo_id) {
@@ -376,18 +476,24 @@ pub(crate) fn apply_vault_create(
 
     // 6. Create owner's MPToken for shares (authorized)
     let owner_token_key = mptoken_key(&issuance_key.0, &tx.account);
-    let owner_token_sle = build_mptoken_sle(&tx.account, &share_mptid, 0x0000_0002); // lsfMPTAuthorized
-    directory::dir_add(state, &tx.account, owner_token_key.0);
+    let owner_token_node = directory::dir_add(state, &tx.account, owner_token_key.0);
+    let owner_token_sle =
+        build_mptoken_sle(&tx.account, &share_mptid, 0x0000_0002, owner_token_node); // lsfMPTAuthorized
     state.insert_raw(owner_token_key, owner_token_sle);
 
     // 7. Create Vault SLE
+    let asset = tx.asset.clone().unwrap_or(Issue::Xrp);
+    let assets_maximum = tx.maximum_amount.unwrap_or(0) as i64;
     let vault_sle = build_vault_sle(
         &tx.account,
         &pseudo_id,
         tx.sequence,
         &share_mptid,
         owner_node,
-        tx.flags, // only tfVaultPrivate stored
+        tx_flags, // only tfVaultPrivate stored
+        &asset,
+        assets_maximum,
+        tx.did_data.as_deref(),
     );
     state.insert_raw(vkey, vault_sle);
 
@@ -449,7 +555,7 @@ pub(crate) fn apply_vault_delete(state: &mut LedgerState, tx: &ParsedTx) -> Appl
     // Also verify outstanding shares == 0
     let issuance_key_check = mpt_issuance_key(&share_mptid);
     if let Some(issuance_raw) = state.get_raw(&issuance_key_check) {
-        let outstanding = sle_uint64(&issuance_raw.to_vec(), 4);
+        let outstanding = sle_uint64(&issuance_raw.to_vec(), SF_OUTSTANDING_AMOUNT);
         if outstanding != 0 {
             return ApplyResult::ClaimedCost("tecHAS_OBLIGATIONS");
         }
@@ -518,6 +624,20 @@ fn sle_uint64(raw: &[u8], target_field: u16) -> u64 {
     0
 }
 
+/// Extract a UInt32 field (type=2) from a parsed SLE.
+fn sle_uint32(raw: &[u8], target_field: u16) -> u32 {
+    let parsed = match crate::ledger::meta::parse_sle(raw) {
+        Some(p) => p,
+        None => return 0,
+    };
+    for field in &parsed.fields {
+        if field.type_code == 2 && field.field_code == target_field && field.data.len() == 4 {
+            return u32::from_be_bytes(field.data[..4].try_into().unwrap());
+        }
+    }
+    0
+}
+
 /// Patch a NUMBER field in an SLE.
 fn patch_number_field(raw: &[u8], field_code: u16, value: i64) -> Vec<u8> {
     crate::ledger::meta::patch_sle(
@@ -546,6 +666,38 @@ fn patch_uint64_field(raw: &[u8], type_code: u16, field_code: u16, value: u64) -
         None,
         &[],
     )
+}
+
+fn patch_blob_field(raw: &[u8], field_code: u16, value: &[u8]) -> Vec<u8> {
+    crate::ledger::meta::patch_sle(
+        raw,
+        &[crate::ledger::meta::ParsedField {
+            type_code: 7,
+            field_code,
+            data: value.to_vec(),
+        }],
+        None,
+        None,
+        &[],
+    )
+}
+
+fn patch_hash256_field(raw: &[u8], field_code: u16, value: [u8; 32]) -> Vec<u8> {
+    crate::ledger::meta::patch_sle(
+        raw,
+        &[crate::ledger::meta::ParsedField {
+            type_code: 5,
+            field_code,
+            data: value.to_vec(),
+        }],
+        None,
+        None,
+        &[],
+    )
+}
+
+fn remove_sle_field(raw: &[u8], type_code: u16, field_code: u16) -> Vec<u8> {
+    crate::ledger::meta::patch_sle(raw, &[], None, None, &[(type_code, field_code)])
 }
 
 /// Type 68: VaultDeposit — deposit assets into a vault and receive shares.
@@ -587,7 +739,7 @@ pub(crate) fn apply_vault_deposit(state: &mut LedgerState, tx: &ParsedTx) -> App
         Some(d) => d.to_vec(),
         None => return ApplyResult::ClaimedCost("tecINTERNAL"),
     };
-    let outstanding_shares = sle_uint64(&issuance_raw, 4); // sfOutstandingAmount = UInt64, field 4
+    let outstanding_shares = sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT);
 
     let shares_minted: u64 = if assets_total == 0 {
         // First deposit, scale=0: shares = deposit_drops (1:1)
@@ -634,15 +786,15 @@ pub(crate) fn apply_vault_deposit(state: &mut LedgerState, tx: &ParsedTx) -> App
 
     // 6. Mint shares: update OutstandingAmount on issuance
     let new_outstanding = outstanding_shares + shares_minted;
-    let issuance_raw = patch_uint64_field(&issuance_raw, 3, 4, new_outstanding);
+    let issuance_raw = patch_uint64_field(&issuance_raw, 3, SF_OUTSTANDING_AMOUNT, new_outstanding);
     state.insert_raw(issuance_key, issuance_raw);
 
     // 7. Credit depositor's MPToken with shares
     let depositor_token_key = mptoken_key(&issuance_key.0, &tx.account);
     if let Some(token_raw) = state.get_raw(&depositor_token_key) {
         let token_raw = token_raw.to_vec();
-        let current = sle_uint64(&token_raw, 26); // sfMPTAmount = UInt64, field 26
-        let updated = patch_uint64_field(&token_raw, 3, 26, current + shares_minted);
+        let current = sle_uint64(&token_raw, SF_MPT_AMOUNT);
+        let updated = patch_uint64_field(&token_raw, 3, SF_MPT_AMOUNT, current + shares_minted);
         state.insert_raw(depositor_token_key, updated);
     }
 
@@ -688,7 +840,7 @@ pub(crate) fn apply_vault_withdraw(state: &mut LedgerState, tx: &ParsedTx) -> Ap
         Some(d) => d.to_vec(),
         None => return ApplyResult::ClaimedCost("tecINTERNAL"),
     };
-    let outstanding_shares = sle_uint64(&issuance_raw, 4);
+    let outstanding_shares = sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT);
 
     if outstanding_shares == 0 || shares_to_burn > outstanding_shares {
         return ApplyResult::ClaimedCost("tecINSUFFICIENT_FUNDS");
@@ -709,7 +861,7 @@ pub(crate) fn apply_vault_withdraw(state: &mut LedgerState, tx: &ParsedTx) -> Ap
     // 4. Verify withdrawer has enough shares
     let withdrawer_token_key = mptoken_key(&issuance_key.0, &tx.account);
     let withdrawer_shares = match state.get_raw(&withdrawer_token_key) {
-        Some(d) => sle_uint64(&d.to_vec(), 26),
+        Some(d) => sle_uint64(&d.to_vec(), SF_MPT_AMOUNT),
         None => return ApplyResult::ClaimedCost("tecINSUFFICIENT_FUNDS"),
     };
     if withdrawer_shares < shares_to_burn {
@@ -737,76 +889,368 @@ pub(crate) fn apply_vault_withdraw(state: &mut LedgerState, tx: &ParsedTx) -> Ap
 
     // 7. Burn shares: reduce OutstandingAmount and depositor's MPToken balance
     let new_outstanding = outstanding_shares - shares_to_burn;
-    let issuance_raw = patch_uint64_field(&issuance_raw, 3, 4, new_outstanding);
+    let issuance_raw = patch_uint64_field(&issuance_raw, 3, SF_OUTSTANDING_AMOUNT, new_outstanding);
     state.insert_raw(issuance_key, issuance_raw);
 
     let token_raw = state.get_raw(&withdrawer_token_key).unwrap().to_vec();
-    let current_shares = sle_uint64(&token_raw, 26);
-    let updated = patch_uint64_field(&token_raw, 3, 26, current_shares - shares_to_burn);
+    let current_shares = sle_uint64(&token_raw, SF_MPT_AMOUNT);
+    let updated = patch_uint64_field(
+        &token_raw,
+        3,
+        SF_MPT_AMOUNT,
+        current_shares - shares_to_burn,
+    );
     state.insert_raw(withdrawer_token_key, updated);
 
     ApplyResult::Success
 }
 
-/// Type 66: VaultSet — modify vault parameters.
+/// Type 66: VaultSet — modify mutable vault parameters.
 ///
-/// Can update: withdrawal policy, flags, data payload.
-/// The vault owner can change operational parameters without
-/// destroying and recreating the vault.
-///
-/// (rippled: VaultSet.cpp — doApply)
+/// Mirrors rippled's VaultSet.cpp: update sfData and sfAssetsMaximum on the
+/// Vault SLE, and update/clear sfDomainID on the share issuance for private
+/// vaults.
 pub(crate) fn apply_vault_set(
-    _state: &mut LedgerState,
+    state: &mut LedgerState,
     tx: &ParsedTx,
     ctx: &TxContext,
 ) -> ApplyResult {
-    // 1. Find the vault — need owner + sequence to compute key
-    let owner = tx.account;
-    let _vault_seq = tx.sequence.saturating_sub(1); // vault was created at a prior sequence
-                                                    // Try to find vault from tx destination (VaultID passed as destination)
-                                                    // Simplified: use tx.destination_account as the vault pseudo-account
-                                                    // and look it up. In practice, VaultSet passes the VaultID.
-                                                    // Return `Success` and let metadata apply the field changes.
-                                                    // The fee and sequence are already consumed, and the amendment gate
-                                                    // ensures this only runs when SingleAssetVault is active.
-    tracing::debug!("VaultSet: applying for account {:?}", hex::encode(owner));
+    if ctx.validated_result.is_some() {
+        return bridge_metadata_only_tx(ctx, 66, "VaultSet", "tecINCOMPLETE");
+    }
 
-    // VaultSet primarily modifies flags on the Vault SLE.
-    // The actual field patching is handled by metadata application in follower mode.
-    // In validator mode, the flags from tx.flags would be applied to the vault SLE.
-    // Since vault SLE lookup by VaultID requires additional parsing of the tx blob
-    // (`sfVaultID` field). Full implementation is deferred until the amendment activates.
-    bridge_metadata_only_tx(ctx, 66, "VaultSet", "temUNKNOWN")
+    let vault_key = match tx.vault_id {
+        Some(id) => Key(id),
+        None => return ApplyResult::ClaimedCost("temMALFORMED"),
+    };
+    if vault_key.0 == [0u8; 32] {
+        return ApplyResult::ClaimedCost("temMALFORMED");
+    }
+    if let Some(data) = tx.did_data.as_deref() {
+        if data.is_empty() || data.len() > MAX_DATA_PAYLOAD_LENGTH {
+            return ApplyResult::ClaimedCost("temMALFORMED");
+        }
+    }
+    if tx.domain_id.is_none() && tx.maximum_amount.is_none() && tx.did_data.is_none() {
+        return ApplyResult::ClaimedCost("temMALFORMED");
+    }
+
+    let vault_raw = match state.get_raw(&vault_key) {
+        Some(raw) => raw.to_vec(),
+        None => return ApplyResult::ClaimedCost("tecNO_ENTRY"),
+    };
+    let owner = match vault_sle_owner(&vault_raw) {
+        Some(owner) => owner,
+        None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+    };
+    if owner != tx.account {
+        return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+    }
+
+    let share_mptid = match vault_sle_share_mptid(&vault_raw) {
+        Some(id) => id,
+        None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+    };
+    let issuance_key = mpt_issuance_key(&share_mptid);
+    let issuance_raw = match state.get_raw(&issuance_key) {
+        Some(raw) => raw.to_vec(),
+        None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+    };
+
+    if let Some(domain_id) = tx.domain_id {
+        let vault_flags = sle_uint32(&vault_raw, 2);
+        if (vault_flags & LSF_VAULT_PRIVATE) == 0 {
+            return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+        }
+        if domain_id != [0u8; 32] && state.get_raw(&Key(domain_id)).is_none() {
+            return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND");
+        }
+        let issuance_flags = sle_uint32(&issuance_raw, 2);
+        if (issuance_flags & LSF_MPT_REQUIRE_AUTH) == 0 {
+            return ApplyResult::ClaimedCost("tecINTERNAL");
+        }
+    }
+
+    let mut next_vault = vault_raw;
+    if let Some(data) = tx.did_data.as_deref() {
+        next_vault = patch_blob_field(&next_vault, 27, data);
+    }
+    if let Some(maximum) = tx.maximum_amount {
+        let maximum = maximum as i64;
+        let assets_total = vault_sle_number(&next_vault, 4);
+        if maximum != 0 && maximum < assets_total {
+            return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED");
+        }
+        next_vault = patch_number_field(&next_vault, 3, maximum);
+    }
+
+    if let Some(domain_id) = tx.domain_id {
+        let next_issuance = if domain_id == [0u8; 32] {
+            remove_sle_field(&issuance_raw, 5, 34)
+        } else {
+            patch_hash256_field(&issuance_raw, 34, domain_id)
+        };
+        state.insert_raw(issuance_key, next_issuance);
+    }
+
+    state.insert_raw(vault_key, next_vault);
+    ApplyResult::Success
 }
 
-/// Type 70: VaultClawback — issuer recovers assets from the vault.
+/// Type 70: VaultClawback — issuer recovers assets from the vault, or the
+/// vault owner burns stale share tokens when the vault has no assets.
 ///
-/// The asset issuer can claw back deposited assets from the vault,
-/// reducing the vault's total and available assets and burning
-/// corresponding shares.
-///
-/// (rippled: VaultClawback.cpp — doApply)
+/// Mirrors rippled's two successful paths: the owner may burn stale share
+/// MPTokens once the vault has no assets, and a clawback-enabled IOU/MPT issuer
+/// may recover vault assets by destroying the holder's proportional shares.
 pub(crate) fn apply_vault_clawback(
-    _state: &mut LedgerState,
+    state: &mut LedgerState,
     tx: &ParsedTx,
-    ctx: &TxContext,
+    _ctx: &TxContext,
 ) -> ApplyResult {
-    // VaultClawback requires:
-    // 1. Caller is the issuer of the vault's asset
-    // 2. Clawback amount from the vault's pool
-    // 3. Burn proportional shares
-    // 4. Transfer clawed-back assets to the issuer
+    let vault_key = match tx.vault_id {
+        Some(id) if id != [0u8; 32] => Key(id),
+        _ => return ApplyResult::ClaimedCost("temMALFORMED"),
+    };
+    let holder = match tx.holder {
+        Some(holder) if holder != [0u8; 20] => holder,
+        _ => return ApplyResult::ClaimedCost("temMALFORMED"),
+    };
+    if matches!(tx.amount.as_ref(), Some(Amount::Xrp(_))) {
+        return ApplyResult::ClaimedCost("temMALFORMED");
+    }
 
-    // The amendment gate ensures this only runs when SingleAssetVault is active.
-    // Metadata/diff sync handles the actual state changes in follower mode.
-    // Validator mode requires the full `VaultID -> vault SLE -> asset` lookup chain.
-    // Because the amendment is not active on mainnet, this path returns `Success` and
-    // the amendment gate will block it until the amendment passes.
-    tracing::debug!(
-        "VaultClawback: applying for account {:?}",
-        hex::encode(tx.account)
-    );
-    bridge_metadata_only_tx(ctx, 70, "VaultClawback", "temUNKNOWN")
+    let vault_raw = match state.get_raw(&vault_key) {
+        Some(raw) => raw.to_vec(),
+        None => return ApplyResult::ClaimedCost("tecNO_ENTRY"),
+    };
+    let owner = match vault_sle_owner(&vault_raw) {
+        Some(owner) => owner,
+        None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+    };
+    let vault_asset = vault_sle_asset(&vault_raw).unwrap_or(Issue::Xrp);
+    let share_mptid = match vault_sle_share_mptid(&vault_raw) {
+        Some(id) => id,
+        None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+    };
+    let share_issue = Issue::Mpt(share_mptid);
+
+    let claw_issue = match tx.amount.as_ref() {
+        Some(amount) => match issue_from_amount(amount) {
+            Some(issue) => issue,
+            None => return ApplyResult::ClaimedCost("temBAD_AMOUNT"),
+        },
+        None if tx.account == owner => share_issue.clone(),
+        None => vault_asset.clone(),
+    };
+
+    if claw_issue == share_issue {
+        if tx.account != owner {
+            return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+        }
+
+        let assets_total = vault_sle_number(&vault_raw, 4);
+        let assets_available = vault_sle_number(&vault_raw, 2);
+        let issuance_key = mpt_issuance_key(&share_mptid);
+        let issuance_raw = match state.get_raw(&issuance_key) {
+            Some(raw) => raw.to_vec(),
+            None => return ApplyResult::ClaimedCost("tefINTERNAL"),
+        };
+        let outstanding = sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT);
+        if outstanding == 0 || assets_total != 0 || assets_available != 0 {
+            return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+        }
+
+        let holder_token_key = mptoken_key(&issuance_key.0, &holder);
+        let holder_token_raw = match state.get_raw(&holder_token_key) {
+            Some(raw) => raw.to_vec(),
+            None => return ApplyResult::ClaimedCost("tecPRECISION_LOSS"),
+        };
+        let holder_shares = sle_uint64(&holder_token_raw, SF_MPT_AMOUNT);
+        if holder_shares == 0 {
+            return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+        }
+        if let Some(amount) = tx.amount.as_ref() {
+            let Some((requested, requested_mptid)) = amount.mpt_parts() else {
+                return ApplyResult::ClaimedCost("tecWRONG_ASSET");
+            };
+            if requested_mptid != share_mptid {
+                return ApplyResult::ClaimedCost("tecWRONG_ASSET");
+            }
+            if requested != 0 && requested != holder_shares {
+                return ApplyResult::ClaimedCost("tecLIMIT_EXCEEDED");
+            }
+        }
+        if outstanding < holder_shares {
+            return ApplyResult::ClaimedCost("tecINTERNAL");
+        }
+
+        let issuance_raw = patch_uint64_field(
+            &issuance_raw,
+            3,
+            SF_OUTSTANDING_AMOUNT,
+            outstanding - holder_shares,
+        );
+        state.insert_raw(issuance_key, issuance_raw);
+
+        let holder_token_raw = patch_uint64_field(&holder_token_raw, 3, SF_MPT_AMOUNT, 0);
+        if holder != owner {
+            directory::dir_remove(state, &holder, &holder_token_key.0);
+            state.remove_raw(&holder_token_key);
+        } else {
+            state.insert_raw(holder_token_key, holder_token_raw);
+        }
+
+        return ApplyResult::Success;
+    }
+
+    if claw_issue == vault_asset {
+        if matches!(vault_asset, Issue::Xrp) {
+            return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+        }
+
+        let asset_issuer = match vault_asset {
+            Issue::Iou { issuer, .. } => issuer,
+            Issue::Mpt(mptid) => mptoken::mpt_issuer(&mptid),
+            Issue::Xrp => unreachable!("XRP handled above"),
+        };
+        if tx.account != asset_issuer || tx.account == holder {
+            return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+        }
+        match vault_asset {
+            Issue::Iou { .. } => {
+                let Some(issuer_account) = state.get_account(&tx.account) else {
+                    return ApplyResult::ClaimedCost("tefINTERNAL");
+                };
+                if (issuer_account.flags & crate::ledger::account::LSF_ALLOW_TRUST_LINE_CLAWBACK)
+                    == 0
+                    || (issuer_account.flags & crate::ledger::account::LSF_NO_FREEZE) != 0
+                {
+                    return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+                }
+            }
+            Issue::Mpt(mptid) => {
+                let issuance_key = mptoken::mpt_issuance_key(&mptid);
+                let Some(issuance_raw) = state.get_raw(&issuance_key) else {
+                    return ApplyResult::ClaimedCost("tecOBJECT_NOT_FOUND");
+                };
+                if mptoken::sle_flags(issuance_raw)
+                    & crate::ledger::tx::mptoken::LSF_MPT_CAN_CLAWBACK
+                    == 0
+                {
+                    return ApplyResult::ClaimedCost("tecNO_PERMISSION");
+                }
+            }
+            Issue::Xrp => unreachable!("XRP handled above"),
+        }
+
+        let pseudo_id = match vault_sle_pseudo_id(&vault_raw) {
+            Some(id) => id,
+            None => return ApplyResult::ClaimedCost("tecINTERNAL"),
+        };
+        let issuance_key = mpt_issuance_key(&share_mptid);
+        let issuance_raw = match state.get_raw(&issuance_key) {
+            Some(raw) => raw.to_vec(),
+            None => return ApplyResult::ClaimedCost("tefINTERNAL"),
+        };
+        let outstanding = sle_uint64(&issuance_raw, SF_OUTSTANDING_AMOUNT);
+        let holder_token_key = mptoken_key(&issuance_key.0, &holder);
+        let holder_token_raw = match state.get_raw(&holder_token_key) {
+            Some(raw) => raw.to_vec(),
+            None => return ApplyResult::ClaimedCost("tecPRECISION_LOSS"),
+        };
+        let holder_shares = sle_uint64(&holder_token_raw, SF_MPT_AMOUNT);
+        if holder_shares == 0 || outstanding == 0 {
+            return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+        }
+
+        let assets_total = vault_sle_number(&vault_raw, 4).max(0) as u64;
+        let assets_available = vault_sle_number(&vault_raw, 2).max(0) as u64;
+        if assets_total == 0 || assets_available == 0 {
+            return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+        }
+
+        let requested_assets = match tx.amount.as_ref() {
+            Some(Amount::Iou { value, .. }) if !value.is_zero() => {
+                let Some(units) = amount_units(tx.amount.as_ref().expect("amount checked")) else {
+                    return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+                };
+                if units == 0 {
+                    return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+                }
+                units
+            }
+            Some(amount) => amount_units(amount).unwrap_or(0),
+            None => 0,
+        };
+        let mut assets_recovered = if requested_assets == 0 {
+            ((holder_shares as u128 * assets_total as u128) / outstanding as u128) as u64
+        } else {
+            requested_assets
+        };
+        assets_recovered = assets_recovered.min(assets_available);
+        if assets_recovered == 0 {
+            return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+        }
+
+        let mut shares_destroyed =
+            ((assets_recovered as u128 * outstanding as u128) / assets_total as u128) as u64;
+        shares_destroyed = shares_destroyed.min(holder_shares);
+        if shares_destroyed == 0 {
+            return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+        }
+        let assets_recovered =
+            ((shares_destroyed as u128 * assets_total as u128) / outstanding as u128) as u64;
+        if assets_recovered == 0 || assets_recovered > assets_available {
+            return ApplyResult::ClaimedCost("tecPRECISION_LOSS");
+        }
+
+        let Some(asset_amount) = amount_from_issue(&vault_asset, assets_recovered) else {
+            return ApplyResult::ClaimedCost("tecINTERNAL");
+        };
+        if !asset_flow::apply_amount_delta(state, &pseudo_id, AssetDelta::Debit, &asset_amount) {
+            return ApplyResult::ClaimedCost("tecINSUFFICIENT_FUNDS");
+        }
+        if matches!(vault_asset, Issue::Mpt(_))
+            && !asset_flow::apply_amount_delta(
+                state,
+                &tx.account,
+                AssetDelta::Credit,
+                &asset_amount,
+            )
+        {
+            return ApplyResult::ClaimedCost("tecINTERNAL");
+        }
+
+        let vault_raw = patch_number_field(&vault_raw, 4, (assets_total - assets_recovered) as i64);
+        let vault_raw =
+            patch_number_field(&vault_raw, 2, (assets_available - assets_recovered) as i64);
+        state.insert_raw(vault_key, vault_raw);
+
+        let issuance_raw = patch_uint64_field(
+            &issuance_raw,
+            3,
+            SF_OUTSTANDING_AMOUNT,
+            outstanding - shares_destroyed,
+        );
+        state.insert_raw(issuance_key, issuance_raw);
+        let holder_token_raw = patch_uint64_field(
+            &holder_token_raw,
+            3,
+            SF_MPT_AMOUNT,
+            holder_shares - shares_destroyed,
+        );
+        if holder != owner && holder_shares == shares_destroyed {
+            directory::dir_remove(state, &holder, &holder_token_key.0);
+            state.remove_raw(&holder_token_key);
+        } else {
+            state.insert_raw(holder_token_key, holder_token_raw);
+        }
+
+        return ApplyResult::Success;
+    }
+
+    ApplyResult::ClaimedCost("tecWRONG_ASSET")
 }
 
 #[cfg(test)]
@@ -819,7 +1263,7 @@ mod tests {
         let pseudo = [2u8; 20];
         let mptid = [3u8; 24];
 
-        let raw = build_vault_sle(&owner, &pseudo, 42, &mptid, 7, 0);
+        let raw = build_vault_sle(&owner, &pseudo, 42, &mptid, 7, 0, &Issue::Xrp, 0, None);
 
         // Verify parse_sle can read the SLE
         let parsed = crate::ledger::meta::parse_sle(&raw);

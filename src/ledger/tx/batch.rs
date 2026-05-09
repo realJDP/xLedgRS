@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Batch transaction engine logic for ledger replay.
 //! Batch transaction (type 71) — execute multiple inner transactions.
 //!
 //! The Batch amendment is NOT active on mainnet (Supported::no in rippled).
@@ -23,5 +22,5 @@ use super::{bridge_metadata_only_tx, ApplyResult, TxContext};
 /// This handler is replay-only. Validator-mode or local apply rejects it unless
 /// authoritative validated metadata is present.
 pub(crate) fn apply_batch(ctx: &TxContext) -> ApplyResult {
-    bridge_metadata_only_tx(ctx, 71, "Batch", "temUNKNOWN")
+    bridge_metadata_only_tx(ctx, 71, "Batch", "tecINCOMPLETE")
 }

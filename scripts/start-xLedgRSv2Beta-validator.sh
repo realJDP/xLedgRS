@@ -1,5 +1,4 @@
 #!/bin/bash
-# xLedgRS purpose: Start a validator node with validator config defaults.
 set -euo pipefail
 
 CONFIG_FILE="$HOME/xLedgRSv2Beta-validator.cfg"
@@ -46,6 +45,9 @@ fi
 
 [ -f "$LOG_FILE" ] && mv "$LOG_FILE" "$LOG_FILE.prev" && echo "Log rotated"
 
+MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}" \
+MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}" \
+XLEDGRSV2BETA_MALLOC_TRIM="${XLEDGRSV2BETA_MALLOC_TRIM:-1}" \
 RUST_LOG="${RUST_LOG:-info}" nohup "$BINARY" \
     --config "$CONFIG_FILE" \
     >> "$LOG_FILE" 2>&1 &

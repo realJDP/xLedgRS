@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Round support for XRPL consensus and validation.
 //! A single consensus round — tracks proposals, converges positions, counts validations.
 //!
 //! # Convergence thresholds (relative timing — matches rippled)
@@ -29,7 +28,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::consensus::{DisputedTx, Manifest, ManifestCache, Proposal, Validation};
+use crate::consensus::{
+    validation_quorum_count, ConsensusTxSet, DisputedTx, Manifest, ManifestCache,
+    PreferredLedgerTracker, Proposal, TxSetDiff, ValidatedLedgerDecision, Validation,
+};
 
 // ── Timing constants (match rippled ConsensusParms.h) ─────────────────────────
 
@@ -174,6 +176,28 @@ impl RoundResult {
     }
 }
 
+/// Prevalidated trust state supplied by node-wide validator-list/manifest code.
+#[derive(Debug, Clone, Default)]
+pub struct RoundTrustSnapshot {
+    pub effective_unl: Vec<Vec<u8>>,
+    pub prevalidated_manifests: Vec<Manifest>,
+    pub original_unl_size: Option<usize>,
+}
+
+impl RoundTrustSnapshot {
+    pub fn new(
+        effective_unl: Vec<Vec<u8>>,
+        prevalidated_manifests: Vec<Manifest>,
+        original_unl_size: Option<usize>,
+    ) -> Self {
+        Self {
+            effective_unl,
+            prevalidated_manifests,
+            original_unl_size,
+        }
+    }
+}
+
 // ── Round ─────────────────────────────────────────────────────────────────────
 
 /// Tracks all state for one consensus round.
@@ -185,16 +209,20 @@ pub struct ConsensusRound {
     pub our_position: Option<[u8; 32]>,
     /// Parent ledger hash for the round.
     pub prev_ledger: [u8; 32],
-    /// Latest proposal from each UNL peer (keyed by node pubkey hex).
+    /// Latest proposal from each UNL peer (keyed by resolved validator master key hex).
     proposals: HashMap<String, Proposal>,
-    /// Validations received, keyed by node pubkey hex.
+    /// Trusted validations observed, keyed by resolved validator master key hex.
     validations: HashMap<String, Validation>,
+    /// Quorum-derived validated ledger decisions.
+    preferred_ledgers: PreferredLedgerTracker,
     /// Per-transaction disputes — tx_id → DisputedTx.
     disputes: HashMap<[u8; 32], DisputedTx>,
     /// Peers that have bowed out of this round.
     dead_nodes: std::collections::HashSet<String>,
     /// Set of trusted master public keys in the UNL.
     unl: Vec<Vec<u8>>,
+    /// Original UNL size, when known, for rippled-style quorum floor.
+    original_unl_size: Option<usize>,
     /// Manifest cache — maps ephemeral signing keys back to master keys.
     manifests: ManifestCache,
     /// When the Establish phase started.
@@ -240,8 +268,10 @@ impl ConsensusRound {
             prev_ledger,
             proposals: HashMap::new(),
             validations: HashMap::new(),
+            preferred_ledgers: PreferredLedgerTracker::new(),
             disputes: HashMap::new(),
             dead_nodes: std::collections::HashSet::new(),
+            original_unl_size: Some(unl.len()),
             unl,
             manifests: ManifestCache::new(),
             establish_start: None,
@@ -256,6 +286,34 @@ impl ConsensusRound {
         }
     }
 
+    pub fn new_with_trust_snapshot(
+        ledger_seq: u32,
+        trust: RoundTrustSnapshot,
+        prev_ledger: [u8; 32],
+        proposing: bool,
+        prev_round_time: Duration,
+        prev_proposers: usize,
+    ) -> Self {
+        let mut round = Self::new(
+            ledger_seq,
+            trust.effective_unl.clone(),
+            prev_ledger,
+            proposing,
+            prev_round_time,
+            prev_proposers,
+        );
+        round.apply_trust_snapshot(trust);
+        round
+    }
+
+    /// Replace the round's trust view with node-wide validator-list and
+    /// already-verified manifest state.
+    pub fn apply_trust_snapshot(&mut self, trust: RoundTrustSnapshot) {
+        self.unl = trust.effective_unl;
+        self.original_unl_size = trust.original_unl_size.or(Some(self.unl.len()));
+        self.add_prevalidated_manifests(trust.prevalidated_manifests);
+    }
+
     /// Register a validator manifest (master → ephemeral delegation).
     ///
     /// Once registered, proposals/validations signed by the ephemeral key
@@ -268,6 +326,24 @@ impl ConsensusRound {
     /// node-wide manifest cache.
     pub fn add_prevalidated_manifest(&mut self, manifest: Manifest) -> bool {
         self.manifests.add_prevalidated(manifest)
+    }
+
+    pub fn add_prevalidated_manifests<I>(&mut self, manifests: I) -> usize
+    where
+        I: IntoIterator<Item = Manifest>,
+    {
+        let mut accepted = 0;
+        for manifest in manifests {
+            if self.add_prevalidated_manifest(manifest) {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
+    /// Set the original UNL size used by the 60% quorum floor.
+    pub fn set_original_unl_size(&mut self, original_unl_size: usize) {
+        self.original_unl_size = Some(original_unl_size);
     }
 
     pub fn unl_size(&self) -> usize {
@@ -298,16 +374,16 @@ impl ConsensusRound {
     /// Record a proposal from a UNL peer.
     /// Returns `true` if the proposal was from a trusted node with a valid signature.
     pub fn add_proposal(&mut self, prop: Proposal) -> bool {
-        if !self.is_trusted(&prop.node_pubkey) {
+        let Some(master_key) = self.trusted_master_for_signing_key(&prop.node_pubkey) else {
             return false;
-        }
+        };
         if prop.ledger_seq != self.ledger_seq {
             return false;
         }
         if !prop.verify_signature() {
             return false;
         }
-        let key = hex::encode(&prop.node_pubkey);
+        let key = hex::encode(master_key);
         // Only accept if prop_seq is newer
         if let Some(existing) = self.proposals.get(&key) {
             if prop.prop_seq <= existing.prop_seq {
@@ -351,6 +427,28 @@ impl ConsensusRound {
             self.add_dispute(*tx_id, false);
             self.set_dispute_vote(tx_id, peer_id, true);
         }
+    }
+
+    /// Compare immutable candidate sets by tx id and create disputes for any
+    /// membership differences.
+    pub fn create_disputes_from_sets(
+        &mut self,
+        local: &ConsensusTxSet,
+        peer: &ConsensusTxSet,
+        peer_id: &str,
+    ) -> TxSetDiff {
+        let diff = local.diff_by_tx_id(peer);
+
+        for tx_id in &diff.only_self {
+            self.add_dispute(*tx_id, true);
+            self.set_dispute_vote(tx_id, peer_id, false);
+        }
+        for tx_id in &diff.only_other {
+            self.add_dispute(*tx_id, false);
+            self.set_dispute_vote(tx_id, peer_id, true);
+        }
+
+        diff
     }
 
     /// Elapsed establish time as a percentage of previous round duration,
@@ -414,6 +512,19 @@ impl ConsensusRound {
         if elapsed < MIN_CONSENSUS {
             self.consensus_state = ConsensusState::No;
             return ConsensusState::No;
+        }
+
+        if self.unl.is_empty() {
+            let abandon_timeout = {
+                let raw = self.prev_round_time.saturating_mul(ABANDON_FACTOR);
+                raw.max(ABANDON_FLOOR).min(ABANDON_CEILING)
+            };
+            self.consensus_state = if elapsed > abandon_timeout {
+                ConsensusState::Expired
+            } else {
+                ConsensusState::No
+            };
+            return self.consensus_state;
         }
 
         let current_proposers = self.proposals.len();
@@ -511,6 +622,9 @@ impl ConsensusRound {
         if self.phase != ConsensusPhase::Establish {
             return None;
         }
+        if self.consensus_state != ConsensusState::Yes {
+            return None;
+        }
         let tx_set_hash = self.our_position?;
         let agree_count = self
             .proposals
@@ -538,10 +652,11 @@ impl ConsensusRound {
     /// later sequences (for `MovedOn` detection).
     /// Returns `true` if it was from a trusted node with a valid signature.
     pub fn add_validation(&mut self, val: Validation) -> bool {
-        if !self.validation_is_trusted(&val) {
+        let Some(master_key) = self.trusted_master_for_validation(&val, true) else {
             return false;
-        }
-        let key = hex::encode(&val.node_pubkey);
+        };
+        let key = hex::encode(&master_key);
+        self.observe_validated_ledger_candidate(&master_key, &val);
         self.validations.insert(key, val);
         true
     }
@@ -549,24 +664,37 @@ impl ConsensusRound {
     /// Check whether a validation is from a trusted node and has a valid
     /// signature, without mutating round state.
     pub fn validation_is_trusted(&self, val: &Validation) -> bool {
-        if !self.is_trusted(&val.node_pubkey) {
-            return false;
-        }
-        if val.ledger_seq < self.ledger_seq {
-            return false;
-        }
-        val.verify_signature()
+        self.trusted_master_for_validation(val, true).is_some()
     }
 
     /// Insert a validation whose signature has already been verified.
     pub fn add_prevalidated_validation(&mut self, val: Validation) -> bool {
-        if !self.is_trusted(&val.node_pubkey) {
+        let Some(master_key) = self.trusted_master_for_validation(&val, false) else {
             return false;
-        }
+        };
+        self.add_prevalidated_validation_from_master(val, master_key)
+    }
+
+    /// Insert a preverified validation using node-wide manifest trust resolution.
+    ///
+    /// This is the parent integration hook for code that has already resolved
+    /// `val.node_pubkey` through the shared manifest cache. The round still
+    /// checks the resolved master against its effective UNL and local revocation
+    /// state before recording the observation.
+    pub fn add_prevalidated_validation_from_master(
+        &mut self,
+        val: Validation,
+        master_key: Vec<u8>,
+    ) -> bool {
         if val.ledger_seq < self.ledger_seq {
             return false;
         }
-        let key = hex::encode(&val.node_pubkey);
+        if self.manifests.is_revoked(&master_key) || !self.unl.iter().any(|key| key == &master_key)
+        {
+            return false;
+        }
+        let key = hex::encode(&master_key);
+        self.observe_validated_ledger_candidate(&master_key, &val);
         self.validations.insert(key, val);
         true
     }
@@ -580,12 +708,9 @@ impl ConsensusRound {
         counts
     }
 
-    /// The validation quorum count (80% of UNL size, rounded up).
+    /// The validation quorum count.
     pub fn quorum(&self) -> u32 {
-        if self.unl.is_empty() {
-            return 0;
-        }
-        (self.unl.len() as f64 * VALIDATION_QUORUM).ceil() as u32
+        validation_quorum_count(self.unl.len(), self.original_unl_size) as u32
     }
 
     /// Check whether any ledger hash has reached the 80% validation quorum.
@@ -594,11 +719,37 @@ impl ConsensusRound {
         if self.unl.is_empty() {
             return None;
         }
-        let quorum = (self.unl.len() as f64 * VALIDATION_QUORUM).ceil() as usize;
-        let counts = self.validation_counts();
-        let (&hash, &_count) = counts.iter().find(|(_, &c)| c >= quorum)?;
+        let hash = self.preferred_ledgers.preferred_head()?.ledger_hash;
         self.phase = ConsensusPhase::Validated;
         Some(hash)
+    }
+
+    /// Check whether any full-validation hash for the specified ledger sequence reached quorum.
+    pub fn check_validated_for(&mut self, ledger_seq: u32) -> Option<[u8; 32]> {
+        if self.unl.is_empty() {
+            return None;
+        }
+        let hash = self
+            .preferred_ledgers
+            .validated_for(ledger_seq)?
+            .ledger_hash;
+        self.phase = ConsensusPhase::Validated;
+        Some(hash)
+    }
+
+    /// Check whether an exact ledger sequence and hash reached full-validation quorum.
+    pub fn check_validated_for_hash(
+        &mut self,
+        ledger_seq: u32,
+        ledger_hash: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        if self.unl.is_empty() {
+            return None;
+        }
+        self.preferred_ledgers
+            .validated_for_hash(ledger_seq, ledger_hash)?;
+        self.phase = ConsensusPhase::Validated;
+        Some(*ledger_hash)
     }
 
     /// Number of validations received for a specific ledger hash.
@@ -607,6 +758,15 @@ impl ConsensusRound {
             .values()
             .filter(|v| &v.ledger_hash == ledger_hash)
             .count()
+    }
+
+    pub fn full_validation_count_for(&self, ledger_seq: u32, ledger_hash: &[u8; 32]) -> usize {
+        self.preferred_ledgers
+            .full_count_for(ledger_seq, ledger_hash)
+    }
+
+    pub fn preferred_validated_ledger(&self) -> Option<ValidatedLedgerDecision> {
+        self.preferred_ledgers.preferred_head()
     }
 
     // ── Dispute resolution ─────────────────────────────────────────────────
@@ -755,22 +915,44 @@ impl ConsensusRound {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Check whether `signing_key` is trusted.
-    ///
-    /// If a manifest maps `signing_key` → `master_key`, check `master_key`
-    /// against the UNL.  If no manifest exists, `signing_key` is treated as
-    /// its own master key (single-key mode, backward-compatible).
-    fn is_trusted(&self, signing_key: &[u8]) -> bool {
-        // Resolve through manifest if available.
+    /// Resolve a signing key through manifests and return its trusted master key.
+    pub fn trusted_master_for_signing_key(&self, signing_key: &[u8]) -> Option<Vec<u8>> {
         let master = self
             .manifests
             .signing_key_to_master(signing_key)
             .unwrap_or(signing_key);
-        // Revoked master keys are never trusted.
         if self.manifests.is_revoked(master) {
-            return false;
+            return None;
         }
-        self.unl.iter().any(|k| k == master)
+        self.unl
+            .iter()
+            .find(|key| key.as_slice() == master)
+            .cloned()
+    }
+
+    fn trusted_master_for_validation(
+        &self,
+        val: &Validation,
+        verify_signature: bool,
+    ) -> Option<Vec<u8>> {
+        if val.ledger_seq < self.ledger_seq {
+            return None;
+        }
+        if verify_signature && !val.verify_signature() {
+            return None;
+        }
+        self.trusted_master_for_signing_key(&val.node_pubkey)
+    }
+
+    fn observe_validated_ledger_candidate(&mut self, master_key: &[u8], val: &Validation) {
+        let quorum = self.quorum() as usize;
+        self.preferred_ledgers.observe_trusted_validation(
+            master_key.to_vec(),
+            val.ledger_seq,
+            val.ledger_hash,
+            val.is_full(),
+            quorum,
+        );
     }
 }
 
@@ -858,6 +1040,18 @@ mod tests {
     }
 
     #[test]
+    fn test_prevalidated_validation_can_use_resolved_nodewide_master() {
+        let masters = make_validators(3);
+        let ephemeral = Secp256k1KeyPair::generate();
+        let mut r = new_round(1, unl_from(&masters), [0u8; 32], true);
+        let val = make_validation(&ephemeral, tx_hash(7));
+
+        assert!(!r.add_prevalidated_validation(val.clone()));
+        assert!(r.add_prevalidated_validation_from_master(val, masters[0].public_key_bytes()));
+        assert_eq!(r.validation_count_for(&tx_hash(7)), 1);
+    }
+
+    #[test]
     fn test_invalid_signature_rejected() {
         let validators = make_validators(3);
         let mut r = new_round(1, unl_from(&validators), [0u8; 32], true);
@@ -915,6 +1109,7 @@ mod tests {
         for v in &validators[..4] {
             r.add_proposal(make_proposal(v, tx_hash(1), 0));
         }
+        r.consensus_state = ConsensusState::Yes;
         let result = r.accept().expect("should produce result");
         assert_eq!(result.tx_set_hash, tx_hash(1));
         assert_eq!(result.agree_count, 4);
@@ -944,6 +1139,54 @@ mod tests {
         }
         let hash = r.check_validated().expect("quorum should be met");
         assert_eq!(hash, tx_hash(42));
+        assert_eq!(r.phase, ConsensusPhase::Validated);
+    }
+
+    #[test]
+    fn test_round_quorum_uses_original_unl_floor() {
+        let validators = make_validators(5);
+        let mut r = new_round(1, unl_from(&validators), [0u8; 32], true);
+        r.set_original_unl_size(10);
+
+        assert_eq!(r.quorum(), 6);
+        for v in &validators {
+            r.add_validation(make_validation(v, tx_hash(42)));
+        }
+        assert_eq!(r.full_validation_count_for(1, &tx_hash(42)), 5);
+        assert!(
+            r.check_validated_for_hash(1, &tx_hash(42)).is_none(),
+            "5 effective validations must not beat the original-UNL 60% floor"
+        );
+    }
+
+    #[test]
+    fn test_single_validation_does_not_advance_validated_head() {
+        let validators = make_validators(5);
+        let mut r = new_round(1, unl_from(&validators), [0u8; 32], true);
+
+        assert!(r.add_validation(make_validation(&validators[0], tx_hash(7))));
+        assert_eq!(r.validation_count_for(&tx_hash(7)), 1);
+        assert_eq!(r.preferred_validated_ledger(), None);
+        assert!(r.check_validated_for_hash(1, &tx_hash(7)).is_none());
+        assert_ne!(r.phase, ConsensusPhase::Validated);
+    }
+
+    #[test]
+    fn test_check_validated_for_finds_quorum_by_sequence_before_hash_compare() {
+        let validators = make_validators(10);
+        let mut r = new_round(7, unl_from(&validators), [0u8; 32], true);
+        let different_local_hash = tx_hash(99);
+        let network_hash = tx_hash(42);
+
+        for v in &validators[..8] {
+            r.add_validation(Validation::new_signed(7, network_hash, 0, true, v));
+        }
+        for v in &validators[8..] {
+            r.add_validation(Validation::new_signed(8, different_local_hash, 0, true, v));
+        }
+
+        assert_eq!(r.check_validated_for(7), Some(network_hash));
+        assert_ne!(network_hash, different_local_hash);
         assert_eq!(r.phase, ConsensusPhase::Validated);
     }
 
@@ -1034,6 +1277,48 @@ mod tests {
     }
 
     #[test]
+    fn test_trust_snapshot_seeds_manifest_resolution() {
+        let masters = make_validators(3);
+        let ephemeral = Secp256k1KeyPair::generate();
+        let manifest = crate::consensus::Manifest::new_signed(1, &masters[0], &ephemeral);
+        let trust =
+            RoundTrustSnapshot::new(unl_from(&masters), vec![manifest], Some(masters.len()));
+        let mut r = ConsensusRound::new_with_trust_snapshot(
+            1,
+            trust,
+            [0u8; 32],
+            true,
+            TEST_PREV_RT,
+            TEST_PREV_PROP,
+        );
+
+        assert!(r.add_validation(make_validation(&ephemeral, tx_hash(7))));
+        assert_eq!(r.validation_count_for(&tx_hash(7)), 1);
+    }
+
+    #[test]
+    fn test_master_and_ephemeral_validation_count_once() {
+        let masters = make_validators(5);
+        let ephemeral = Secp256k1KeyPair::generate();
+        let mut r = new_round(1, unl_from(&masters), [0u8; 32], true);
+        assert!(r.add_manifest(crate::consensus::Manifest::new_signed(
+            1,
+            &masters[0],
+            &ephemeral,
+        )));
+
+        assert!(r.add_validation(make_validation(&masters[0], tx_hash(8))));
+        assert!(r.add_validation(make_validation(&ephemeral, tx_hash(8))));
+        assert_eq!(
+            r.validation_count_for(&tx_hash(8)),
+            1,
+            "resolved master identity must deduplicate signing/master keys"
+        );
+        assert_eq!(r.full_validation_count_for(1, &tx_hash(8)), 1);
+        assert!(r.check_validated_for_hash(1, &tx_hash(8)).is_none());
+    }
+
+    #[test]
     fn test_revoked_master_key_not_trusted() {
         let masters = make_validators(3);
         let ephemeral = Secp256k1KeyPair::generate();
@@ -1088,6 +1373,7 @@ mod tests {
         }
 
         // Phase 3: accept
+        r.consensus_state = ConsensusState::Yes;
         let result = r.accept().unwrap();
         assert_eq!(result.tx_set_hash, tx_hash(7));
         assert_eq!(result.agree_count, 5);
@@ -1197,6 +1483,17 @@ mod tests {
         let validators = make_validators(5);
         let mut r = new_round(1, unl_from(&validators), [0u8; 32], true);
         r.close_ledger(tx_hash(1));
+        r.establish_start = Some(Instant::now() - Duration::from_secs(50));
+        assert_eq!(r.check_consensus(), ConsensusState::Expired);
+    }
+
+    #[test]
+    fn test_check_consensus_empty_unl_never_self_accepts() {
+        let mut r = new_round(1, Vec::new(), [0u8; 32], true);
+        r.close_ledger(tx_hash(1));
+        r.establish_start = Some(Instant::now() - Duration::from_secs(2));
+        assert_eq!(r.check_consensus(), ConsensusState::No);
+
         r.establish_start = Some(Instant::now() - Duration::from_secs(50));
         assert_eq!(r.check_consensus(), ConsensusState::Expired);
     }

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Close support for XRPL ledger state and SHAMap logic.
 //! Ledger close — drain the transaction pool, apply all transactions,
 //! and produce a new validated ledger.
 //!
@@ -15,7 +14,7 @@ use crate::ledger::history::TxRecord;
 use crate::ledger::pool::TxPool;
 use crate::ledger::sparse_shamap::SparseSHAMap;
 use crate::ledger::ter::ApplyFlags;
-use crate::ledger::tx::{classify_result, run_tx, ApplyOutcome};
+use crate::ledger::tx::{classify_result, run_candidate_tx, run_tx, sequence_proxy, ApplyOutcome};
 use crate::ledger::{LedgerHeader, LedgerState};
 use crate::transaction::parse_blob;
 use tracing::{debug, info, warn};
@@ -86,7 +85,7 @@ fn trace_debug_directory_raw(phase: &str, key: &crate::ledger::Key, raw: &[u8], 
     }
 }
 
-fn encode_tx_leaf_data(tx_blob: &[u8], meta_blob: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_tx_leaf_data(tx_blob: &[u8], meta_blob: &[u8]) -> Vec<u8> {
     let mut data = Vec::with_capacity(tx_blob.len() + meta_blob.len() + 8);
     crate::transaction::serialize::encode_length(tx_blob.len(), &mut data);
     data.extend_from_slice(tx_blob);
@@ -207,6 +206,7 @@ pub(crate) fn build_tx_metadata(
     ledger_seq: u32,
     tx_index: u32,
     result: &str,
+    delivered_amount: Option<&crate::transaction::amount::Amount>,
 ) -> Vec<u8> {
     let mut nodes = Vec::new();
 
@@ -272,7 +272,17 @@ pub(crate) fn build_tx_metadata(
         }
     }
 
-    crate::ledger::meta::encode_metadata(result_code(result), tx_index, &nodes)
+    crate::ledger::meta::encode_metadata(result_code(result), tx_index, &nodes, delivered_amount)
+}
+
+fn payment_delivered_amount_hint<'a>(
+    tx: &'a crate::transaction::parse::ParsedTx,
+    result: &str,
+) -> Option<&'a crate::transaction::amount::Amount> {
+    const TF_PARTIAL_PAYMENT: u32 = 0x0002_0000;
+    (result == "tesSUCCESS" && tx.tx_type == 0 && (tx.flags & TF_PARTIAL_PAYMENT) == 0)
+        .then_some(tx.amount.as_ref())
+        .flatten()
 }
 
 fn hydrate_replay_prestate(state: &mut LedgerState, replay_txs: &[ReplayTx]) {
@@ -571,6 +581,12 @@ impl PartialEq for CanonicalEntry {
 }
 impl Eq for CanonicalEntry {}
 
+fn canonical_order_salt(entries: &[crate::ledger::pool::PoolEntry]) -> [u8; 32] {
+    crate::ledger::pool::canonical_set_hash_from_blobs(
+        entries.iter().map(|entry| entry.blob.as_slice()),
+    )
+}
+
 /// Close the current ledger: drain the pool, apply transactions, build a new header.
 ///
 /// Uses rippled's multi-pass model with `certainRetry` semantics and
@@ -585,6 +601,17 @@ pub fn close_ledger(
     close_time: u64,
     have_close_time_consensus: bool,
 ) -> CloseResult {
+    close_ledger_with_network_id(prev, state, pool, close_time, have_close_time_consensus, 0)
+}
+
+pub fn close_ledger_with_network_id(
+    prev: &LedgerHeader,
+    state: &mut LedgerState,
+    pool: &mut TxPool,
+    close_time: u64,
+    have_close_time_consensus: bool,
+    network_id: u32,
+) -> CloseResult {
     let entries = pool.drain_sorted();
 
     let new_seq = prev.sequence + 1;
@@ -598,19 +625,13 @@ pub fn close_ledger(
     let mut tx_map = SparseSHAMap::new();
 
     // ── Build handler context from parent header ──────────────────────────
-    let tx_ctx = TxContext::from_parent(prev, close_time);
+    let mut tx_ctx = TxContext::from_parent(prev, close_time);
+    tx_ctx.network_id = network_id;
 
     // ── Compute salt for canonical ordering ──────────────────────────────
-    // rippled uses the consensus transaction set hash as the CanonicalTXSet salt.
-    // Derive it from all transaction hashes in the set.
-    let salt: [u8; 32] = {
-        let mut hasher_data = Vec::with_capacity(4 + entries.len() * 32);
-        hasher_data.extend_from_slice(&[0x53, 0x4E, 0x44, 0x00]); // SND\0 prefix
-        for e in &entries {
-            hasher_data.extend_from_slice(&e.hash);
-        }
-        sha512_first_half(&hasher_data)
-    };
+    // rippled salts CanonicalTXSet with the consensus tx-set hash (the
+    // transaction SHAMap root), not an insertion-order digest.
+    let salt = canonical_order_salt(&entries);
 
     // ── Parse and build canonical set ────────────────────────────────────
     let mut txns: Vec<CanonicalEntry> = Vec::with_capacity(entries.len());
@@ -624,7 +645,7 @@ pub fn close_ledger(
         };
         txns.push(CanonicalEntry::new(
             &parsed.account,
-            parsed.sequence,
+            sequence_proxy(&parsed),
             entry.hash,
             entry.blob,
             &salt,
@@ -659,7 +680,7 @@ pub fn close_ledger(
                 }
             };
 
-            let result = run_tx(state, &parsed, &tx_ctx, flags);
+            let result = run_candidate_tx(state, &parsed, &tx_ctx, flags);
 
             match classify_result(&result) {
                 ApplyOutcome::Success => {
@@ -687,6 +708,7 @@ pub fn close_ledger(
                         new_seq,
                         next_tx_index,
                         result_str,
+                        payment_delivered_amount_hint(&parsed, result_str),
                     );
                     let leaf_data = encode_tx_leaf_data(&entry.blob, &meta);
                     let lh = tx_leaf_hash(&leaf_data, &entry.hash);
@@ -1580,6 +1602,7 @@ pub(crate) fn apply_authoritative_validated_tx_metadata_with_created_overrides(
                     pays_issuer: pays_iss,
                     gets_currency: gets_cur,
                     gets_issuer: gets_iss,
+                    domain_id: None,
                 })
                 .0;
             tx_book_dirs.entry(root).or_insert(sides);
@@ -2558,6 +2581,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -2848,6 +2872,81 @@ mod tests {
         let sender = state.get_account(&genesis_id()).unwrap();
         assert_eq!(sender.balance, 100_000_000_000_000_000);
         assert_eq!(sender.sequence, 1);
+    }
+
+    #[test]
+    fn close_candidate_rejects_bad_signature_before_apply() {
+        let (header, mut state) = initial_state();
+        let kp = genesis_kp();
+        let signed = TxBuilder::payment()
+            .account(&kp)
+            .destination("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe")
+            .unwrap()
+            .amount(Amount::Xrp(1_000_000))
+            .fee(12)
+            .sequence(1)
+            .sign(&kp)
+            .unwrap();
+
+        let parsed = parse_blob(&signed.blob).unwrap();
+        let mut blob = signed.blob;
+        let sig_pos = blob
+            .windows(parsed.signature.len())
+            .position(|window| window == parsed.signature.as_slice())
+            .expect("signature bytes should be present in signed blob");
+        blob[sig_pos] ^= 0x01;
+
+        let hash = crate::transaction::serialize::tx_blob_hash(&blob);
+        let parsed = parse_blob(&blob).unwrap();
+        let mut pool = TxPool::new();
+        assert!(pool.insert(hash, blob, &parsed));
+
+        let result = close_ledger(&header, &mut state, &mut pool, 100, true);
+        assert_eq!(result.applied_count, 0);
+        assert!(result.tx_records.is_empty());
+
+        let sender = state.get_account(&genesis_id()).unwrap();
+        assert_eq!(sender.balance, 100_000_000_000_000_000);
+        assert_eq!(sender.sequence, 1);
+    }
+
+    #[test]
+    fn canonical_order_salt_matches_consensus_tx_set_hash() {
+        let tx1 = sign_payment_blob(1, 1_000_000, 12);
+        let tx2 = sign_payment_blob(2, 2_000_000, 12);
+        let pool = pool_with_txs(vec![tx1.clone(), tx2.clone()]);
+        let entries: Vec<_> = pool.entries().cloned().collect();
+
+        let expected = crate::ledger::pool::canonical_set_hash_from_blobs([
+            tx2.0.as_slice(),
+            tx1.0.as_slice(),
+        ]);
+        assert_eq!(canonical_order_salt(&entries), expected);
+    }
+
+    #[test]
+    fn canonical_entry_uses_ticket_sequence_proxy() {
+        let kp = genesis_kp();
+        let signed = TxBuilder::payment()
+            .account(&kp)
+            .destination("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe")
+            .unwrap()
+            .amount(Amount::Xrp(1_000_000))
+            .fee(12)
+            .sequence(0)
+            .ticket_sequence(42)
+            .sign(&kp)
+            .unwrap();
+        let parsed = parse_blob(&signed.blob).unwrap();
+        let entry = CanonicalEntry::new(
+            &parsed.account,
+            sequence_proxy(&parsed),
+            signed.hash,
+            signed.blob,
+            &[0u8; 32],
+        );
+
+        assert_eq!(entry.sequence, 42);
     }
 
     #[test]

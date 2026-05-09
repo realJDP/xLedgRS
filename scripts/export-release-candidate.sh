@@ -1,5 +1,4 @@
 #!/bin/bash
-# xLedgRS purpose: Build a sanitized public release candidate tree.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

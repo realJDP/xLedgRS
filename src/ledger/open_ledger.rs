@@ -1,12 +1,13 @@
-//! xLedgRS purpose: Open Ledger support for XRPL ledger state and SHAMap logic.
 //! Open-ledger queue state and transaction application tracking.
 
 use crate::crypto::sha512_first_half;
 use crate::ledger::ledger_core::ClosedLedger;
 use crate::ledger::open_view::OpenView;
 use crate::ledger::pool::{FeeMetrics, TxPool};
-use crate::ledger::transact::{self, TER};
-use crate::ledger::views::{ApplyFlags, ReadView, TxsRawView};
+use crate::ledger::shamap::SHAMap;
+use crate::ledger::tx::{classify_result, run_candidate_tx, ApplyOutcome, TxContext};
+use crate::ledger::views::{RawView, ReadView, TxsRawView};
+use crate::ledger::{Key, LedgerState};
 use std::sync::Arc;
 
 const OPEN_LEDGER_TOTAL_PASSES: usize = 3;
@@ -382,11 +383,101 @@ impl OpenLedger {
         unique
     }
 
-    fn is_permanent_failure(ter: &TER) -> bool {
-        matches!(ter, TER::Malformed(_) | TER::LocalFail(_))
+    fn ledger_state_from_open_view(base: &ClosedLedger, open: &OpenView) -> LedgerState {
+        let mut materialized = ClosedLedger::new(
+            base.info().clone(),
+            base.clone_state_map(),
+            SHAMap::new_transaction(),
+            base.fees().clone(),
+            base.rules().clone(),
+        );
+        open.apply(&mut materialized);
+
+        let mut state = LedgerState::new();
+        for (key, data) in materialized.clone_state_map().iter_leaves() {
+            state.insert_raw(key, data.to_vec());
+        }
+        for amendment in crate::ledger::read_amendments(&state) {
+            state.enable_amendment(amendment);
+        }
+        state
+    }
+
+    fn seed_account_from_open(state: &mut LedgerState, open: &OpenView, account: &[u8; 20]) {
+        if state.get_account(account).is_some() {
+            return;
+        }
+        let keylet = crate::ledger::keylet::account(account);
+        if let Some(sle) = open.read(&keylet) {
+            state.insert_raw(keylet.key, sle.data().to_vec());
+        }
+    }
+
+    fn seed_amount_issuer_from_open(
+        state: &mut LedgerState,
+        open: &OpenView,
+        amount: &crate::transaction::Amount,
+    ) {
+        match amount {
+            crate::transaction::Amount::Iou { issuer, .. } => {
+                Self::seed_account_from_open(state, open, issuer);
+            }
+            crate::transaction::Amount::Mpt(_) => {}
+            crate::transaction::Amount::Xrp(_) => {}
+        }
+    }
+
+    fn seed_tx_accounts_from_open(
+        state: &mut LedgerState,
+        open: &OpenView,
+        tx: &crate::transaction::ParsedTx,
+    ) {
+        Self::seed_account_from_open(state, open, &tx.account);
+        if let Some(destination) = tx.destination {
+            Self::seed_account_from_open(state, open, &destination);
+        }
+        if let Some(delegate) = tx.delegate {
+            Self::seed_account_from_open(state, open, &delegate);
+        }
+        for amount in [
+            tx.amount.as_ref(),
+            tx.amount2.as_ref(),
+            tx.limit_amount.as_ref(),
+            tx.taker_pays.as_ref(),
+            tx.taker_gets.as_ref(),
+            tx.send_max.as_ref(),
+            tx.deliver_min.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            Self::seed_amount_issuer_from_open(state, open, amount);
+        }
+    }
+
+    fn apply_touched_to_open(
+        open: &mut OpenView,
+        state: &LedgerState,
+        touched: &[(Key, Option<Vec<u8>>)],
+    ) {
+        for (key, before) in touched {
+            match state
+                .get_raw_owned(key)
+                .and_then(|data| crate::ledger::sle::SLE::from_raw(*key, data))
+            {
+                Some(sle) if before.is_none() => {
+                    open.raw_insert(Arc::new(sle));
+                }
+                Some(sle) => {
+                    open.raw_replace(Arc::new(sle));
+                }
+                None => open.raw_erase(key),
+            }
+        }
     }
 
     fn apply_canonical_entries(
+        base: &ClosedLedger,
         open: &mut OpenView,
         mut txns: Vec<CanonicalEntry>,
         applied_transactions: &mut usize,
@@ -402,9 +493,9 @@ impl OpenLedger {
 
         for pass in 0..OPEN_LEDGER_TOTAL_PASSES {
             let flags = if certain_retry {
-                ApplyFlags::RETRY
+                crate::ledger::ter::ApplyFlags::RETRY
             } else {
-                ApplyFlags::NONE
+                crate::ledger::ter::ApplyFlags::NONE
             };
             let mut changes = 0usize;
             let mut kept = Vec::new();
@@ -422,31 +513,53 @@ impl OpenLedger {
                     }
                 };
 
-                let handler = transact::handler_for_type(parsed.tx_type);
-                let result = transact::apply_transaction(
-                    open,
-                    &parsed,
-                    &entry.hash,
-                    handler.as_ref(),
-                    flags,
-                );
-
-                if result.ter.is_success() || result.ter.claims_fee() {
-                    if result.ter.is_success() {
-                        *applied_transactions = applied_transactions.saturating_add(1);
-                    } else {
-                        *failed_transactions = failed_transactions.saturating_add(1);
+                let mut state = Self::ledger_state_from_open_view(base, open);
+                Self::seed_tx_accounts_from_open(&mut state, open, &parsed);
+                let tx_ctx = TxContext {
+                    parent_hash: open.info().parent_hash,
+                    ledger_seq: open.info().seq,
+                    close_time: open.info().close_time,
+                    parent_close_time: open.info().parent_close_time,
+                    ..TxContext::default()
+                };
+                let result = run_candidate_tx(&mut state, &parsed, &tx_ctx, flags);
+                match classify_result(&result) {
+                    ApplyOutcome::Success => {
+                        let result_str = result.ter.token();
+                        if result.ter.is_tes_success() {
+                            *applied_transactions = applied_transactions.saturating_add(1);
+                        } else {
+                            *failed_transactions = failed_transactions.saturating_add(1);
+                        }
+                        crate::ledger::close::stamp_touched_previous_fields(
+                            &mut state,
+                            &result.touched,
+                            &entry.hash,
+                            open.info().seq,
+                        );
+                        let meta = crate::ledger::close::build_tx_metadata(
+                            &state,
+                            &result.touched,
+                            entry.hash,
+                            open.info().seq,
+                            open.tx_count(),
+                            result_str,
+                            None,
+                        );
+                        Self::apply_touched_to_open(open, &state, &result.touched);
+                        open.raw_tx_insert(
+                            crate::ledger::Key(entry.hash),
+                            entry.blob.clone(),
+                            meta,
+                        );
+                        changes = changes.saturating_add(1);
                     }
-                    open.raw_tx_insert(
-                        crate::ledger::Key(entry.hash),
-                        entry.blob.clone(),
-                        Vec::new(),
-                    );
-                    changes = changes.saturating_add(1);
-                } else if Self::is_permanent_failure(&result.ter) {
-                    failed_set.insert(entry.hash);
-                } else {
-                    kept.push(entry);
+                    ApplyOutcome::Fail => {
+                        failed_set.insert(entry.hash);
+                    }
+                    ApplyOutcome::Retry => {
+                        kept.push(entry);
+                    }
                 }
             }
 
@@ -482,7 +595,7 @@ impl OpenLedger {
         retries: &[OpenLedgerTx],
         retries_first: bool,
     ) -> (OpenView, usize, usize, usize) {
-        let mut open = Self::build_base_open_view(base);
+        let mut open = Self::build_base_open_view(base.clone());
         let mut seen = std::collections::HashSet::new();
         let unique_retries = if retries_first {
             Self::dedup_transactions(retries, &mut seen)
@@ -506,6 +619,7 @@ impl OpenLedger {
                 Self::canonical_entries_from_transactions(&unique_retries, &salt);
             skipped_transactions = skipped_transactions.saturating_add(retry_skipped);
             Self::apply_canonical_entries(
+                base.as_ref(),
                 &mut open,
                 ordered_retries,
                 &mut applied_transactions,
@@ -518,6 +632,7 @@ impl OpenLedger {
             Self::canonical_entries_from_transactions(&unique_current, &salt);
         skipped_transactions = skipped_transactions.saturating_add(current_skipped);
         Self::apply_canonical_entries(
+            base.as_ref(),
             &mut open,
             ordered_current,
             &mut applied_transactions,
@@ -529,6 +644,7 @@ impl OpenLedger {
             Self::canonical_entries_from_transactions(&unique_locals, &salt);
         skipped_transactions = skipped_transactions.saturating_add(local_skipped);
         Self::apply_canonical_entries(
+            base.as_ref(),
             &mut open,
             ordered_locals,
             &mut applied_transactions,
@@ -1081,6 +1197,92 @@ mod tests {
             hex::encode_upper(base_state_hash)
         );
         assert_ne!(snapshot.open_view_tx_hash, hex::encode_upper([0u8; 32]));
+    }
+
+    #[test]
+    fn open_ledger_rejects_stale_sequence_before_legacy_apply() {
+        let alice = genesis_kp();
+        let alice_id = crate::crypto::account_id(&alice.public_key_bytes());
+        let bob_addr = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
+        let bob_id = crate::crypto::base58::decode_account(bob_addr).unwrap();
+
+        let mut base = setup_ledger_with_account(&alice_id, 100_000_000);
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&alice_id).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&alice_id, 100_000_000, 2),
+        )));
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&bob_id).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&bob_id, 50_000_000, 1),
+        )));
+        base.info_mut().seq = 16;
+        base.info_mut().hash = [0xAF; 32];
+        let base = Arc::new(base);
+
+        let signed = TxBuilder::payment()
+            .account(&alice)
+            .destination(bob_addr)
+            .unwrap()
+            .amount(Amount::Xrp(1_000_000))
+            .fee(10)
+            .sequence(1)
+            .sign(&alice)
+            .unwrap();
+        let parsed = parse_blob(&signed.blob).unwrap();
+        let mut pool = TxPool::default();
+        assert!(pool.insert(signed.hash, signed.blob.clone(), &parsed));
+        let metrics = pool.metrics.clone();
+
+        let mut open = OpenLedger::default();
+        assert!(open.sync_with_pool(base, &pool, pool.len(), pool.canonical_set_hash(), &metrics,));
+
+        let snapshot = open.snapshot();
+        assert_eq!(snapshot.open_view_applied_transactions, 0);
+        assert_eq!(snapshot.open_view_tx_count, 0);
+        assert!(open.current_transactions().is_empty());
+    }
+
+    #[test]
+    fn open_ledger_defers_future_sequence_before_legacy_apply() {
+        let alice = genesis_kp();
+        let alice_id = crate::crypto::account_id(&alice.public_key_bytes());
+        let bob_addr = "rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe";
+        let bob_id = crate::crypto::base58::decode_account(bob_addr).unwrap();
+
+        let mut base = setup_ledger_with_account(&alice_id, 100_000_000);
+        base.raw_insert(Arc::new(SLE::new(
+            keylet::account(&bob_id).key,
+            LedgerEntryType::AccountRoot,
+            make_account_data(&bob_id, 50_000_000, 1),
+        )));
+        base.info_mut().seq = 17;
+        base.info_mut().hash = [0xB0; 32];
+        let base = Arc::new(base);
+
+        let signed = TxBuilder::payment()
+            .account(&alice)
+            .destination(bob_addr)
+            .unwrap()
+            .amount(Amount::Xrp(1_000_000))
+            .fee(10)
+            .sequence(3)
+            .sign(&alice)
+            .unwrap();
+        let parsed = parse_blob(&signed.blob).unwrap();
+        let mut pool = TxPool::default();
+        assert!(pool.insert(signed.hash, signed.blob.clone(), &parsed));
+        let metrics = pool.metrics.clone();
+
+        let mut open = OpenLedger::default();
+        assert!(open.sync_with_pool(base, &pool, pool.len(), pool.canonical_set_hash(), &metrics,));
+
+        let snapshot = open.snapshot();
+        assert_eq!(snapshot.open_view_applied_transactions, 0);
+        assert_eq!(snapshot.open_view_skipped_transactions, 1);
+        assert_eq!(snapshot.open_view_tx_count, 0);
+        assert!(open.current_transactions().is_empty());
     }
 
     #[test]

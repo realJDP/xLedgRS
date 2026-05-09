@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Account support for XRPL ledger state and SHAMap logic.
 //! AccountRoot — the on-ledger state of a single XRPL account.
 //!
 //! AccountRoot objects are stored in the account-state SHAMap.  Each leaf's
@@ -20,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::sha512_first_half;
+use crate::ledger::sle::{LedgerEntryType, SLE};
 use crate::ledger::Key;
 
 // ── AccountRoot flag constants ───────────────────────────────────────────────
@@ -33,10 +33,20 @@ pub const LSF_NO_FREEZE: u32 = 0x00200000;
 pub const LSF_GLOBAL_FREEZE: u32 = 0x00400000;
 pub const LSF_DEFAULT_RIPPLE: u32 = 0x00800000;
 pub const LSF_DEPOSIT_AUTH: u32 = 0x01000000;
+pub const LSF_DISALLOW_INCOMING_NFTOKEN_OFFER: u32 = 0x04000000;
+pub const LSF_DISALLOW_INCOMING_TRUSTLINE: u32 = 0x20000000;
+pub const LSF_ALLOW_TRUST_LINE_LOCKING: u32 = 0x40000000;
+pub const LSF_ALLOW_TRUST_LINE_CLAWBACK: u32 = 0x80000000;
 
 /// Namespace prefix for AccountRoot keys in the SHAMap.
 /// `0x0061` == ASCII 'a' in a u16.
 const ACCOUNT_SPACE: [u8; 2] = [0x00, 0x61];
+const SF_ACCOUNT_TXN_ID: (u16, u16) = (5, 9);
+const SF_EMAIL_HASH: (u16, u16) = (4, 1);
+const SF_WALLET_LOCATOR: (u16, u16) = (5, 7);
+const SF_MESSAGE_KEY: (u16, u16) = (7, 2);
+const SF_NFTOKEN_MINTER: (u16, u16) = (8, 9);
+const SF_FIRST_NFTOKEN_SEQUENCE: (u16, u16) = (2, 50);
 
 /// Compute the SHAMap key for an AccountRoot.
 pub fn shamap_key(account_id: &[u8; 20]) -> Key {
@@ -66,6 +76,9 @@ pub struct AccountRoot {
     /// Total NFTs minted by this account (monotonically increasing).
     #[serde(default)]
     pub minted_nftokens: u32,
+    /// Sequence used as the base for this account's NFToken IDs.
+    #[serde(default)]
+    pub first_nftoken_sequence: u32,
     /// Total NFTs burned by this account.
     #[serde(default)]
     pub burned_nftokens: u32,
@@ -105,6 +118,7 @@ impl PartialEq for AccountRoot {
             && self.flags == other.flags
             && self.regular_key == other.regular_key
             && self.minted_nftokens == other.minted_nftokens
+            && self.first_nftoken_sequence == other.first_nftoken_sequence
             && self.burned_nftokens == other.burned_nftokens
             && self.transfer_rate == other.transfer_rate
             && self.domain == other.domain
@@ -174,6 +188,13 @@ impl AccountRoot {
             out.extend_from_slice(&self.burned_nftokens.to_be_bytes());
         }
 
+        // (2,50) sfFirstNFTokenSequence = extended (0x20, 50)
+        if self.first_nftoken_sequence > 0 {
+            out.push(0x20);
+            out.push(50);
+            out.extend_from_slice(&self.first_nftoken_sequence.to_be_bytes());
+        }
+
         // (5,5) sfPreviousTxnID = 0x55 (NOT 0x52 which is sfParentHash field=2)
         if self.previous_txn_id != [0u8; 32] {
             out.push(0x55);
@@ -203,14 +224,131 @@ impl AccountRoot {
             out.extend_from_slice(rk);
         }
 
-        // TickSize is UInt8 field 8; type code 16 uses extended type encoding.
+        // TickSize is UInt8 field 16; both type and field use extended encoding.
         if self.tick_size > 0 {
-            out.push(0x08); // field=8, type extended
+            out.push(0x00);
             out.push(16); // type=16 (UInt8)
+            out.push(16); // field=16 (sfTickSize)
             out.push(self.tick_size);
         }
 
         out
+    }
+
+    fn sle(&self) -> SLE {
+        SLE::new(
+            shamap_key(&self.account_id),
+            LedgerEntryType::AccountRoot,
+            self.to_sle_binary(),
+        )
+    }
+
+    fn replace_sle(&mut self, sle: SLE) {
+        self.raw_sle = Some(sle.into_data());
+    }
+
+    pub fn account_txn_id(&self) -> Option<[u8; 32]> {
+        self.sle()
+            .get_field_h256(SF_ACCOUNT_TXN_ID.0, SF_ACCOUNT_TXN_ID.1)
+    }
+
+    pub fn set_account_txn_id(&mut self, account_txn_id: [u8; 32]) {
+        let mut sle = self.sle();
+        sle.set_field_h256(SF_ACCOUNT_TXN_ID.0, SF_ACCOUNT_TXN_ID.1, &account_txn_id);
+        self.replace_sle(sle);
+    }
+
+    pub fn ensure_account_txn_id(&mut self) {
+        if self.account_txn_id().is_none() {
+            self.set_account_txn_id([0u8; 32]);
+        }
+    }
+
+    pub fn clear_account_txn_id(&mut self) {
+        let mut sle = self.sle();
+        sle.remove_field(SF_ACCOUNT_TXN_ID.0, SF_ACCOUNT_TXN_ID.1);
+        self.replace_sle(sle);
+    }
+
+    pub fn email_hash(&self) -> Option<[u8; 16]> {
+        self.sle()
+            .find_field_raw(SF_EMAIL_HASH.0, SF_EMAIL_HASH.1)
+            .and_then(|data| data.try_into().ok())
+    }
+
+    pub fn set_email_hash(&mut self, hash: Option<[u8; 16]>) {
+        let mut sle = self.sle();
+        if let Some(hash) = hash {
+            sle.set_field_raw_pub(SF_EMAIL_HASH.0, SF_EMAIL_HASH.1, &hash);
+        } else {
+            sle.remove_field(SF_EMAIL_HASH.0, SF_EMAIL_HASH.1);
+        }
+        self.replace_sle(sle);
+    }
+
+    pub fn wallet_locator(&self) -> Option<[u8; 32]> {
+        self.sle()
+            .get_field_h256(SF_WALLET_LOCATOR.0, SF_WALLET_LOCATOR.1)
+    }
+
+    pub fn set_wallet_locator(&mut self, locator: Option<[u8; 32]>) {
+        let mut sle = self.sle();
+        if let Some(locator) = locator {
+            sle.set_field_h256(SF_WALLET_LOCATOR.0, SF_WALLET_LOCATOR.1, &locator);
+        } else {
+            sle.remove_field(SF_WALLET_LOCATOR.0, SF_WALLET_LOCATOR.1);
+        }
+        self.replace_sle(sle);
+    }
+
+    pub fn message_key(&self) -> Option<Vec<u8>> {
+        self.sle()
+            .find_field_raw(SF_MESSAGE_KEY.0, SF_MESSAGE_KEY.1)
+    }
+
+    pub fn set_message_key(&mut self, key: Option<&[u8]>) {
+        let mut sle = self.sle();
+        if let Some(key) = key {
+            sle.set_field_raw_pub(SF_MESSAGE_KEY.0, SF_MESSAGE_KEY.1, key);
+        } else {
+            sle.remove_field(SF_MESSAGE_KEY.0, SF_MESSAGE_KEY.1);
+        }
+        self.replace_sle(sle);
+    }
+
+    pub fn nftoken_minter(&self) -> Option<[u8; 20]> {
+        self.sle()
+            .get_field_account(SF_NFTOKEN_MINTER.0, SF_NFTOKEN_MINTER.1)
+    }
+
+    pub fn set_nftoken_minter(&mut self, minter: Option<[u8; 20]>) {
+        let mut sle = self.sle();
+        if let Some(minter) = minter {
+            sle.set_field_account(SF_NFTOKEN_MINTER.0, SF_NFTOKEN_MINTER.1, &minter);
+        } else {
+            sle.remove_field(SF_NFTOKEN_MINTER.0, SF_NFTOKEN_MINTER.1);
+        }
+        self.replace_sle(sle);
+    }
+
+    pub fn first_nftoken_sequence(&self) -> Option<u32> {
+        let value = self.first_nftoken_sequence;
+        (value != 0).then_some(value)
+    }
+
+    pub fn set_first_nftoken_sequence(&mut self, value: u32) {
+        self.first_nftoken_sequence = value;
+        let mut sle = self.sle();
+        if value > 0 {
+            sle.set_field_u32(
+                SF_FIRST_NFTOKEN_SEQUENCE.0,
+                SF_FIRST_NFTOKEN_SEQUENCE.1,
+                value,
+            );
+        } else {
+            sle.remove_field(SF_FIRST_NFTOKEN_SEQUENCE.0, SF_FIRST_NFTOKEN_SEQUENCE.1);
+        }
+        self.replace_sle(sle);
     }
 
     /// Produce the binary SLE for this AccountRoot.
@@ -274,6 +412,13 @@ impl AccountRoot {
             sle.remove_field(2, 44);
         }
 
+        // FirstNFTokenSequence
+        if self.first_nftoken_sequence > 0 {
+            sle.set_field_u32(2, 50, self.first_nftoken_sequence);
+        } else {
+            sle.remove_field(2, 50);
+        }
+
         // Domain (VL type=7, field=7)
         if !self.domain.is_empty() {
             sle.set_field_raw_pub(7, 7, &self.domain);
@@ -288,11 +433,11 @@ impl AccountRoot {
             sle.remove_field(8, 8);
         }
 
-        // TickSize (UInt8 type=16, field=8)
+        // TickSize (UInt8 type=16, field=16)
         if self.tick_size > 0 {
-            sle.set_field_raw_pub(16, 8, &[self.tick_size]);
+            sle.set_field_raw_pub(16, 16, &[self.tick_size]);
         } else {
-            sle.remove_field(16, 8);
+            sle.remove_field(16, 16);
         }
 
         sle.into_data()
@@ -308,6 +453,7 @@ impl AccountRoot {
         let mut flags = None::<u32>;
         let mut regular_key = None::<[u8; 20]>;
         let mut minted_nftokens = 0u32;
+        let mut first_nftoken_sequence = 0u32;
         let mut burned_nftokens = 0u32;
         let mut transfer_rate = 0u32;
         let mut domain = Vec::new();
@@ -447,6 +593,15 @@ impl AccountRoot {
                     burned_nftokens = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
                     pos += 4;
                 }
+                (2, 50) => {
+                    // FirstNFTokenSequence (UInt32), sfFirstNFTokenSequence
+                    if pos + 4 > data.len() {
+                        break;
+                    }
+                    first_nftoken_sequence =
+                        u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                }
                 (2, 11) => {
                     // TransferRate (UInt32)
                     if pos + 4 > data.len() {
@@ -494,7 +649,7 @@ impl AccountRoot {
                     domain = data[pos..pos + vl_len].to_vec();
                     pos += vl_len;
                 }
-                (16, 8) => {
+                (16, 16) => {
                     // TickSize (UInt8)
                     if pos >= data.len() {
                         break;
@@ -581,6 +736,7 @@ impl AccountRoot {
             flags: flags.unwrap_or(0),
             regular_key,
             minted_nftokens,
+            first_nftoken_sequence,
             burned_nftokens,
             transfer_rate,
             domain,
@@ -623,6 +779,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -661,6 +818,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -683,6 +841,95 @@ mod tests {
             "positive XRP bit must be set"
         );
         assert_eq!(raw & 0x3FFF_FFFF_FFFF_FFFF, 1_000_000);
+    }
+
+    #[test]
+    fn tick_size_uses_rippled_uint8_field_16_header() {
+        let mut acct = genesis();
+        acct.tick_size = 7;
+
+        let encoded = acct.encode();
+        let pos = encoded
+            .windows(4)
+            .position(|w| w == [0x00, 16, 16, 7])
+            .expect("sfTickSize UInt8/16 header present");
+        assert_eq!(&encoded[pos..pos + 4], &[0x00, 16, 16, 7]);
+
+        let decoded = AccountRoot::decode(&encoded).expect("account decodes");
+        assert_eq!(decoded.tick_size, 7);
+    }
+
+    #[test]
+    fn first_nftoken_sequence_roundtrips_and_patches_raw_sle() {
+        let mut acct = genesis();
+        acct.first_nftoken_sequence = 7;
+
+        let encoded = acct.encode();
+        let pos = encoded
+            .windows(2)
+            .position(|w| w == [0x20, 50])
+            .expect("sfFirstNFTokenSequence header present");
+        assert_eq!(
+            u32::from_be_bytes(encoded[pos + 2..pos + 6].try_into().unwrap()),
+            7
+        );
+
+        let mut decoded = AccountRoot::decode(&encoded).expect("account decodes");
+        assert_eq!(decoded.first_nftoken_sequence(), Some(7));
+        decoded.set_first_nftoken_sequence(11);
+        let patched = decoded.to_sle_binary();
+        let pos = patched
+            .windows(2)
+            .position(|w| w == [0x20, 50])
+            .expect("patched sfFirstNFTokenSequence header present");
+        assert_eq!(
+            u32::from_be_bytes(patched[pos + 2..pos + 6].try_into().unwrap()),
+            11
+        );
+
+        decoded.set_first_nftoken_sequence(0);
+        assert!(decoded.to_sle_binary().windows(2).all(|w| w != [0x20, 50]));
+    }
+
+    #[test]
+    fn optional_accountroot_fields_roundtrip_through_sle_accessors() {
+        let mut acct = genesis();
+        let account_txn_id = [0x11; 32];
+        let email_hash = [0x22; 16];
+        let wallet_locator = [0x33; 32];
+        let message_key = [0xED; 33];
+        let nftoken_minter = [0x44; 20];
+
+        acct.set_account_txn_id(account_txn_id);
+        acct.set_email_hash(Some(email_hash));
+        acct.set_wallet_locator(Some(wallet_locator));
+        acct.set_message_key(Some(&message_key));
+        acct.set_nftoken_minter(Some(nftoken_minter));
+
+        assert_eq!(acct.account_txn_id(), Some(account_txn_id));
+        assert_eq!(acct.email_hash(), Some(email_hash));
+        assert_eq!(acct.wallet_locator(), Some(wallet_locator));
+        assert_eq!(acct.message_key(), Some(message_key.to_vec()));
+        assert_eq!(acct.nftoken_minter(), Some(nftoken_minter));
+
+        let decoded = AccountRoot::decode(&acct.to_sle_binary()).expect("account should decode");
+        assert_eq!(decoded.account_txn_id(), Some(account_txn_id));
+        assert_eq!(decoded.email_hash(), Some(email_hash));
+        assert_eq!(decoded.wallet_locator(), Some(wallet_locator));
+        assert_eq!(decoded.message_key(), Some(message_key.to_vec()));
+        assert_eq!(decoded.nftoken_minter(), Some(nftoken_minter));
+
+        acct.clear_account_txn_id();
+        acct.set_email_hash(None);
+        acct.set_wallet_locator(None);
+        acct.set_message_key(None);
+        acct.set_nftoken_minter(None);
+
+        assert_eq!(acct.account_txn_id(), None);
+        assert_eq!(acct.email_hash(), None);
+        assert_eq!(acct.wallet_locator(), None);
+        assert_eq!(acct.message_key(), None);
+        assert_eq!(acct.nftoken_minter(), None);
     }
 
     #[test]

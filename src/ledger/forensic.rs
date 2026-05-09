@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Forensic support for XRPL ledger state and SHAMap logic.
 //! Forensic capture for engine-divergence debugging.
 //!
 //! When the follower detects a state-hash mismatch on the first ledger after
@@ -275,10 +274,10 @@ pub async fn capture_forensic_bundle(
         false,
     )?;
     if rippled_fetched {
-        // Deep owner/book neighborhoods can outgrow the first enrichment cap.
-        // Give the crawl enough headroom to prove that the frontier is exhausted
-        // instead of stopping at an artificial ceiling.
-        const REFERENCE_ENRICH_MAX_KEYS: usize = 1_000_000;
+        // Keep live forensic captures bounded. The initial reference pass
+        // already captures the touched/post-state frontier; deeper enrichment
+        // is useful offline, but it can stall a live validator for minutes.
+        const REFERENCE_ENRICH_MAX_KEYS: usize = 0;
         let requested_keys: HashSet<[u8; 32]> = initial_reference_keys.iter().copied().collect();
         let mut remaining_budget = REFERENCE_ENRICH_MAX_KEYS;
         let host = rpc_host.expect("rpc_host must be present when rippled_fetched is true");
@@ -349,8 +348,8 @@ pub async fn capture_forensic_bundle(
                 }
             }
         }
-        const DIRECT_EDGE_TARGET_CAP: usize = 200_000;
-        const DIRECT_EDGE_CLOSURE_MAX_FETCHES: usize = 1_000_000;
+        const DIRECT_EDGE_TARGET_CAP: usize = 0;
+        const DIRECT_EDGE_CLOSURE_MAX_FETCHES: usize = 0;
         let mut remaining_direct_edge_budget = DIRECT_EDGE_CLOSURE_MAX_FETCHES;
         let mut round = 0usize;
         while remaining_direct_edge_budget > 0 {
@@ -1791,6 +1790,7 @@ mod tests {
             pays_issuer: [0x72; 20],
             gets_currency: [0x73; 20],
             gets_issuer: [0x74; 20],
+            domain_id: None,
         };
         let mut book_root = crate::ledger::directory::DirectoryNode::new_book_root(&book, 9);
         book_root.index_next = 3;

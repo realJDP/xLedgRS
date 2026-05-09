@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Sle support for XRPL ledger state and SHAMap logic.
 //! Serialized Ledger Entry — the fundamental unit of XRPL ledger state.
 //!
 //! An SLE is a binary STObject with a 32-byte SHAMap key and a type tag.

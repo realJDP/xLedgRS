@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Rules support for XRPL ledger state and SHAMap logic.
 //! Active amendment set for a ledger.
 
 use std::collections::HashSet;

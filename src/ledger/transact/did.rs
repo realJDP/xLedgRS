@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Did legacy transactor for XRPL transaction apply.
 use super::{check_reserve, owner_dir, TecCode, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::{LedgerEntryType, SLE};
@@ -38,8 +37,22 @@ impl TxHandler for DIDSetHandler {
                 }
             }
 
+            let has_uri = did.find_field_raw(7, 5).is_some();
+            let has_doc = did.find_field_raw(7, 26).is_some();
+            let has_data = did.find_field_raw(7, 27).is_some();
+            if !has_uri && !has_doc && !has_data {
+                return TER::ClaimedCost(TecCode::Generic("tecEMPTY_DID"));
+            }
+
             view.update(Arc::new(did));
         } else {
+            let has_uri = tx.uri.as_ref().is_some_and(|uri| !uri.is_empty());
+            let has_doc = tx.did_document.as_ref().is_some_and(|doc| !doc.is_empty());
+            let has_data = tx.did_data.as_ref().is_some_and(|data| !data.is_empty());
+            if !has_uri && !has_doc && !has_data {
+                return TER::ClaimedCost(TecCode::Generic("tecEMPTY_DID"));
+            }
+
             // Reserve check — sender must afford one more owned object
             let sender_keylet_chk = keylet::account(&tx.account);
             if let Some(sender_sle) = view.peek(&sender_keylet_chk) {

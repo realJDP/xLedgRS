@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Master support for XRPL ledger state and SHAMap logic.
 //! Validated-ledger bookkeeping and recent validation history.
 
 use std::collections::{HashMap, VecDeque};
@@ -43,8 +42,6 @@ impl LedgerMaster {
         queued_transactions: usize,
         candidate_set_hash: [u8; 32],
     ) {
-        self.validated_seq = header.sequence;
-        self.validated_hash = header.hash;
         self.last_close_time = header.close_time;
         self.complete_ledgers = complete_ledgers;
         self.queued_transactions = queued_transactions;
@@ -59,7 +56,6 @@ impl LedgerMaster {
     }
 
     pub fn record_validated_hash(&mut self, seq: u32, hash: [u8; 32]) {
-        self.note_validated_head(seq, hash);
         if !self.validated_hashes.contains_key(&seq) {
             self.validated_order.push_back(seq);
             while self.validated_order.len() > RECENT_VALIDATED_CAPACITY {
@@ -125,11 +121,15 @@ mod tests {
         master.note_closed(&header, "1-22".into(), 7, [0xCC; 32]);
         master.record_validated_hash(22, [0xAB; 32]);
         let snapshot = master.snapshot();
-        assert_eq!(snapshot.validated_seq, 22);
-        assert_eq!(snapshot.open_ledger_seq, 23);
+        assert_eq!(snapshot.validated_seq, 0);
+        assert_eq!(snapshot.open_ledger_seq, 1);
         assert_eq!(snapshot.complete_ledgers, "1-22");
         assert_eq!(snapshot.queued_transactions, 7);
         assert_eq!(snapshot.recent_validated[0].seq, 22);
         assert_eq!(master.hash_for_seq(22), Some([0xAB; 32]));
+        master.note_validated_head(22, [0xAB; 32]);
+        let snapshot = master.snapshot();
+        assert_eq!(snapshot.validated_seq, 22);
+        assert_eq!(snapshot.open_ledger_seq, 23);
     }
 }

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Release Safety test coverage for release and parity safety.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -118,6 +117,36 @@ fn hardcoded_remote_targets(contents: &str) -> Vec<String> {
     found
 }
 
+fn section_body<'a>(contents: &'a str, section: &str) -> Vec<&'a str> {
+    let header = format!("[{}]", section.to_ascii_lowercase());
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.to_ascii_lowercase() == header {
+            in_section = true;
+            continue;
+        }
+        if in_section && trimmed.starts_with('[') {
+            break;
+        }
+        if in_section && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            lines.push(trimmed);
+        }
+    }
+    lines
+}
+
+fn section_scalar(contents: &str, section: &str) -> Option<String> {
+    section_body(contents, section).first().map(|line| {
+        line.split('=')
+            .next_back()
+            .unwrap_or(line)
+            .trim()
+            .to_string()
+    })
+}
+
 #[test]
 fn documented_public_release_files_exist() {
     for relative in [
@@ -172,6 +201,25 @@ fn release_cfg_templates_do_not_ship_uncommented_validation_seeds() {
 }
 
 #[test]
+fn validator_cfg_templates_do_not_enable_close_loop_without_identity() {
+    for relative in ["cfg/validator-mainnet.cfg", "cfg/validator-testnet.cfg"] {
+        let path = repo_root().join(relative);
+        let cfg = xrpl::config::ConfigFile::load(&path).expect("validator cfg parses");
+        assert_ne!(
+            cfg.runtime.enable_consensus_close_loop,
+            Some(true),
+            "{relative} must not enable consensus close loop in the public template"
+        );
+        assert!(
+            cfg.validation_seed.is_none()
+                && cfg.validation_secret_key.is_none()
+                && cfg.validator_token.is_none(),
+            "{relative} must not ship an active validator identity"
+        );
+    }
+}
+
+#[test]
 fn release_surfaces_do_not_hardcode_nonlocal_ipv4_addresses() {
     let mut paths = cfg_templates();
     paths.extend(release_shell_scripts());
@@ -197,6 +245,49 @@ fn release_scripts_do_not_hardcode_remote_targets() {
             "{} still contains hardcoded remote targets: {:?}",
             path.display(),
             targets
+        );
+    }
+}
+
+#[test]
+fn public_startup_templates_keep_network_modes_distinct() {
+    for (cfg, expected_network) in [
+        ("cfg/xLedgRSv2Beta.cfg", "main"),
+        ("cfg/validator-mainnet.cfg", "main"),
+        ("cfg/testnet.cfg", "testnet"),
+        ("cfg/validator-testnet.cfg", "testnet"),
+    ] {
+        let contents = read_text(&repo_root().join(cfg));
+        assert_eq!(
+            section_scalar(&contents, "network_id").as_deref(),
+            Some(expected_network),
+            "{cfg} must declare the intended rippled-compatible network_id"
+        );
+    }
+}
+
+#[test]
+fn validator_close_loop_templates_require_release_safe_inputs() {
+    for cfg in ["cfg/validator-mainnet.cfg", "cfg/validator-testnet.cfg"] {
+        let contents = read_text(&repo_root().join(cfg));
+        assert!(
+            section_body(&contents, "xLedgRSv2Beta")
+                .iter()
+                .any(|line| *line == "enable_consensus_close_loop = 0"),
+            "{cfg} must keep the consensus close loop disabled in the public template"
+        );
+        assert_eq!(
+            section_scalar(&contents, "ledger_history").as_deref(),
+            Some("full"),
+            "{cfg} must keep full history for validator close-loop safety"
+        );
+        assert!(
+            section_scalar(&contents, "validators_file").is_some(),
+            "{cfg} must configure a validator list source"
+        );
+        assert!(
+            uncommented_validation_seed_lines(&contents).is_empty(),
+            "{cfg} must not ship an active validation seed"
         );
     }
 }

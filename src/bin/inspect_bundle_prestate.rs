@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Inspect Bundle Prestate diagnostic utility for parity investigation.
 use std::path::PathBuf;
 
 use clap::Parser;

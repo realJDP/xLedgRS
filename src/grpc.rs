@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Serve optional gRPC APIs backed by the node runtime.
 //! gRPC service layer for xLedgRSv2Beta.
 //!
 //! This exposes the binary ledger RPC surface plus a local extension service
@@ -56,7 +55,14 @@ impl GrpcRuntime {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        let _ = self.join.await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.join).await {
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!("gRPC server did not stop within shutdown grace; aborting");
+                self.join.abort();
+                let _ = self.join.await;
+            }
+        }
     }
 }
 
@@ -369,6 +375,7 @@ impl GrpcService {
 
         loop {
             params.insert("limit".to_string(), json!(256u32));
+            params.insert("binary".to_string(), json!(true));
             if let Some(ref current_marker) = next_marker {
                 params.insert(
                     "marker".to_string(),
@@ -796,7 +803,10 @@ mod tests {
             .expect("current ledger should be available");
 
         assert!(!response.ledger_header.is_empty());
-        assert!(response.validated);
+        assert!(
+            !response.validated,
+            "the current shortcut returns the live current ledger; it is only validated once it matches the validated head"
+        );
     }
 
     #[tokio::test]

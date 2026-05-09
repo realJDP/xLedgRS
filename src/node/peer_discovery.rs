@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peer Discovery piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -47,7 +46,12 @@ impl Node {
 
                 let elapsed_secs = start_time.elapsed().as_secs();
                 let max_out = self.config.max_outbound();
-                let target_outbound = (3 + (elapsed_secs / 30) * 3).min(max_out as u64) as usize;
+                let sync_active = state.sync_in_progress || self.sync_runtime.sync_active();
+                let target_outbound = if sync_active {
+                    self.config.sync_peer_target().min(max_out)
+                } else {
+                    (3 + (elapsed_secs / 30) * 3).min(max_out as u64) as usize
+                };
 
                 if let Some(queue) = state.ctx.connect_requests.clone() {
                     let mut pending = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -69,8 +73,12 @@ impl Node {
                         .unwrap_or_default()
                         .as_secs();
                     let candidates = state.services.peerfinder.autoconnect(now_unix);
-                    for addr in candidates.into_iter().take(3) {
+                    let dial_budget = if sync_active { 4 } else { 3 };
+                    for addr in candidates.into_iter().take(dial_budget) {
                         if state.allow_outbound_candidate(addr, now) && !addrs.contains(&addr) {
+                            state
+                                .peer_cooldowns
+                                .insert(addr, now + std::time::Duration::from_secs(15));
                             addrs.push(addr);
                         }
                     }

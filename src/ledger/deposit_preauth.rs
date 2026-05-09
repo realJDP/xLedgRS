@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Deposit Preauth support for XRPL ledger state and SHAMap logic.
 //! DepositPreauth — pre-authorization for deposits.
 //!
 //! Account A authorizes account B to send payments to A even when A has
@@ -12,12 +11,26 @@ use crate::crypto::sha512_first_half;
 use crate::ledger::Key;
 
 const DEPOSIT_PREAUTH_SPACE: [u8; 2] = [0x00, 0x70];
+const DEPOSIT_PREAUTH_CREDENTIALS_SPACE: [u8; 2] = [0x00, 0x50];
 
 pub fn shamap_key(account: &[u8; 20], authorized: &[u8; 20]) -> Key {
     let mut data = Vec::with_capacity(42);
     data.extend_from_slice(&DEPOSIT_PREAUTH_SPACE);
     data.extend_from_slice(account);
     data.extend_from_slice(authorized);
+    Key(sha512_first_half(&data))
+}
+
+pub fn credential_shamap_key(account: &[u8; 20], credentials: &[([u8; 20], Vec<u8>)]) -> Key {
+    let mut data = Vec::with_capacity(22 + credentials.len() * 32);
+    data.extend_from_slice(&DEPOSIT_PREAUTH_CREDENTIALS_SPACE);
+    data.extend_from_slice(account);
+    for (issuer, credential_type) in credentials {
+        let mut credential_hash_input = Vec::with_capacity(20 + credential_type.len());
+        credential_hash_input.extend_from_slice(issuer);
+        credential_hash_input.extend_from_slice(credential_type);
+        data.extend_from_slice(&sha512_first_half(&credential_hash_input));
+    }
     Key(sha512_first_half(&data))
 }
 

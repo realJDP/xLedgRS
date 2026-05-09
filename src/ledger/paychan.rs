@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Paychan support for XRPL ledger state and SHAMap logic.
 //! PayChannel — an off-chain XRP payment channel between two accounts.
 //!
 //! A payment channel locks XRP that can be claimed incrementally by the
@@ -113,11 +112,7 @@ impl PayChannel {
         sle.set_field_u64(3, 4, self.owner_node);
 
         // DestinationNode (UInt64, 3, 9)
-        if self.destination_node != 0 {
-            sle.set_field_u64(3, 9, self.destination_node);
-        } else {
-            sle.remove_field(3, 9);
-        }
+        sle.set_field_u64(3, 9, self.destination_node);
 
         // Amount (Amount, 6, 1) — XRP
         sle.set_field_raw_pub(
@@ -221,15 +216,42 @@ impl PayChannel {
                 data: tag.to_be_bytes().to_vec(),
             });
         }
-        if self.destination_node != 0 {
-            fields.push(crate::ledger::meta::ParsedField {
-                type_code: 3,
-                field_code: 9,
-                data: self.destination_node.to_be_bytes().to_vec(),
-            });
-        }
+        fields.push(crate::ledger::meta::ParsedField {
+            type_code: 3,
+            field_code: 9,
+            data: self.destination_node.to_be_bytes().to_vec(),
+        });
 
         crate::ledger::meta::build_sle(0x0078, &fields, None, None)
+    }
+
+    pub fn from_sle(key: &Key, raw_sle: Vec<u8>) -> Option<Self> {
+        let parsed = crate::ledger::meta::parse_sle(&raw_sle)?;
+        if parsed.entry_type != 0x0078 {
+            return None;
+        }
+        let amount = amount_drops(&parsed.fields, 1)?;
+        let balance = amount_drops(&parsed.fields, 2)?;
+        let account = account_field(&parsed.fields, 1)?;
+        let destination = account_field(&parsed.fields, 3)?;
+        let sequence = u32_field(&parsed.fields, 4)?;
+        let pc = Self {
+            account,
+            destination,
+            amount,
+            balance,
+            settle_delay: u32_field(&parsed.fields, 39)?,
+            public_key: field(&parsed.fields, 7, 1).unwrap_or_default(),
+            sequence,
+            cancel_after: u32_field(&parsed.fields, 36).unwrap_or(0),
+            expiration: u32_field(&parsed.fields, 10).unwrap_or(0),
+            owner_node: u64_field(&parsed.fields, 4).unwrap_or(0),
+            destination_node: u64_field(&parsed.fields, 9).unwrap_or(0),
+            source_tag: u32_field(&parsed.fields, 3),
+            destination_tag: u32_field(&parsed.fields, 14),
+            raw_sle: Some(raw_sle),
+        };
+        (pc.key() == *key).then_some(pc)
     }
 
     /// Verify a claim authorization signature.
@@ -242,28 +264,81 @@ impl PayChannel {
     /// For Ed25519 keys (0xED prefix), ed25519 verify is used directly on
     /// the raw payload (no pre-hashing), matching rippled.
     pub fn verify_claim(&self, claimed_drops: u64, signature: &[u8]) -> bool {
-        let mut payload = PREFIX_CLAIM.to_vec();
-        payload.extend_from_slice(&self.key().0);
-        payload.extend_from_slice(&claimed_drops.to_be_bytes());
+        verify_claim_with_public_key(&self.public_key, &self.key().0, claimed_drops, signature)
+    }
+}
 
-        if self.public_key.first() == Some(&0xED) && self.public_key.len() == 33 {
-            // Ed25519: strip the 0xED prefix byte to get the 32-byte verifying key
-            use ed25519_dalek::Verifier;
-            let Ok(key_bytes): Result<[u8; 32], _> = self.public_key[1..].try_into() else {
-                return false;
-            };
-            let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
-                return false;
-            };
-            let Ok(sig_bytes): Result<[u8; 64], _> = signature.try_into() else {
-                return false;
-            };
-            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-            vk.verify(&payload, &sig).is_ok()
-        } else {
-            // secp256k1: verify_secp256k1 does SHA-512-Half(payload) internally
-            crate::crypto::keys::verify_secp256k1(&self.public_key, &payload, signature)
-        }
+fn field(fields: &[crate::ledger::meta::ParsedField], tc: u16, fc: u16) -> Option<Vec<u8>> {
+    fields
+        .iter()
+        .find(|field| field.type_code == tc && field.field_code == fc)
+        .map(|field| field.data.clone())
+}
+
+fn u32_field(fields: &[crate::ledger::meta::ParsedField], fc: u16) -> Option<u32> {
+    let data = field(fields, 2, fc)?;
+    Some(u32::from_be_bytes(data.get(..4)?.try_into().ok()?))
+}
+
+fn u64_field(fields: &[crate::ledger::meta::ParsedField], fc: u16) -> Option<u64> {
+    let data = field(fields, 3, fc)?;
+    Some(u64::from_be_bytes(data.get(..8)?.try_into().ok()?))
+}
+
+fn account_field(fields: &[crate::ledger::meta::ParsedField], fc: u16) -> Option<[u8; 20]> {
+    field(fields, 8, fc)?.try_into().ok()
+}
+
+fn amount_drops(fields: &[crate::ledger::meta::ParsedField], fc: u16) -> Option<u64> {
+    match crate::transaction::Amount::from_bytes(&field(fields, 6, fc)?)
+        .ok()?
+        .0
+    {
+        crate::transaction::Amount::Xrp(drops) => Some(drops),
+        _ => None,
+    }
+}
+
+pub fn valid_public_key(public_key: &[u8]) -> bool {
+    if public_key.first() == Some(&0xED) {
+        return public_key.len() == 33;
+    }
+    if public_key.len() != 33 {
+        return false;
+    }
+    secp256k1::PublicKey::from_slice(public_key).is_ok()
+}
+
+pub fn verify_claim_with_public_key(
+    public_key: &[u8],
+    channel: &[u8; 32],
+    claimed_drops: u64,
+    signature: &[u8],
+) -> bool {
+    if !valid_public_key(public_key) {
+        return false;
+    }
+    let mut payload = PREFIX_CLAIM.to_vec();
+    payload.extend_from_slice(channel);
+    payload.extend_from_slice(&claimed_drops.to_be_bytes());
+
+    if public_key.first() == Some(&0xED) {
+        // Ed25519: strip the 0xED prefix byte to get the 32-byte verifying key
+        use ed25519_dalek::Verifier;
+        let Ok(key_bytes): Result<[u8; 32], _> = public_key[1..].try_into() else {
+            return false;
+        };
+        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
+            return false;
+        };
+        let Ok(sig_bytes): Result<[u8; 64], _> = signature.try_into() else {
+            return false;
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        vk.verify(&payload, &sig).is_ok()
+    } else {
+        // secp256k1: verify_secp256k1 does SHA-512-Half(payload) internally
+        crate::crypto::keys::verify_secp256k1(public_key, &payload, signature)
     }
 }
 

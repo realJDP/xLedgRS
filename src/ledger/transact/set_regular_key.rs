@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Set Regular Key legacy transactor for XRPL transaction apply.
 use super::{TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::views::ApplyView;
@@ -8,6 +7,13 @@ use std::sync::Arc;
 pub struct SetRegularKeyHandler;
 
 impl TxHandler for SetRegularKeyHandler {
+    fn preflight(&self, tx: &ParsedTx) -> Result<(), TER> {
+        if tx.regular_key == Some(tx.account) {
+            return Err(TER::Malformed("temBAD_REGKEY"));
+        }
+        Ok(())
+    }
+
     fn do_apply(&self, tx: &ParsedTx, view: &mut dyn ApplyView) -> TER {
         let sender_keylet = keylet::account(&tx.account);
         let sender_sle = match view.peek(&sender_keylet) {

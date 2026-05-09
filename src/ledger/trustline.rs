@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Trustline support for XRPL ledger state and SHAMap logic.
 //! RippleState — the on-ledger state of a trust line between two accounts.
 //!
 //! A trust line connects two accounts for a specific currency.  The "low"
@@ -22,6 +21,8 @@ pub const LSF_LOW_NO_RIPPLE: u32 = 0x00100000;
 pub const LSF_HIGH_NO_RIPPLE: u32 = 0x00200000;
 pub const LSF_LOW_FREEZE: u32 = 0x00400000;
 pub const LSF_HIGH_FREEZE: u32 = 0x00800000;
+pub const LSF_LOW_DEEP_FREEZE: u32 = 0x02000000;
+pub const LSF_HIGH_DEEP_FREEZE: u32 = 0x04000000;
 
 /// Namespace prefix for RippleState objects.
 const RIPPLE_STATE_SPACE: [u8; 2] = [0x00, 0x72];

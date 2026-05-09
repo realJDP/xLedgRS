@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Fees support for XRPL ledger state and SHAMap logic.
 //! Fee settings for a ledger — parsed from the FeeSettings SLE.
 
 /// Fee configuration for the current ledger.

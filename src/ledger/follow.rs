@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Follow support for XRPL ledger state and SHAMap logic.
 //! Ledger follower — tracks validated ledgers and builds them locally.
 //!
 //! Requests liBASE (header) + liTX_NODE (transactions) in parallel for each
@@ -133,6 +132,43 @@ fn directory_index_keys_from_raw(
         out.push(crate::ledger::Key(index));
     }
     Some(out)
+}
+
+fn metadata_fields_include_directory_indexes(fields: &[crate::ledger::meta::ParsedField]) -> bool {
+    fields
+        .iter()
+        .any(|field| field.type_code == 19 && field.field_code == 1)
+}
+
+fn preserve_directory_indexes_from_existing(
+    key: &crate::ledger::Key,
+    rebuilt: Vec<u8>,
+    existing: &[u8],
+) -> Vec<u8> {
+    let Ok(existing_dir) = crate::ledger::DirectoryNode::decode(existing, key.0) else {
+        return rebuilt;
+    };
+    let Ok(mut rebuilt_dir) = crate::ledger::DirectoryNode::decode(&rebuilt, key.0) else {
+        return rebuilt;
+    };
+
+    let mut changed = false;
+    for index in existing_dir.indexes {
+        if !rebuilt_dir
+            .indexes
+            .iter()
+            .any(|candidate| *candidate == index)
+        {
+            rebuilt_dir.indexes.push(index);
+            changed = true;
+        }
+    }
+    if !changed {
+        return rebuilt;
+    }
+
+    rebuilt_dir.raw_sle = None;
+    rebuilt_dir.encode()
 }
 
 fn directory_member_frontier_keys_from_raw(
@@ -726,6 +762,7 @@ fn expand_authoritative_directory_scope_with_sources(
     extra_raw_sources: &[&std::collections::HashMap<[u8; 32], Vec<u8>>],
     keys: &mut std::collections::BTreeSet<crate::ledger::Key>,
 ) {
+    const AUTHORITATIVE_REPAIR_SCOPE_MAX_KEYS: usize = 1_024;
     let mut frontier: std::collections::VecDeque<crate::ledger::Key> =
         keys.iter().copied().collect();
     let mut visited = std::collections::BTreeSet::new();
@@ -738,6 +775,9 @@ fn expand_authoritative_directory_scope_with_sources(
             continue;
         };
         for related in authoritative_related_scope_keys_from_raw(key, &raw) {
+            if keys.len() >= AUTHORITATIVE_REPAIR_SCOPE_MAX_KEYS && !keys.contains(&related) {
+                continue;
+            }
             if keys.insert(related) {
                 frontier.push_back(related);
             }
@@ -1535,6 +1575,16 @@ fn apply_metadata_patches(
         crate::ledger::close::collect_created_keys_referenced_later_from_sorted_meta(
             all_meta.iter().map(|(_, _, nodes)| nodes.as_slice()),
         );
+    let mut seen_from_later = std::collections::HashSet::<crate::ledger::Key>::new();
+    let mut keys_referenced_later = std::collections::HashSet::<crate::ledger::Key>::new();
+    for (_, _, nodes) in all_meta.iter().rev() {
+        for node in nodes.iter().rev() {
+            let key = crate::ledger::Key(node.ledger_index);
+            if !seen_from_later.insert(key) {
+                keys_referenced_later.insert(key);
+            }
+        }
+    }
     if byte_diff_mode {
         info!(
             "BYTE DIFF seq={}: txs_with_meta={} sorted_meta_entries={}",
@@ -1590,6 +1640,7 @@ fn apply_metadata_patches(
                             pays_issuer: pays_iss,
                             gets_currency: gets_cur,
                             gets_issuer: gets_iss,
+                            domain_id: None,
                         },
                     )
                     .0;
@@ -1835,19 +1886,32 @@ fn apply_metadata_patches(
                 crate::ledger::meta::Action::Modified => {
                     let related_offer_book =
                         related_offer_book_for_directory_node(node, &tx_book_dirs);
-                    if let Some(override_sle) = modified_dir_overrides.get(&key).cloned() {
+                    let allow_modified_override = !keys_referenced_later.contains(&key);
+                    if allow_modified_override {
+                        if let Some(override_sle) = modified_dir_overrides.get(&key).cloned() {
+                            if byte_diff_mode {
+                                info!(
+                                    "BYTE DIFF seq={}: MODIFY-OVERRIDE key={} type={:04X} sle_len={} tx_hash={}",
+                                    ledger_seq,
+                                    hex::encode_upper(&key.0[..8]),
+                                    node.entry_type,
+                                    override_sle.len(),
+                                    hex::encode_upper(&tx_hash[..8]),
+                                );
+                            }
+                            tx_ops.push((key, node.entry_type, Some(override_sle), false));
+                            continue;
+                        }
+                    } else if byte_diff_mode && modified_dir_overrides.contains_key(&key) {
                         if byte_diff_mode {
                             info!(
-                                "BYTE DIFF seq={}: MODIFY-OVERRIDE key={} type={:04X} sle_len={} tx_hash={}",
+                                "BYTE DIFF seq={}: MODIFY-OVERRIDE-DEFERRED key={} type={:04X} tx_hash={}",
                                 ledger_seq,
                                 hex::encode_upper(&key.0[..8]),
                                 node.entry_type,
-                                override_sle.len(),
                                 hex::encode_upper(&tx_hash[..8]),
                             );
                         }
-                        tx_ops.push((key, node.entry_type, Some(override_sle), false));
-                        continue;
                     }
                     let norm_fields = normalize_directory_fields(node.entry_type, &node.fields);
                     let existing = local_before
@@ -1857,23 +1921,34 @@ fn apply_metadata_patches(
                         .or_else(|| state.get_raw_owned(&key));
                     let created_earlier_in_ledger = created_seen.contains_key(&node.ledger_index);
                     if node.entry_type == 0x0064 {
-                        let has_indexes = node
-                            .fields
-                            .iter()
-                            .any(|f| f.type_code == 19 && f.field_code == 1);
+                        let has_indexes = metadata_fields_include_directory_indexes(&node.fields);
                         if !has_indexes {
-                            if let Some(override_sle) = modified_dir_overrides.get(&key).cloned() {
-                                if byte_diff_mode && watch_directory_key(&node.ledger_index) {
-                                    info!(
-                                        "DIR WATCH seq={} action=Modified key={} source=override sle_len={} tx_hash={}",
-                                        ledger_seq,
-                                        hex::encode_upper(node.ledger_index),
-                                        override_sle.len(),
-                                        hex::encode_upper(&tx_hash[..8]),
-                                    );
+                            if allow_modified_override {
+                                if let Some(override_sle) =
+                                    modified_dir_overrides.get(&key).cloned()
+                                {
+                                    if byte_diff_mode && watch_directory_key(&node.ledger_index) {
+                                        info!(
+                                            "DIR WATCH seq={} action=Modified key={} source=override sle_len={} tx_hash={}",
+                                            ledger_seq,
+                                            hex::encode_upper(node.ledger_index),
+                                            override_sle.len(),
+                                            hex::encode_upper(&tx_hash[..8]),
+                                        );
+                                    }
+                                    tx_ops.push((key, node.entry_type, Some(override_sle), false));
+                                    continue;
                                 }
-                                tx_ops.push((key, node.entry_type, Some(override_sle), false));
-                                continue;
+                            } else if byte_diff_mode
+                                && watch_directory_key(&node.ledger_index)
+                                && modified_dir_overrides.contains_key(&key)
+                            {
+                                warn!(
+                                    "DIR WATCH seq={} action=Modified key={} source=patch_fallback reason=override_deferred_until_last_touch tx_hash={}",
+                                    ledger_seq,
+                                    hex::encode_upper(node.ledger_index),
+                                    hex::encode_upper(&tx_hash[..8]),
+                                );
                             } else if byte_diff_mode && watch_directory_key(&node.ledger_index) {
                                 warn!(
                                     "DIR WATCH seq={} action=Modified key={} source=patch_fallback reason=no_override tx_hash={}",
@@ -1930,6 +2005,13 @@ fn apply_metadata_patches(
                                 new_ptid,
                                 new_ptseq,
                             );
+                            let rebuilt = if node.entry_type == 0x0064
+                                && !metadata_fields_include_directory_indexes(&node.fields)
+                            {
+                                preserve_directory_indexes_from_existing(&key, rebuilt, &e)
+                            } else {
+                                rebuilt
+                            };
                             if byte_diff_mode {
                                 info!(
                                     "BYTE DIFF seq={}: MODIFY-REBUILD key={} type={:04X} before_len={} after_len={} prev_fields={} final_fields={} tx_hash={} before_prefix={} after_prefix={}",
@@ -2117,7 +2199,7 @@ fn apply_metadata_patches(
                             hex::encode_upper(&key.0[..8]),
                             node.entry_type,
                             node.fields.len(),
-                            hex::encode_upper(&tx_hash[..8]),
+                            hex::encode_upper(tx_hash),
                         );
                     }
                     crate::ledger::close::remove_directory_entries_for_deleted_sle(
@@ -2410,6 +2492,9 @@ async fn fetch_modified_overrides(
     meta_with_hashes: &[([u8; 32], Vec<u8>)],
 ) -> std::collections::HashMap<crate::ledger::Key, Vec<u8>> {
     const OVERRIDE_FETCH_TIMEOUT_SECS: u64 = 5;
+    const OVERRIDE_RETRY_TIMEOUT_SECS: u64 = 8;
+    const OVERRIDE_RETRY_ATTEMPTS: usize = 3;
+    const RETRY_CONCURRENCY: usize = 16;
     let mut keys = std::collections::BTreeSet::new();
     for (_tx_hash, meta_blob) in meta_with_hashes {
         let nodes =
@@ -2425,8 +2510,9 @@ async fn fetch_modified_overrides(
     }
     let total = keys.len();
     let mut out = std::collections::HashMap::new();
+    let mut statuses = std::collections::HashMap::new();
     let mut join_set = tokio::task::JoinSet::new();
-    for key in keys {
+    for &key in &keys {
         let host = rpc_host.to_string();
         join_set.spawn(async move {
             let req = format!(
@@ -2436,27 +2522,88 @@ async fn fetch_modified_overrides(
             );
             let fetched = tokio::time::timeout(
                 std::time::Duration::from_secs(OVERRIDE_FETCH_TIMEOUT_SECS),
-                fetch_sle_binary(&host, rpc_port, &req),
+                fetch_sle_binary_status(&host, rpc_port, &req),
             )
             .await
-            .ok()
-            .flatten();
+            .unwrap_or(RpcLedgerEntryFetch::Unavailable);
             (key, fetched)
         });
     }
     while let Some(res) = join_set.join_next().await {
-        if let Ok((key, Some(data))) = res {
-            out.insert(key, data);
+        if let Ok((key, fetched)) = res {
+            if let RpcLedgerEntryFetch::Found(data) = &fetched {
+                out.insert(key, data.clone());
+            }
+            statuses.insert(key, fetched);
         }
     }
+
+    let misses: Vec<crate::ledger::Key> = keys
+        .iter()
+        .copied()
+        .filter(|key| {
+            !matches!(
+                statuses.get(key),
+                Some(RpcLedgerEntryFetch::Found(_)) | Some(RpcLedgerEntryFetch::NotFound)
+            )
+        })
+        .collect();
+    let mut retry_set = tokio::task::JoinSet::new();
+    let mut i = 0usize;
+    while i < misses.len() || !retry_set.is_empty() {
+        while i < misses.len() && retry_set.len() < RETRY_CONCURRENCY {
+            let key = misses[i];
+            i += 1;
+            let host = rpc_host.to_string();
+            retry_set.spawn(async move {
+                let req = format!(
+                    r#"{{"method":"ledger_entry","params":[{{"index":"{}","ledger_index":{},"binary":true}}]}}"#,
+                    hex::encode(key.0),
+                    ledger_seq
+                );
+                let mut fetched = RpcLedgerEntryFetch::Unavailable;
+                for _ in 0..OVERRIDE_RETRY_ATTEMPTS {
+                    fetched = tokio::time::timeout(
+                        std::time::Duration::from_secs(OVERRIDE_RETRY_TIMEOUT_SECS),
+                        fetch_sle_binary_status(&host, rpc_port, &req),
+                    )
+                    .await
+                    .unwrap_or(RpcLedgerEntryFetch::Unavailable);
+                    if !matches!(fetched, RpcLedgerEntryFetch::Unavailable) {
+                        break;
+                    }
+                }
+                (key, fetched)
+            });
+        }
+        if let Some(joined) = retry_set.join_next().await {
+            if let Ok((key, fetched)) = joined {
+                if let RpcLedgerEntryFetch::Found(data) = &fetched {
+                    out.insert(key, data.clone());
+                }
+                statuses.insert(key, fetched);
+            }
+        }
+    }
+
     info!(
-        "follower: modified overrides fetched {}/{} for ledger {} via {}:{} ({}s timeout each)",
+        "follower: modified overrides fetched {}/{} for ledger {} via {}:{} (not_found={} unavailable={} {}s initial timeout, {} retry timeout x{} attempts)",
         out.len(),
         total,
         ledger_seq,
         rpc_host,
         rpc_port,
+        statuses
+            .values()
+            .filter(|status| matches!(status, RpcLedgerEntryFetch::NotFound))
+            .count(),
+        statuses
+            .values()
+            .filter(|status| matches!(status, RpcLedgerEntryFetch::Unavailable))
+            .count(),
         OVERRIDE_FETCH_TIMEOUT_SECS,
+        OVERRIDE_RETRY_TIMEOUT_SECS,
+        OVERRIDE_RETRY_ATTEMPTS,
     );
     out
 }
@@ -3086,7 +3233,13 @@ fn should_attempt_authoritative_reconcile(
     first_post_sync_seq: Option<u32>,
     seq: u32,
 ) -> bool {
-    sync_complete && !matched && first_post_sync_seq != Some(seq)
+    hash_diff_repair_enabled() && !matched && (sync_complete || first_post_sync_seq == Some(seq))
+}
+
+fn hash_diff_repair_enabled() -> bool {
+    std::env::var("XLEDGRSV2BETA_ALLOW_HASH_DIFF_REPAIR")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn try_flush_follow_state(state: &mut crate::ledger::LedgerState) -> std::io::Result<[u8; 32]> {
@@ -3107,7 +3260,6 @@ pub async fn run_follower(
     storage: Arc<Storage>,
     follower_state: Arc<FollowerState>,
     shared_state: Arc<tokio::sync::RwLock<crate::node::SharedState>>,
-    _diff_sync_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<crate::proto::TmLedgerData>>>,
     inbound_ledgers: Arc<std::sync::Mutex<crate::ledger::inbound::InboundLedgers>>,
 ) {
     follower_state.running.store(true, Ordering::SeqCst);
@@ -3479,7 +3631,7 @@ pub async fn run_follower(
         );
         let mut watch_rx = {
             let mut guard = inbound_ledgers.lock().unwrap_or_else(|e| e.into_inner());
-            let rx = guard.acquire(
+            let rx = guard.acquire_tx_only(
                 ledger_hash,
                 validated,
                 crate::ledger::inbound::InboundReason::History,
@@ -3736,38 +3888,31 @@ pub async fn run_follower(
 
             // ── Parent linkage check ───────────────────────────────────
             // The acquired header must chain to `prev_header`. If not,
-            // this is a gap or wrong branch — reset prev_header to this
-            // header (treat as a new bootstrap point).
+            // this is a gap or wrong branch. Reject the candidate and retry
+            // this sequence until a header linked to our parent arrives.
             if seq_header.parent_hash != parent.hash {
                 let mismatches = follower_state.hash_mismatches.load(Ordering::Relaxed);
-                let _ = mismatches; // always accept in divergent-tolerant mode
-                if false {
-                    warn!(
-                        "follower: parent mismatch for seq={} — expected parent={} got={} (rejecting candidate, retrying same seq)",
-                        seq_header.sequence,
-                        hex::encode_upper(&parent.hash[..8]),
-                        hex::encode_upper(&seq_header.parent_hash[..8]),
-                    );
-                    {
-                        let mut guard = inbound_ledgers.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.reject_seq_candidate(seq_header.sequence, seq_header.hash);
-                    }
-                    {
-                        let mut state = shared_state.write().await;
-                        if state.validated_hashes.get(&seq_header.sequence).copied()
-                            == Some(seq_header.hash)
-                        {
-                            state.validated_hashes.remove(&seq_header.sequence);
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    continue;
-                }
-                // In divergent mode: accept the rippled header despite parent mismatch
-                info!(
-                    "follower: parent mismatch for seq={} (divergent mode, {} prior mismatches) — accepting anyway",
-                    seq_header.sequence, mismatches,
+                warn!(
+                    "follower: parent mismatch for seq={} — expected parent={} got={} ({} prior hash mismatches; rejecting candidate, retrying same seq)",
+                    seq_header.sequence,
+                    hex::encode_upper(&parent.hash[..8]),
+                    hex::encode_upper(&seq_header.parent_hash[..8]),
+                    mismatches,
                 );
+                {
+                    let mut guard = inbound_ledgers.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.reject_seq_candidate(seq_header.sequence, seq_header.hash);
+                }
+                {
+                    let mut state = shared_state.write().await;
+                    if state.validated_hashes.get(&seq_header.sequence).copied()
+                        == Some(seq_header.hash)
+                    {
+                        state.validated_hashes.remove(&seq_header.sequence);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
             }
 
             let seq = seq_header.sequence;
@@ -4538,8 +4683,9 @@ pub async fn run_follower(
 
             // Hash diff diagnostic: log both hashes for every built ledger.
             // Only run the heavyweight RPC reconcile path once sync is fully
-            // complete. The first post-sync mismatch is our forensic capture
-            // point; trying to reconcile there can stall bundle capture.
+            // complete. With repair explicitly enabled, attempt recovery even
+            // for the first post-sync ledger; if it cannot resolve, the
+            // forensic capture path below still preserves the evidence.
             if hash_check_ready && !matched {
                 warn!(
                     "HASH DIFF seq={}: local={} network={} parent_used={}",
@@ -4548,6 +4694,17 @@ pub async fn run_follower(
                     hex::encode_upper(&seq_account_hash[..16]),
                     hex::encode_upper(&replay_result.header.parent_hash[..8]),
                 );
+                if !hash_diff_repair_enabled() {
+                    error!(
+                        "follower: hash mismatch at seq={} — requesting resync and stopping before consensus can advance divergent state",
+                        seq,
+                    );
+                    follower_state
+                        .hash_mismatches
+                        .fetch_add(1, Ordering::Relaxed);
+                    request_resync_and_stop_follower(&follower_state);
+                    return;
+                }
             }
 
             if should_attempt_authoritative_reconcile(
@@ -4570,6 +4727,13 @@ pub async fn run_follower(
                     );
                     keys.into_iter().collect()
                 };
+                info!(
+                    "follower: authoritative repair scope seq={} keys={} post_state_keys={} repair_keys={}",
+                    seq,
+                    repair_scope.len(),
+                    post_state.len(),
+                    authoritative_repair_keys.len(),
+                );
                 let explicit_delete_keys = metadata_deleted_keys.clone();
 
                 if !repair_scope.is_empty() {
@@ -5986,41 +6150,51 @@ pub async fn run_follower(
                 let records2 = replay_result.tx_records.clone();
                 let is_first_post_sync = first_post_sync_seq == Some(header2.sequence);
                 let submit_t = std::time::Instant::now();
-                tokio::task::spawn_blocking(move || {
+                let persist_result = tokio::task::spawn_blocking(move || {
                     let queue_ms = submit_t.elapsed().as_millis();
                     let persist_t0 = std::time::Instant::now();
 
-                    // take_dirty (under lock) — NuDB handles persistence
-                    {
-                        let mut ls = ls_arc2.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Err(e) = ls.try_take_dirty() {
-                            error!(
-                                "follower persist seq={} failed to flush NuDB state: {}",
-                                seq, e
-                            );
-                            request_resync_and_stop_follower(&follower_state_for_persist);
-                            pif.fetch_sub(1, Ordering::Relaxed);
-                            return;
+                    let result = (|| -> Result<(u128, u128, u128), String> {
+                        // take_dirty (under lock) — NuDB handles persistence
+                        {
+                            let mut ls = ls_arc2.lock().unwrap_or_else(|e| e.into_inner());
+                            ls.try_take_dirty().map_err(|e| {
+                                format!(
+                                    "failed to flush NuDB state before checkpoint advance: {e}"
+                                )
+                            })?;
                         }
-                    }
 
-                    let ledger_t0 = std::time::Instant::now();
-                    let _ = store2.save_ledger(&header2, &records2);
-                    let ledger_ms = ledger_t0.elapsed().as_millis();
+                        let ledger_t0 = std::time::Instant::now();
+                        store2
+                            .save_validated_checkpoint(&header2, &records2, true)
+                            .map_err(|e| format!("failed to save validated checkpoint: {e}"))?;
+                        let ledger_ms = ledger_t0.elapsed().as_millis();
 
-                    let meta_t0 = std::time::Instant::now();
-                    let header_hash = hex::encode_upper(header2.hash);
-                    let _ = store2.save_meta(header2.sequence, &header_hash, &header2);
-                    let _ = store2.persist_sync_anchor(&header2);
-                    let meta_ms = meta_t0.elapsed().as_millis();
+                        let meta_t0 = std::time::Instant::now();
+                        let meta_ms = meta_t0.elapsed().as_millis();
 
-                    let flush_t0 = std::time::Instant::now();
-                    let _ = store2.flush();
-                    let flush_ms = flush_t0.elapsed().as_millis();
+                        let flush_t0 = std::time::Instant::now();
+                        store2
+                            .flush()
+                            .map_err(|e| format!("failed to flush follower storage: {e}"))?;
+                        let flush_ms = flush_t0.elapsed().as_millis();
+
+                        Ok((ledger_ms, meta_ms, flush_ms))
+                    })();
 
                     let total_ms = persist_t0.elapsed().as_millis();
                     pif.fetch_sub(1, Ordering::Relaxed);
                     let remaining = pif.load(Ordering::Relaxed);
+
+                    let (ledger_ms, meta_ms, flush_ms) = match result {
+                        Ok(timings) => timings,
+                        Err(err) => {
+                            error!("follower persist seq={} failed: {}", seq, err);
+                            request_resync_and_stop_follower(&follower_state_for_persist);
+                            return Err(err);
+                        }
+                    };
 
                     tracing::info!(
                         "follower persist seq={}: queue={}ms ledger={}ms meta={}ms flush={}ms total={}ms in_flight={}",
@@ -6035,8 +6209,18 @@ pub async fn run_follower(
                             records2.len(),
                         );
                     }
-                });
-                // Don't .await — fire and forget
+                    Ok(())
+                })
+                .await;
+                match persist_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return,
+                    Err(e) => {
+                        error!("follower persist task panicked: {}", e);
+                        request_resync_and_stop_follower(&follower_state);
+                        return;
+                    }
+                }
             } else {
                 let ls_arc2 = ledger_state.clone();
                 tokio::task::spawn_blocking(move || {
@@ -6407,6 +6591,7 @@ fn parse_account_from_json(fields: &Value) -> Option<crate::ledger::AccountRoot>
     let flags = fields["Flags"].as_u64().unwrap_or(0) as u32;
     let regular_key = parse_account_id_from_json(fields, "RegularKey");
     let minted_nftokens = fields["MintedNFTokens"].as_u64().unwrap_or(0) as u32;
+    let first_nftoken_sequence = fields["FirstNFTokenSequence"].as_u64().unwrap_or(0) as u32;
     let burned_nftokens = fields["BurnedNFTokens"].as_u64().unwrap_or(0) as u32;
     let transfer_rate = fields["TransferRate"].as_u64().unwrap_or(0) as u32;
     let domain = fields["Domain"]
@@ -6426,6 +6611,7 @@ fn parse_account_from_json(fields: &Value) -> Option<crate::ledger::AccountRoot>
         flags,
         regular_key,
         minted_nftokens,
+        first_nftoken_sequence,
         burned_nftokens,
         transfer_rate,
         domain,
@@ -6571,6 +6757,7 @@ fn parse_check_from_json(fields: &Value) -> Option<crate::ledger::Check> {
         destination_node: 0,
         source_tag: None,
         destination_tag: None,
+        invoice_id: None,
         raw_sle: None,
     })
 }
@@ -6682,6 +6869,14 @@ fn parse_nft_offer_from_json(fields: &Value) -> Option<crate::ledger::NFTokenOff
     let destination = parse_account_id_from_json(fields, "Destination");
     let expiration = fields["Expiration"].as_u64().map(|e| e as u32);
     let flags = fields["Flags"].as_u64().unwrap_or(0) as u32;
+    let owner_node = fields["OwnerNode"]
+        .as_str()
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+    let nft_offer_node = fields["NFTokenOfferNode"]
+        .as_str()
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
 
     Some(crate::ledger::NFTokenOffer {
         account,
@@ -6691,8 +6886,8 @@ fn parse_nft_offer_from_json(fields: &Value) -> Option<crate::ledger::NFTokenOff
         destination,
         expiration,
         flags,
-        owner_node: 0,
-        nft_offer_node: 0,
+        owner_node,
+        nft_offer_node,
         previous_txn_id: [0u8; 32],
         previous_txn_lgrseq: 0,
         raw_sle: None,
@@ -6810,12 +7005,7 @@ fn parse_amount_json(val: &Value) -> Option<crate::transaction::Amount> {
 
 /// Full-history XRPL servers for fallback when local rippled doesn't have the ledger.
 /// All verified full-history (complete_ledgers starting from 32570).
-const PUBLIC_SERVERS: &[(&str, u16)] = &[
-    ("s1.ripple.com", 51234),
-    ("s2.ripple.com", 51234),
-    ("44.225.136.208", 51234),
-    ("54.208.98.161", 51234),
-];
+const PUBLIC_SERVERS: &[(&str, u16)] = &[("s1.ripple.com", 51234), ("s2.ripple.com", 51234)];
 
 /// Round-robin counter for distributing requests across public servers.
 static RR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -7130,7 +7320,7 @@ async fn compare_engine_touched_keys(
 async fn reconcile_touched_keys_with_rpc(
     ledger_state: Arc<std::sync::Mutex<crate::ledger::LedgerState>>,
     touched_keys: &[crate::ledger::Key],
-    _explicit_delete_keys: &std::collections::BTreeSet<crate::ledger::Key>,
+    explicit_delete_keys: &std::collections::BTreeSet<crate::ledger::Key>,
     seq: u32,
     rpc_host: &str,
     rpc_port: u16,
@@ -7145,13 +7335,21 @@ async fn reconcile_touched_keys_with_rpc(
     const RPC_FETCH_MAX_IN_FLIGHT: usize = 24;
     let mut fetched: std::collections::HashMap<crate::ledger::Key, RpcLedgerEntryFetch> =
         std::collections::HashMap::new();
+    let mut keys_to_fetch = Vec::with_capacity(touched_keys.len());
+    for key in touched_keys {
+        if explicit_delete_keys.contains(key) {
+            fetched.insert(*key, RpcLedgerEntryFetch::NotFound);
+        } else {
+            keys_to_fetch.push(*key);
+        }
+    }
     {
         let mut tasks = tokio::task::JoinSet::new();
         let mut next_idx = 0usize;
         let mut in_flight = 0usize;
-        while next_idx < touched_keys.len() || in_flight > 0 {
-            while in_flight < RPC_FETCH_MAX_IN_FLIGHT && next_idx < touched_keys.len() {
-                let key = touched_keys[next_idx];
+        while next_idx < keys_to_fetch.len() || in_flight > 0 {
+            while in_flight < RPC_FETCH_MAX_IN_FLIGHT && next_idx < keys_to_fetch.len() {
+                let key = keys_to_fetch[next_idx];
                 next_idx += 1;
                 in_flight += 1;
                 let host = rpc_host.to_string();
@@ -7210,13 +7408,14 @@ async fn reconcile_touched_keys_with_rpc(
         }
     }
     info!(
-        "follower: touched-key RPC reconcile seq={}: upserted={} removed={} not_found={} unavailable={} touched={}",
+        "follower: touched-key RPC reconcile seq={}: upserted={} removed={} not_found={} unavailable={} touched={} explicit_deletes={}",
         seq,
         upserted,
         removed,
         not_found,
         unavailable,
         touched_keys.len(),
+        explicit_delete_keys.len(),
     );
     (
         upserted,
@@ -8048,14 +8247,34 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_reconcile_skips_first_post_sync_mismatch() {
+    fn saturated_prefetch_channel_fails_nonblocking() {
+        let follower = FollowerState::new();
+        for _ in 0..64 {
+            follower
+                .prefetch_tx
+                .try_send(crate::proto::TmLedgerData::default())
+                .expect("prefetch capacity should accept initial items");
+        }
+
+        let err = follower
+            .prefetch_tx
+            .try_send(crate::proto::TmLedgerData::default())
+            .expect_err("saturated prefetch should not await route tasks");
+        assert!(matches!(
+            err,
+            tokio::sync::mpsc::error::TrySendError::Full(_)
+        ));
+    }
+
+    #[test]
+    fn authoritative_reconcile_is_opt_in_for_hash_mismatches() {
         assert!(!should_attempt_authoritative_reconcile(
             true,
             false,
             Some(103_674_820),
             103_674_820,
         ));
-        assert!(should_attempt_authoritative_reconcile(
+        assert!(!should_attempt_authoritative_reconcile(
             true,
             false,
             Some(103_674_820),
@@ -8086,6 +8305,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -8135,6 +8355,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -8774,6 +8995,7 @@ mod tests {
             destination_node: 12,
             source_tag: None,
             destination_tag: None,
+            invoice_id: None,
             raw_sle: None,
         };
         let check_key = check.key();
@@ -9561,7 +9783,7 @@ mod tests {
             prev_txn_id: None,
             prev_txn_lgrseq: None,
         }];
-        let metadata = crate::ledger::meta::encode_metadata(0, 0, &nodes);
+        let metadata = crate::ledger::meta::encode_metadata(0, 0, &nodes, None);
 
         let stats = apply_metadata_patches(
             &[([0xAB; 32], metadata)],
@@ -9666,7 +9888,7 @@ mod tests {
                 prev_txn_lgrseq: None,
             },
         ];
-        let metadata = crate::ledger::meta::encode_metadata(0, 0, &nodes);
+        let metadata = crate::ledger::meta::encode_metadata(0, 0, &nodes, None);
 
         let stats = apply_metadata_patches(
             &[([0xAB; 32], metadata)],
@@ -9698,6 +9920,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -9726,6 +9949,7 @@ mod tests {
                 prev_txn_id: None,
                 prev_txn_lgrseq: None,
             }],
+            None,
         );
         let mut created_overrides = std::collections::HashMap::new();
         created_overrides.insert(key, RpcLedgerEntryFetch::NotFound);
@@ -9860,6 +10084,7 @@ mod tests {
                 prev_txn_id: None,
                 prev_txn_lgrseq: None,
             }],
+            None,
         );
         let mut created_overrides = std::collections::HashMap::new();
         created_overrides.insert(offer_key, RpcLedgerEntryFetch::NotFound);
@@ -10037,6 +10262,7 @@ mod tests {
                 prev_txn_id: None,
                 prev_txn_lgrseq: None,
             }],
+            None,
         );
 
         let _stats = apply_metadata_patches(
@@ -10152,6 +10378,7 @@ mod tests {
                 prev_txn_id: None,
                 prev_txn_lgrseq: None,
             }],
+            None,
         );
         let per_tx_local_touched = vec![crate::ledger::close::TxLocalTouched {
             tx_id: tx_hash,
@@ -10191,6 +10418,7 @@ mod tests {
             flags: 0,
             regular_key: None,
             minted_nftokens: 0,
+            first_nftoken_sequence: 0,
             burned_nftokens: 0,
             transfer_rate: 0,
             domain: Vec::new(),
@@ -10228,6 +10456,7 @@ mod tests {
                 prev_txn_id: None,
                 prev_txn_lgrseq: None,
             }],
+            None,
         );
         let per_tx_local_touched = vec![crate::ledger::close::TxLocalTouched {
             tx_id: tx_hash,

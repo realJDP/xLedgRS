@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Peer Handshake piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -242,11 +241,15 @@ impl Node {
 
         let status_msg = {
             let state = self.state.read().await;
-            crate::network::relay::encode_status_change(
+            let ledger_range =
+                (state.ctx.ledger_seq > 0).then_some((state.ctx.ledger_seq, state.ctx.ledger_seq));
+            crate::network::relay::encode_status_change_full(
                 crate::proto::NodeStatus::NsConnected,
                 crate::proto::NodeEvent::NeAcceptedLedger,
                 state.ctx.ledger_seq,
                 &state.ctx.ledger_header.hash,
+                Some(&state.ctx.ledger_header.parent_hash),
+                ledger_range,
             )
         };
         let _ = stream.write_all(&status_msg.encode()).await;
@@ -305,7 +308,7 @@ impl Node {
             .info
             .as_ref()
             .and_then(|i| i.features.as_ref())
-            .map(|f| f.contains("lz4"))
+            .map(|f| crate::network::handshake::protocol_ctl_advertises_lz4(f))
             .unwrap_or(false);
 
         Some(use_compression)

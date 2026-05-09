@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Integration test coverage for release and parity safety.
 //! Integration tests — spin up real nodes and verify they talk to each other.
 //!
 //! Each test binds on a random port (port 0) so tests never conflict.
@@ -31,6 +30,7 @@ async fn start_node() -> (Arc<Node>, std::net::SocketAddr, std::net::SocketAddr)
         rpc_addr,
         ws_addr: free_addr().await,
         max_peers: 5,
+        route_worker_count: 1,
         bootstrap: vec![],
         use_tls: false,
         data_dir: None,
@@ -44,8 +44,11 @@ async fn start_node() -> (Arc<Node>, std::net::SocketAddr, std::net::SocketAddr)
         online_delete: None,
         standalone: false,
         enable_consensus_close_loop: false,
+        allow_node_key_consensus: false,
         validator_token: None,
         validation_seed: None,
+        validation_secret_key: None,
+        sync_tuning: Default::default(),
         post_sync_checkpoint_script: None,
     };
     let node = Arc::new(Node::new(config));
@@ -134,7 +137,7 @@ async fn test_rpc_submit_real_tx() {
         .destination("rPT1Sjq2YGrBMTttX4GZHjKu9dyfzbpAYe")
         .unwrap()
         .amount(Amount::Xrp(1_000_000))
-        .fee(12)
+        .fee(10_000)
         .sequence(1)
         .sign(&kp)
         .unwrap();
@@ -200,6 +203,7 @@ async fn test_outbound_node_sends_handshake() {
         rpc_addr,
         ws_addr: free_addr().await,
         max_peers: 5,
+        route_worker_count: 1,
         bootstrap: vec![target_addr],
         use_tls: false,
         data_dir: None,
@@ -213,8 +217,11 @@ async fn test_outbound_node_sends_handshake() {
         online_delete: None,
         standalone: false,
         enable_consensus_close_loop: false,
+        allow_node_key_consensus: false,
         validator_token: None,
         validation_seed: None,
+        validation_secret_key: None,
+        sync_tuning: Default::default(),
         post_sync_checkpoint_script: None,
     };
     let node = Arc::new(Node::new(config));
@@ -257,6 +264,7 @@ async fn test_two_nodes_connect() {
         rpc_addr: free_addr().await,
         ws_addr: free_addr().await,
         max_peers: 5,
+        route_worker_count: 1,
         bootstrap: vec![peer_addr_a],
         use_tls: false,
         data_dir: None,
@@ -270,8 +278,11 @@ async fn test_two_nodes_connect() {
         online_delete: None,
         standalone: false,
         enable_consensus_close_loop: false,
+        allow_node_key_consensus: false,
         validator_token: None,
         validation_seed: None,
+        validation_secret_key: None,
+        sync_tuning: Default::default(),
         post_sync_checkpoint_script: None,
     };
     let node_b = Arc::new(Node::new(config_b));
@@ -301,6 +312,7 @@ async fn test_two_tls_nodes_connect() {
         rpc_addr: rpc_addr_a,
         ws_addr: free_addr().await,
         max_peers: 5,
+        route_worker_count: 1,
         bootstrap: vec![],
         use_tls: true,
         data_dir: None,
@@ -314,8 +326,11 @@ async fn test_two_tls_nodes_connect() {
         online_delete: None,
         standalone: false,
         enable_consensus_close_loop: false,
+        allow_node_key_consensus: false,
         validator_token: None,
         validation_seed: None,
+        validation_secret_key: None,
+        sync_tuning: Default::default(),
         post_sync_checkpoint_script: None,
     }));
     node_a.clone().start().await.unwrap();
@@ -326,6 +341,7 @@ async fn test_two_tls_nodes_connect() {
         rpc_addr: free_addr().await,
         ws_addr: free_addr().await,
         max_peers: 5,
+        route_worker_count: 1,
         bootstrap: vec![peer_addr_a],
         use_tls: true,
         data_dir: None,
@@ -339,8 +355,11 @@ async fn test_two_tls_nodes_connect() {
         online_delete: None,
         standalone: false,
         enable_consensus_close_loop: false,
+        allow_node_key_consensus: false,
         validator_token: None,
         validation_seed: None,
+        validation_secret_key: None,
+        sync_tuning: Default::default(),
         post_sync_checkpoint_script: None,
     }));
     node_b.clone().start().await.unwrap();

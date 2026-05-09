@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Ws support for JSON-RPC and WebSocket APIs.
 //! WebSocket API server — real-time event streaming + request/response.
 //!
 //! Reuses the same `dispatch()` function as the HTTP JSON-RPC server for
@@ -156,12 +155,13 @@ impl WsEvent {
                 network_id,
                 ..
             } => {
+                let validated = !ledger_hash.is_empty() && ledger_hash.chars().any(|c| c != '0');
                 let result_code = crate::ledger::ter::token_to_code(&tx_record.result)
                     .map(|r| r.code())
                     .unwrap_or(0);
                 let mut out = json!({
                     "type":           "transaction",
-                    "validated":      true,
+                    "validated":      validated,
                     "status":         "closed",
                     "ledger_index":   tx_record.ledger_seq,
                     "ledger_hash":    ledger_hash,
@@ -380,6 +380,7 @@ fn parse_book_subscription(book: &Value) -> Result<BookSubscription, crate::rpc:
         pays_issuer: taker_pays.1,
         gets_currency: taker_gets.0,
         gets_issuer: taker_gets.1,
+        domain_id: None,
     };
     let inverse = book
         .get("both")
@@ -759,19 +760,13 @@ fn hydrate_ws_read_context(shared: &crate::node::SharedState, ctx: &mut crate::r
     ctx.node_store_snapshot = shared.services.node_store_snapshot();
     ctx.fetch_pack_snapshot = shared.services.fetch_pack_snapshot();
     let mut ledger_master_snapshot = shared.services.ledger_master.snapshot();
-    if ledger_master_snapshot.validated_seq == 0 {
-        ledger_master_snapshot.validated_seq = ctx.ledger_header.sequence;
-        ledger_master_snapshot.validated_hash = ctx.ledger_hash.clone();
-        ledger_master_snapshot.open_ledger_seq = ctx.ledger_seq.saturating_add(1);
-        ledger_master_snapshot.complete_ledgers = complete_ledgers;
-        ledger_master_snapshot.last_close_time = ctx.ledger_header.close_time;
-        ledger_master_snapshot.queued_transactions = ctx
-            .tx_relay_metrics
-            .as_ref()
-            .map(|metrics| metrics.queued_transactions)
-            .unwrap_or(0);
-        ledger_master_snapshot.candidate_set_hash = hex::encode_upper(candidate_set_hash);
-    }
+    ledger_master_snapshot.complete_ledgers = complete_ledgers;
+    ledger_master_snapshot.queued_transactions = ctx
+        .tx_relay_metrics
+        .as_ref()
+        .map(|metrics| metrics.queued_transactions)
+        .unwrap_or(0);
+    ledger_master_snapshot.candidate_set_hash = hex::encode_upper(candidate_set_hash);
     ctx.ledger_master_snapshot = Some(ledger_master_snapshot);
     ctx.network_ops_snapshot = Some(crate::network::ops::NetworkOpsSnapshot::from_context(ctx));
 }
@@ -896,10 +891,13 @@ fn handle_ws_path_find(
             }
         }
         "close" => {
-            manager
+            let closed = manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .close(subscriptions.client_id);
+            if !closed {
+                return response_err(crate::rpc::RpcError::no_path_request(), id);
+            }
             subscriptions.path_find = false;
             response_ok(json!({"closed": true}), id)
         }

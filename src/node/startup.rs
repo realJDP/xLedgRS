@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Startup piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -58,19 +57,21 @@ impl Node {
 
         if !self.config.standalone {
             let node1 = self.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if let Err(e) = node1.run_peer_listener().await {
                     error!("peer listener error: {e}");
                 }
             });
+            self.track_background_task("peer_listener", handle);
         }
 
         let node2 = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = node2.run_rpc_server().await {
                 error!("RPC server error: {e}");
             }
         });
+        self.track_background_task("rpc_server", handle);
 
         if !self.config.standalone {
             let mut state = self.state.write().await;
@@ -94,11 +95,12 @@ impl Node {
                 }
                 let node3 = self.clone();
                 let addr = *addr;
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(e) = node3.dial(addr).await {
                         warn!("failed to dial bootstrap peer {addr}: {e}");
                     }
                 });
+                self.track_background_task("bootstrap_dial", handle);
             }
             info!(
                 "initial dial: localhost + {} bootstrap peers (rest via discovery ramp)",
@@ -111,20 +113,22 @@ impl Node {
             for addr in &self.config.full_history_peers {
                 let node_dh = self.clone();
                 let addr = *addr;
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(e) = node_dh.dial(addr).await {
                         warn!("failed to dial deep-history peer {addr}: {e}");
                     }
                 });
+                self.track_background_task("deep_history_dial", handle);
             }
             info!("dialing {} deep-history peers for sync", count);
         }
 
         if self.config.enable_consensus_close_loop {
             let node4 = self.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 node4.run_consensus_close_loop_supervisor().await;
             });
+            self.track_background_task("consensus_close_loop", handle);
         } else {
             info!("consensus close loop disabled; running in follower mode");
         }
@@ -140,7 +144,7 @@ impl Node {
                 .ok()
                 .and_then(|state| state.ctx.validator_site_statuses.clone());
             let shutdown = self.shutdown.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let Some(site_statuses) = site_statuses else {
                     tracing::warn!("validator list site status tracking unavailable");
                     return;
@@ -155,21 +159,24 @@ impl Node {
                 )
                 .await;
             });
+            self.track_background_task("validator_list_fetch", handle);
         }
 
         let ws_addr = self.config.ws_addr;
         let ws_tls = self.config.use_tls;
         let ws_state = self.state.clone();
         let ws_tx = self.ws_events.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             crate::rpc::ws::run_ws_server_with_sender(ws_addr, ws_tls, ws_state, ws_tx).await;
         });
+        self.track_background_task("ws_server", handle);
 
         if !self.config.standalone {
             let node5 = self.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 node5.run_discovery_loop().await;
             });
+            self.track_background_task("discovery_loop", handle);
         } else {
             info!("standalone mode enabled; peer listener, dialing, discovery, and validator list fetch are disabled");
         }
@@ -228,36 +235,40 @@ impl Node {
         {
             if !RESOURCE_MANAGER_LOOP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let node_resource = self.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     node_resource.run_resource_manager_loop().await;
                 });
+                self.track_background_task("resource_manager", handle);
             } else {
                 warn!("resource manager loop already started; skipping duplicate spawn");
             }
 
             if !LOAD_MANAGER_LOOP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let node_load = self.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     node_load.run_load_manager_loop().await;
                 });
+                self.track_background_task("load_manager", handle);
             } else {
                 warn!("load manager loop already started; skipping duplicate spawn");
             }
 
             if !SYNC_STALL_CHECKER_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let node6 = self.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     node6.run_sync_timer().await;
                 });
+                self.track_background_task("sync_timer", handle);
             } else {
                 warn!("sync timer already started; skipping duplicate spawn");
             }
 
             if !SYNC_BATCH_PROCESSOR_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let node_batch = self.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     node_batch.run_sync_data_processor().await;
                 });
+                self.track_background_task("sync_data_processor", handle);
             } else {
                 warn!("sync data processor already started; skipping duplicate spawn");
             }

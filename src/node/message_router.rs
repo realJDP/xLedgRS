@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Message Router piece of the live node runtime.
 use super::*;
 
 impl Node {
@@ -48,6 +47,8 @@ impl Node {
                         self.handle_state_node_message(peer, &ld).await;
                     } else if ld.r#type == crate::proto::TmLedgerInfoType::LiTxNode as i32 {
                         self.handle_tx_node_message(peer, &ld).await;
+                    } else if ld.r#type == crate::proto::TmLedgerInfoType::LiTsCandidate as i32 {
+                        self.handle_tx_set_candidate_message(peer, &ld).await;
                     } else {
                         debug!(
                             "received LedgerData type={} seq={} nodes={} from peer {:?}",

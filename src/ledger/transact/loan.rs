@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Loan legacy transactor for XRPL transaction apply.
 use super::{legacy_path_not_supported, TxHandler, TER};
 use crate::ledger::views::ApplyView;
 use crate::transaction::ParsedTx;
@@ -6,6 +5,10 @@ use crate::transaction::ParsedTx;
 pub struct LoanBrokerSetHandler;
 
 impl TxHandler for LoanBrokerSetHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -14,6 +17,10 @@ impl TxHandler for LoanBrokerSetHandler {
 pub struct LoanBrokerDeleteHandler;
 
 impl TxHandler for LoanBrokerDeleteHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -22,6 +29,10 @@ impl TxHandler for LoanBrokerDeleteHandler {
 pub struct LoanSetHandler;
 
 impl TxHandler for LoanSetHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -30,6 +41,10 @@ impl TxHandler for LoanSetHandler {
 pub struct LoanDeleteHandler;
 
 impl TxHandler for LoanDeleteHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -38,6 +53,10 @@ impl TxHandler for LoanDeleteHandler {
 pub struct LoanManageHandler;
 
 impl TxHandler for LoanManageHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -46,6 +65,10 @@ impl TxHandler for LoanManageHandler {
 pub struct LoanPayHandler;
 
 impl TxHandler for LoanPayHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }
@@ -55,6 +78,10 @@ impl TxHandler for LoanPayHandler {
 pub struct LoanCoverHandler;
 
 impl TxHandler for LoanCoverHandler {
+    fn preflight(&self, _tx: &ParsedTx) -> Result<(), TER> {
+        Err(legacy_path_not_supported())
+    }
+
     fn do_apply(&self, _tx: &ParsedTx, _view: &mut dyn ApplyView) -> TER {
         legacy_path_not_supported()
     }

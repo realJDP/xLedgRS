@@ -1,8 +1,8 @@
-//! xLedgRS purpose: Payment legacy transactor for XRPL transaction apply.
 use super::{legacy_path_not_supported, TecCode, TxHandler, TER};
 use crate::ledger::keylet;
 use crate::ledger::sle::{LedgerEntryType, SLE};
 use crate::ledger::views::{ApplyView, ReadView};
+use crate::transaction::Amount;
 use crate::transaction::ParsedTx;
 use std::sync::Arc;
 
@@ -20,6 +20,14 @@ impl TxHandler for PaymentHandler {
     }
 
     fn preclaim(&self, tx: &ParsedTx, view: &dyn ReadView) -> Result<(), TER> {
+        if tx
+            .amount
+            .as_ref()
+            .is_some_and(|amount| !matches!(amount, Amount::Xrp(_)))
+        {
+            return Err(legacy_path_not_supported());
+        }
+
         // Check destination exists (for XRP payments to existing accounts)
         // New accounts can be created if amount >= reserve
         let dest_id = tx.destination.unwrap();

@@ -1,4 +1,3 @@
-//! xLedgRS purpose: Load support for XRPL peer networking.
 //! Load/stall tracking for server status surfaces.
 //!
 //! xLedgRSv2Beta keeps a dedicated load-manager cycle backed by a runtime job-queue
@@ -12,6 +11,11 @@ const FEE_INC_FRACTION: u32 = 4;
 const FEE_DEC_FRACTION: u32 = 4;
 const FEE_MAX: u32 = LOAD_BASE * 1_000_000;
 const STALL_THRESHOLD: Duration = Duration::from_secs(10);
+const BOOTSTRAP_QUEUE_CAPACITY_MIN: usize = 4096;
+const BOOTSTRAP_QUEUE_CAPACITY_PER_THREAD: usize = 256;
+const LOADAVG_WARN_PER_THREAD: f64 = 1.50;
+const RSS_WARN_MB: u64 = 4 * 1024;
+const DISK_WARN_FREE_PERCENT: u8 = 10;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobTypeSnapshot {
@@ -93,10 +97,17 @@ impl JobQueue {
             .saturating_add(tracked_inbound_transactions)
             .saturating_add(active_path_requests.saturating_mul(2))
             .saturating_add(active_inbound_ledgers.saturating_mul(4));
-        let soft_capacity = queue_capacity.max(1);
         let threads = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
+        let queue_capacity = if queue_capacity == 0 {
+            threads
+                .saturating_mul(BOOTSTRAP_QUEUE_CAPACITY_PER_THREAD)
+                .max(BOOTSTRAP_QUEUE_CAPACITY_MIN)
+        } else {
+            queue_capacity
+        };
+        let soft_capacity = queue_capacity.max(1);
         let tracked_target = soft_capacity.saturating_mul(2).max(4);
         let inbound_target = soft_capacity.max(4);
         let path_target = threads.max(2);
@@ -167,6 +178,10 @@ pub struct LoadSnapshot {
     pub tracked_inbound_transactions: usize,
     pub active_path_requests: usize,
     pub active_inbound_ledgers: usize,
+    pub process_rss_mb: u64,
+    pub system_load_percent: Option<u32>,
+    pub disk_free_percent: Option<u8>,
+    pub resource_overloaded: bool,
     pub queue_depth: usize,
     pub queue_capacity: usize,
     pub queue_overloaded: bool,
@@ -197,6 +212,10 @@ impl Default for LoadSnapshot {
             tracked_inbound_transactions: 0,
             active_path_requests: 0,
             active_inbound_ledgers: 0,
+            process_rss_mb: 0,
+            system_load_percent: None,
+            disk_free_percent: None,
+            resource_overloaded: false,
             queue_depth: 0,
             queue_capacity: 0,
             queue_overloaded: false,
@@ -285,6 +304,10 @@ impl LoadSnapshot {
         self.queue_overloaded
     }
 
+    pub fn is_resource_overloaded(&self) -> bool {
+        self.resource_overloaded
+    }
+
     pub fn is_loaded_cluster(&self) -> bool {
         self.local_fee != self.load_base || self.cluster_fee != self.load_base
     }
@@ -359,9 +382,50 @@ impl LoadManager {
         self.snapshot.queue_depth = queue.queue_depth;
         self.snapshot.queue_capacity = queue.queue_capacity;
         self.snapshot.queue_fee = queue.pressure_fee(self.snapshot.load_base);
-        self.snapshot.queue_overloaded = queue.is_overloaded(self.snapshot.load_base);
+        self.snapshot.queue_overloaded = queue.overloaded;
         self.snapshot.queue_job_types = queue.job_types.clone();
         self.snapshot.local_fee = self.snapshot.local_fee.max(self.snapshot.pressure_floor());
+    }
+
+    pub fn refresh_runtime_resource_health(&mut self, sample: RuntimeResourceSnapshot) {
+        self.snapshot.process_rss_mb = sample.process_rss_mb;
+        self.snapshot.system_load_percent = sample.system_load_percent;
+        self.snapshot.disk_free_percent = sample.disk_free_percent;
+
+        let threads = self.snapshot.job_queue_threads.max(1);
+        let cpu_overloaded = sample
+            .system_load_percent
+            .is_some_and(|percent| percent >= (LOADAVG_WARN_PER_THREAD * 100.0) as u32);
+        let rss_overloaded = sample.process_rss_mb >= RSS_WARN_MB;
+        let disk_overloaded = sample
+            .disk_free_percent
+            .is_some_and(|percent| percent <= DISK_WARN_FREE_PERCENT);
+        let overloaded = cpu_overloaded || rss_overloaded || disk_overloaded;
+        self.snapshot.resource_overloaded = overloaded;
+
+        let mut fee = self.snapshot.load_base;
+        if let Some(percent) = sample.system_load_percent {
+            let per_thread = percent / threads as u32;
+            if per_thread >= 100 {
+                fee =
+                    fee.saturating_add((per_thread.min(400) / 25) * (self.snapshot.load_base / 16));
+            }
+        }
+        if sample.process_rss_mb >= RSS_WARN_MB {
+            let excess_gb = sample.process_rss_mb.saturating_sub(RSS_WARN_MB) / 1024 + 1;
+            fee = fee.saturating_add((excess_gb.min(8) as u32) * (self.snapshot.load_base / 8));
+        }
+        if let Some(percent) = sample.disk_free_percent {
+            if percent <= DISK_WARN_FREE_PERCENT {
+                fee = fee.saturating_add(
+                    (u32::from(DISK_WARN_FREE_PERCENT.saturating_sub(percent)) + 1)
+                        * (self.snapshot.load_base / 8),
+                );
+            }
+        }
+        if overloaded {
+            self.snapshot.local_fee = self.snapshot.local_fee.max(fee);
+        }
     }
 
     pub fn refresh_network_health(
@@ -468,14 +532,18 @@ impl LoadManager {
 
     pub fn run_cycle(&mut self, now: Instant) -> bool {
         self.snapshot.service_cycles = self.snapshot.service_cycles.saturating_add(1);
-        let overloaded = self.snapshot.queue_overloaded;
+        let overloaded = self.snapshot.queue_overloaded || self.snapshot.resource_overloaded;
         self.snapshot.last_cycle_reason = Some(if overloaded {
-            self.snapshot
-                .queue_job_types
-                .iter()
-                .find(|job| job.over_target)
-                .map(|job| format!("queue_overloaded:{}", job.job_type))
-                .unwrap_or_else(|| "queue_overloaded".to_string())
+            if self.snapshot.resource_overloaded && !self.snapshot.queue_overloaded {
+                "runtime_resource_overloaded".to_string()
+            } else {
+                self.snapshot
+                    .queue_job_types
+                    .iter()
+                    .find(|job| job.over_target)
+                    .map(|job| format!("queue_overloaded:{}", job.job_type))
+                    .unwrap_or_else(|| "queue_overloaded".to_string())
+            }
         } else {
             "queue_idle".to_string()
         });
@@ -546,6 +614,85 @@ impl LoadManager {
         }
         self.snapshot.local_fee != original
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeResourceSnapshot {
+    pub process_rss_mb: u64,
+    pub system_load_percent: Option<u32>,
+    pub disk_free_percent: Option<u8>,
+}
+
+pub fn runtime_resource_snapshot(data_dir: Option<&std::path::Path>) -> RuntimeResourceSnapshot {
+    RuntimeResourceSnapshot {
+        process_rss_mb: process_rss_mb(),
+        system_load_percent: system_load_percent(),
+        disk_free_percent: data_dir.and_then(disk_free_percent),
+    }
+}
+
+#[allow(deprecated)]
+pub fn process_rss_mb() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            let mut info: libc::mach_task_basic_info_data_t = std::mem::zeroed();
+            let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
+                / std::mem::size_of::<libc::natural_t>())
+                as libc::mach_msg_type_number_t;
+            let kr = libc::task_info(
+                libc::mach_task_self(),
+                libc::MACH_TASK_BASIC_INFO,
+                &mut info as *mut _ as libc::task_info_t,
+                &mut count,
+            );
+            if kr == libc::KERN_SUCCESS {
+                return info.resident_size as u64 / (1024 * 1024);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(rss_pages) = statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+                return rss_pages.saturating_mul(page_size) / (1024 * 1024);
+            }
+        }
+    }
+
+    0
+}
+
+fn system_load_percent() -> Option<u32> {
+    let mut loads = [0.0f64; 1];
+    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+    if n == 1 {
+        Some((loads[0].max(0.0) * 100.0).round() as u32)
+    } else {
+        None
+    }
+}
+
+fn disk_free_percent(path: &std::path::Path) -> Option<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    let total = stats.f_blocks;
+    if total == 0 {
+        return None;
+    }
+    let available = stats.f_bavail.min(total);
+    Some(((available.saturating_mul(100)) / total).min(100) as u8)
 }
 
 #[cfg(test)]
@@ -687,6 +834,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_open_ledger_capacity_uses_bootstrap_capacity() {
+        let snapshot = queue_snapshot(0, 0, 0, 79, 0, 0);
+
+        assert!(snapshot.queue_capacity >= BOOTSTRAP_QUEUE_CAPACITY_MIN);
+        assert!(!snapshot.overloaded);
+    }
+
+    #[test]
+    fn fee_pressure_below_capacity_is_not_queue_overload() {
+        let now = Instant::now();
+        let mut manager = LoadManager::default();
+        manager.activate_stall_detector(now);
+        let queue = queue_snapshot(0, 0, 236, 236, 0, 0);
+
+        manager.refresh_local_queue_health(&queue, now);
+        let snapshot = manager.snapshot();
+
+        assert!(snapshot.queue_capacity >= BOOTSTRAP_QUEUE_CAPACITY_MIN);
+        assert!(snapshot.queue_fee > LOAD_BASE);
+        assert!(!snapshot.queue_overloaded);
+    }
+
+    #[test]
     fn resource_pressure_raises_remote_fee() {
         let mut manager = LoadManager::default();
         manager.refresh_network_health(
@@ -740,6 +910,28 @@ mod tests {
         assert_eq!(recovered.idle_cycles, 1);
         assert_eq!(recovered.last_cycle_reason.as_deref(), Some("queue_idle"));
         assert!(recovered.local_fee >= LOAD_BASE);
+    }
+
+    #[test]
+    fn runtime_resource_pressure_raises_local_load() {
+        let now = Instant::now();
+        let mut manager = LoadManager::default();
+        manager.activate_stall_detector(now);
+        manager.refresh_runtime_resource_health(RuntimeResourceSnapshot {
+            process_rss_mb: RSS_WARN_MB + 1024,
+            system_load_percent: Some(800),
+            disk_free_percent: Some(3),
+        });
+
+        assert!(manager.run_cycle(now));
+        let snapshot = manager.snapshot();
+
+        assert!(snapshot.resource_overloaded);
+        assert!(snapshot.local_fee > LOAD_BASE);
+        assert_eq!(
+            snapshot.last_cycle_reason.as_deref(),
+            Some("runtime_resource_overloaded")
+        );
     }
 
     #[test]
