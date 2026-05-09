@@ -163,10 +163,13 @@ async fn run_sync_persistence_worker(
             metrics,
         } = work;
         metrics.note_worker_lane_started("sync_persistence");
-        let result = tokio::task::spawn_blocking(move || backend.store_batch(&batch))
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|store_result| store_result.map_err(|e| e.to_string()));
+        let result = tokio::task::spawn_blocking(move || {
+            backend.store_batch(&batch)?;
+            backend.flush_to_disk()
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|store_result| store_result.map_err(|e| e.to_string()));
         metrics.note_worker_lane_finished("sync_persistence", result.is_ok());
         if result_tx
             .send(SyncPersistenceResult {
@@ -475,7 +478,7 @@ impl Node {
         };
 
         let flush_kind = if final_flush { "final " } else { "" };
-        let mut total_flushed = 0usize;
+        let mut total_staged = 0usize;
         let mut total_bytes = 0usize;
 
         let mut submitted_leaves = 0usize;
@@ -552,7 +555,7 @@ impl Node {
                     chunk_bytes,
                     result: Ok(()),
                 }) => {
-                    total_flushed = total_flushed.saturating_add(chunk_len);
+                    total_staged = total_staged.saturating_add(chunk_len);
                     total_bytes = total_bytes.saturating_add(chunk_bytes);
                     maybe_trim_allocator_after_sync_flush(chunk_bytes);
                 }
@@ -577,8 +580,8 @@ impl Node {
 
         pending_leaves.shrink_to(Self::NUDB_FLUSH_CHUNK_LEAVES);
         info!(
-            "sync data processor: flushed {}{}leaves to NuDB ({} bytes staged)",
-            flush_kind, total_flushed, total_bytes,
+            "sync data processor: durably flushed {}{}leaves to NuDB ({} bytes)",
+            flush_kind, total_staged, total_bytes,
         );
         true
     }
@@ -880,6 +883,23 @@ impl Node {
                 if target_peers.is_empty() {
                     for req in &reqs {
                         total_reqs += self.sync_send_request(req, sync_seq, None).await;
+                    }
+                } else if reqs.len() < target_peers.len() {
+                    info!(
+                        "sync reply follow-up: replicating {} tail request(s) across {} peer(s)",
+                        reqs.len(),
+                        target_peers.len(),
+                    );
+                    for req in &reqs {
+                        let mut sent_for_req = 0usize;
+                        for pid in &target_peers {
+                            sent_for_req += self.sync_send_request(req, sync_seq, Some(*pid)).await;
+                        }
+                        if sent_for_req == 0 {
+                            total_reqs += self.sync_send_request(req, sync_seq, None).await;
+                        } else {
+                            total_reqs += sent_for_req;
+                        }
                     }
                 } else {
                     for (i, req) in reqs.iter().enumerate() {
@@ -1275,13 +1295,54 @@ impl Node {
                 }
             }
 
-            let Some(sync_info) = epoch_sync_info else {
+            let Some(mut sync_info) = epoch_sync_info else {
                 continue;
             };
-            let completed_shamap = epoch_completed_shamap;
+            let mut completed_shamap = epoch_completed_shamap;
             let outcome = epoch_outcome;
             let batch_len = epoch_response_count;
             let walk_ms = epoch_walk_ms;
+
+            if completed_shamap.is_none() && !pending_leaves.is_empty() {
+                if self
+                    .flush_sync_leaves_to_nudb(
+                        &mut pending_leaves,
+                        false,
+                        &persistence_work_tx,
+                        &mut persistence_result_rx,
+                    )
+                    .await
+                {
+                    self.evict_synced_leaves_from_memory("pre-completion NuDB checkpoint");
+                    let completion = crate::sync_epoch::check_sync_completion(
+                        self.sync_runtime.sync_arc(),
+                        std::time::Duration::ZERO,
+                    );
+                    if completion.checked {
+                        let complete = completion.completed.is_some();
+                        self.sync_runtime
+                            .metrics()
+                            .note_completion_check(completion.plausible, complete);
+                    }
+                    if completion.completed.is_some() {
+                        info!(
+                            "sync data processor: completion succeeded after durable leaf checkpoint"
+                        );
+                    }
+                    if let Some((shamap, header, completed_sync_info)) = completion.completed {
+                        sync_info = completed_sync_info;
+                        completed_shamap = Some((shamap, header));
+                    }
+                } else {
+                    persistence_worker.abort();
+                    (
+                        persistence_work_tx,
+                        persistence_result_rx,
+                        persistence_worker,
+                    ) = spawn_sync_persistence_lane(tuning.sync_persistence_capacity);
+                    continue;
+                }
+            }
 
             if let Some((shamap, sync_header)) = completed_shamap {
                 if !self
@@ -1337,6 +1398,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingNodeStore {
         stored_first_bytes: Mutex<Vec<u8>>,
+        flush_count: std::sync::atomic::AtomicUsize,
     }
 
     impl crate::ledger::node_store::NodeStore for RecordingNodeStore {
@@ -1350,6 +1412,12 @@ mod tests {
 
         fn fetch(&self, _hash: &[u8; 32]) -> std::io::Result<Option<Vec<u8>>> {
             Ok(None)
+        }
+
+        fn flush_to_disk(&self) -> std::io::Result<()> {
+            self.flush_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -1445,6 +1513,12 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
             vec![1, 2]
+        );
+        assert_eq!(
+            backend
+                .flush_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
     }
 }
